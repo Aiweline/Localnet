@@ -1,4 +1,5 @@
 mod behaviour;
+mod discovery;
 mod runtime;
 mod transfer;
 

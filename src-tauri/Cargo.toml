@@ -18,9 +18,11 @@ tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-single-instance = "2"
-tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 libp2p = { version = "0.56", features = ["cbor", "dns", "identify", "macros", "mdns", "noise", "request-response", "serde", "tcp", "tokio", "yamux"] }
 libp2p-stream = "0.4.0-alpha"
+if-addrs = "0.15"
+socket2 = "0.6"
 rusqlite = { version = "0.37", features = ["bundled"] }
 keyring = { version = "3", features = ["apple-native", "windows-native"] }
 serde = { version = "1", features = ["derive"] }

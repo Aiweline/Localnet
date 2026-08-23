@@ -6,16 +6,22 @@ use std::{
 
 use futures::StreamExt;
 use libp2p::{
-    Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder, mdns, noise, request_response,
-    swarm::{SwarmEvent, dial_opts::DialOpts},
+    Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder, mdns,
+    multiaddr::Protocol,
+    noise, request_response,
+    swarm::{
+        SwarmEvent,
+        dial_opts::{DialOpts, PeerCondition},
+    },
     tcp, yamux,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use super::{
     behaviour::{LocalnetBehaviour, LocalnetBehaviourEvent},
+    discovery::{DiscoveryEvent, DiscoveryService},
     transfer,
 };
 use crate::{
@@ -155,10 +161,14 @@ struct NetworkRuntime {
     swarm: Swarm<LocalnetBehaviour>,
     stream_control: libp2p_stream::Control,
     receiver: mpsc::Receiver<NetworkCommand>,
+    discovery_receiver: mpsc::Receiver<DiscoveryEvent>,
+    listen_port_sender: watch::Sender<Option<u16>>,
     pending: HashMap<request_response::OutboundRequestId, PendingAction>,
-    discovered_addresses: HashMap<PeerId, HashSet<Multiaddr>>,
+    mdns_addresses: HashMap<PeerId, HashSet<Multiaddr>>,
+    beacon_addresses: HashMap<PeerId, HashMap<Multiaddr, Instant>>,
     active_connections: HashMap<PeerId, usize>,
     friend_request_times: HashMap<PeerId, VecDeque<Instant>>,
+    mdns_enabled: bool,
 }
 
 impl NetworkRuntime {
@@ -195,8 +205,12 @@ impl NetworkRuntime {
         swarm
             .listen_on("/ip4/0.0.0.0/tcp/0".parse().expect("static listen address"))
             .map_err(|error| AppError::Network(format!("无法监听局域网端口：{error}")))?;
+        let (listen_port_sender, listen_port_receiver) = watch::channel(None);
+        let discovery_receiver = DiscoveryService::spawn(peer_id, listen_port_receiver);
+        let mdns_enabled =
+            !(cfg!(debug_assertions) && std::env::var_os("LOCALNET_DISABLE_MDNS").is_some());
 
-        tracing::info!(peer_id = %peer_id, "Localnet network runtime started");
+        tracing::info!(peer_id = %peer_id, mdns_enabled, "Localnet network runtime started");
         let mut runtime = Self {
             local_profile: profile,
             storage,
@@ -205,15 +219,21 @@ impl NetworkRuntime {
             swarm,
             stream_control,
             receiver,
+            discovery_receiver,
+            listen_port_sender,
             pending: HashMap::new(),
-            discovered_addresses: HashMap::new(),
+            mdns_addresses: HashMap::new(),
+            beacon_addresses: HashMap::new(),
             active_connections: HashMap::new(),
             friend_request_times: HashMap::new(),
+            mdns_enabled,
         };
         runtime.event_loop().await
     }
 
     async fn event_loop(&mut self) -> Result<(), AppError> {
+        let mut discovery_cleanup = tokio::time::interval(Duration::from_secs(1));
+        discovery_cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 command = self.receiver.recv() => {
@@ -231,6 +251,12 @@ impl NetworkRuntime {
                     }
                 }
                 event = self.swarm.select_next_some() => self.handle_swarm_event(event)?,
+                discovery = self.discovery_receiver.recv() => {
+                    if let Some(discovery) = discovery {
+                        self.handle_discovery_event(discovery)?;
+                    }
+                }
+                _ = discovery_cleanup.tick() => self.expire_beacon_addresses()?,
             }
         }
     }
@@ -371,29 +397,29 @@ impl NetworkRuntime {
     ) -> Result<(), AppError> {
         match event {
             SwarmEvent::Behaviour(LocalnetBehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {
+                if !self.mdns_enabled {
+                    return Ok(());
+                }
                 for (peer_id, address) in peers {
                     if peer_id == *self.swarm.local_peer_id() {
                         continue;
                     }
-                    self.discovered_addresses
+                    self.mdns_addresses
                         .entry(peer_id)
                         .or_default()
                         .insert(address.clone());
-                    self.swarm.add_peer_address(peer_id, address.clone());
-                    if !self.swarm.is_connected(&peer_id) {
-                        let options = DialOpts::peer_id(peer_id).addresses(vec![address]).build();
-                        if let Err(error) = self.swarm.dial(options) {
-                            tracing::debug!(peer_id = %peer_id, error = %error, "peer dial deferred");
-                        }
-                    }
+                    self.dial_discovered_peer(peer_id, address, "mdns");
                 }
             }
             SwarmEvent::Behaviour(LocalnetBehaviourEvent::Mdns(mdns::Event::Expired(peers))) => {
+                if !self.mdns_enabled {
+                    return Ok(());
+                }
                 for (peer_id, address) in peers {
-                    if let Some(addresses) = self.discovered_addresses.get_mut(&peer_id) {
+                    if let Some(addresses) = self.mdns_addresses.get_mut(&peer_id) {
                         addresses.remove(&address);
                         if addresses.is_empty() {
-                            self.discovered_addresses.remove(&peer_id);
+                            self.mdns_addresses.remove(&peer_id);
                         }
                     }
                     self.mark_offline_if_unreachable(peer_id)?;
@@ -429,6 +455,12 @@ impl NetworkRuntime {
             }
             SwarmEvent::NewListenAddr { address, .. } => {
                 tracing::info!(%address, "Localnet listening");
+                if let Some(port) = address.iter().find_map(|protocol| match protocol {
+                    Protocol::Tcp(port) => Some(port),
+                    _ => None,
+                }) {
+                    self.listen_port_sender.send_replace(Some(port));
+                }
             }
             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                 tracing::debug!(?peer_id, %error, "outgoing connection error");
@@ -437,6 +469,60 @@ impl NetworkRuntime {
                 tracing::debug!(%error, "incoming connection error");
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_discovery_event(&mut self, event: DiscoveryEvent) -> Result<(), AppError> {
+        match event {
+            DiscoveryEvent::PeerHint {
+                peer_id,
+                address,
+                expires_at,
+            } => {
+                if peer_id == *self.swarm.local_peer_id() {
+                    return Ok(());
+                }
+                let is_new = self
+                    .beacon_addresses
+                    .entry(peer_id)
+                    .or_default()
+                    .insert(address.clone(), expires_at)
+                    .is_none();
+                if is_new {
+                    tracing::debug!(peer_id = %peer_id, %address, "LAN beacon peer hint received");
+                }
+                self.dial_discovered_peer(peer_id, address, "lan-beacon");
+            }
+        }
+        Ok(())
+    }
+
+    fn dial_discovered_peer(&mut self, peer_id: PeerId, address: Multiaddr, source: &'static str) {
+        self.swarm.add_peer_address(peer_id, address.clone());
+        let options = DialOpts::peer_id(peer_id)
+            .condition(PeerCondition::DisconnectedAndNotDialing)
+            .addresses(vec![address])
+            .build();
+        if let Err(error) = self.swarm.dial(options) {
+            tracing::trace!(peer_id = %peer_id, source, error = %error, "peer dial deferred");
+        }
+    }
+
+    fn expire_beacon_addresses(&mut self) -> Result<(), AppError> {
+        let now = Instant::now();
+        let mut expired_peers = Vec::new();
+        self.beacon_addresses.retain(|peer_id, addresses| {
+            addresses.retain(|_, expires_at| *expires_at > now);
+            if addresses.is_empty() {
+                expired_peers.push(*peer_id);
+                false
+            } else {
+                true
+            }
+        });
+        for peer_id in expired_peers {
+            self.mark_offline_if_unreachable(peer_id)?;
         }
         Ok(())
     }
@@ -833,12 +919,16 @@ impl NetworkRuntime {
     }
 
     fn mark_offline_if_unreachable(&self, peer_id: PeerId) -> Result<(), AppError> {
-        let has_address = self
-            .discovered_addresses
+        let has_mdns_address = self
+            .mdns_addresses
+            .get(&peer_id)
+            .is_some_and(|addresses| !addresses.is_empty());
+        let has_beacon_address = self
+            .beacon_addresses
             .get(&peer_id)
             .is_some_and(|addresses| !addresses.is_empty());
         let has_connection = self.active_connections.get(&peer_id).copied().unwrap_or(0) > 0;
-        if !has_address && !has_connection {
+        if !has_mdns_address && !has_beacon_address && !has_connection {
             let last_seen = now_rfc3339();
             self.storage
                 .set_peer_offline(&peer_id.to_string(), &last_seen)?;

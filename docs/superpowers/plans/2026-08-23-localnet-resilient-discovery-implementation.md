@@ -89,7 +89,6 @@
 - [ ] Bump all application versions to `0.1.1` and make workflow artifact naming derive from that version.
 - [ ] Run `pnpm typecheck`, `pnpm build`, `cargo check`, and `git diff --check`.
 - [ ] Install Windows 0.1.1, verify the LocalSubnet firewall rule, and launch the installed executable.
-- [ ] Run two isolated Windows instances with a synthetic higher-priority TUN/default route and confirm discovery, friend request, text, image, and file transfer without disabling that route.
+- [ ] Run two isolated Windows instances with mDNS disabled while physical and virtual private interfaces remain active; confirm the UDP path alone completes discovery, friend request, text, image, and file transfer. Do not mutate the host's default route. Treat the user's real Win-to-Mac TUN environment as the final cross-machine acceptance.
 - [ ] Push the scoped branch, build the universal macOS DMG, download it, and verify SHA-256.
 - [ ] Inspect the DMG app bundle's merged Info.plist on the macOS runner before upload.
-
