@@ -40,7 +40,9 @@ function App() {
   const [busyKey, setBusyKey] = useState("");
   const [toast, setToast] = useState<ToastState | null>(null);
   const [editingProfile, setEditingProfile] = useState(false);
+  const [discoverySlow, setDiscoverySlow] = useState(false);
   const refreshTimer = useRef<number | null>(null);
+  const hasOnlinePeer = snapshot.peers.some((peer) => peer.online);
 
   const refresh = useCallback(async (showLoader = false) => {
     if (showLoader) setLoading(true);
@@ -84,6 +86,15 @@ function App() {
     if (selectedPeerId && snapshot.friends.some((friend) => friend.peerId === selectedPeerId)) return;
     setSelectedPeerId(snapshot.friends[0]?.peerId ?? null);
   }, [selectedPeerId, snapshot.friends]);
+
+  useEffect(() => {
+    if (!snapshot.localProfile || hasOnlinePeer) {
+      setDiscoverySlow(false);
+      return;
+    }
+    const timer = window.setTimeout(() => setDiscoverySlow(true), 12_000);
+    return () => window.clearTimeout(timer);
+  }, [hasOnlinePeer, snapshot.localProfile]);
 
   const act = useCallback(async <T,>(key: string, action: () => Promise<T>, success?: string): Promise<T | null> => {
     setBusyKey(key);
@@ -199,7 +210,7 @@ function App() {
                 </button>
               </div>
             ))}
-            {visibleNearby.length === 0 && <SidebarEmpty icon={<Wifi size={17} />} text={searchText ? "没有匹配的附近用户" : "正在自动发现同一内网的用户"} />}
+            {visibleNearby.length === 0 && <SidebarEmpty icon={discoverySlow ? <AlertCircle size={17} /> : <Wifi size={17} />} text={searchText ? "没有匹配的附近用户" : discoverySlow ? "仍未发现？请允许 Localnet 访问本地网络，并检查 Windows 防火墙" : "正在自动发现同一内网的用户"} />}
           </SidebarSection>
           <SidebarSection title="好友" count={visibleFriends.length} icon={<UsersRound size={14} />}>
             {visibleFriends.map((friend) => (

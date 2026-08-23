@@ -1,6 +1,6 @@
 [package]
 name = "localnet"
-version = "0.1.0"
+version = "0.1.1"
 description = "Private local network chat for Windows and macOS"
 authors = ["Aiweline"]
 edition = "2024"
