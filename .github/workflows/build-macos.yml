@@ -40,17 +40,27 @@ jobs:
         run: |
           set -euo pipefail
           version="$(node -p "require('./package.json').version")"
-          app_path="$(find src-tauri/target/universal-apple-darwin/release/bundle/macos -maxdepth 1 -name '*.app' -print -quit)"
+          dmg_path="$(find src-tauri/target/universal-apple-darwin/release/bundle/dmg -maxdepth 1 -name '*.dmg' -print -quit)"
+          test -n "$dmg_path"
+          mount_dir="$(mktemp -d)"
+          hdiutil attach "$dmg_path" -readonly -nobrowse -mountpoint "$mount_dir"
+          trap 'hdiutil detach "$mount_dir" >/dev/null 2>&1 || true; rmdir "$mount_dir" >/dev/null 2>&1 || true' EXIT
+          app_path="$(find "$mount_dir" -maxdepth 2 -name '*.app' -print -quit)"
           test -n "$app_path"
-          test "$(plutil -extract CFBundleShortVersionString raw "$app_path/Contents/Info.plist")" = "$version"
-          test -n "$(plutil -extract NSLocalNetworkUsageDescription raw "$app_path/Contents/Info.plist")"
-          test "$(plutil -extract NSBonjourServices.0 raw "$app_path/Contents/Info.plist")" = "_p2p._udp"
+          bundle_version="$(plutil -extract CFBundleShortVersionString raw "$app_path/Contents/Info.plist")"
+          local_network_description="$(plutil -extract NSLocalNetworkUsageDescription raw "$app_path/Contents/Info.plist")"
+          bonjour_service="$(plutil -extract NSBonjourServices.0 raw "$app_path/Contents/Info.plist")"
           binary_path="$(find "$app_path/Contents/MacOS" -maxdepth 1 -type f -perm -111 -print -quit)"
           test -n "$binary_path"
           archs="$(lipo -archs "$binary_path")"
-          echo "Verified bundle: $app_path"
-          echo "Bundle version: $version"
+          echo "Verified DMG: $dmg_path"
+          echo "Bundle version: $bundle_version"
+          echo "Local Network description: $local_network_description"
+          echo "Bonjour service: $bonjour_service"
           echo "Executable architectures: $archs"
+          test "$bundle_version" = "$version"
+          test -n "$local_network_description"
+          test "$bonjour_service" = "_p2p._udp"
           [[ "$archs" == *arm64* ]]
           [[ "$archs" == *x86_64* ]]
 
