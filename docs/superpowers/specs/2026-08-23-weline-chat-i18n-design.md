@@ -2,7 +2,7 @@
 
 ## Outcome
 
-Weline Chat 0.1.3 will provide a complete, first-class experience in ten languages on Windows and macOS. A fresh installation follows the operating-system language automatically, users can change the language without restarting, and the selected preference persists. Internationalization must cover application UI, user-facing runtime errors, Windows installer messages, and macOS Local Network permission text without changing peer identity, discovery, friendship, chat history, or transfer protocols.
+Weline Chat 0.1.4 will provide a complete, first-class experience in ten languages on Windows and macOS. A fresh installation follows the operating-system language automatically, users can change the language without restarting, and the selected preference persists. Internationalization must cover application UI, user-facing runtime errors, Windows installer messages, and macOS Local Network permission text without changing peer identity, discovery, friendship, chat history, or transfer protocols.
 
 ## Supported locales
 
@@ -48,7 +48,7 @@ Startup resolution order is:
 3. For `auto`, match `navigator.languages` in order, first exactly and then by language prefix.
 4. If no language matches, use `en-US`.
 
-Fresh 0.1.3 databases store `auto`. During upgrade, an existing database with no language preference stores `zh-CN` once, preserving the behavior users already had before the update. The backend determines whether the database existed before it initializes the new setting; it does not infer this from nickname or chat data.
+Fresh 0.1.4 databases store `auto`. During upgrade, an existing database with no language preference stores `zh-CN` once, preserving the behavior users already had before the update. The backend determines whether the database existed before it initializes the new setting; it does not infer this from nickname or chat data.
 
 Selecting a language updates the UI immediately and persists it through a dedicated settings command. Selecting “System default” stores `auto`. While `auto` is active, the application listens for the browser `languagechange` event and also resolves the OS language again on every launch.
 
@@ -199,7 +199,7 @@ The locale preference is a new settings row only. Rollback to 0.1.2 safely ignor
 8. Every expected Rust/Tauri application failure visible in the webview is represented by a stable code that all catalogs can translate.
 9. Windows NSIS contains all ten installer languages, and the custom firewall hook has translations for all user-visible messages.
 10. The macOS app bundle contains all ten localized `InfoPlist.strings` resources and a valid localized Local Network purpose string.
-11. Windows and universal macOS packages build successfully as version 0.1.3.
+11. Windows and universal macOS packages build successfully as version 0.1.4.
 12. Real two-device smoke checks confirm both default mDNS and mDNS-disabled UDP fallback discovery still work after the internationalization changes, with TUN enabled and disabled.
 
 ## Non-goals

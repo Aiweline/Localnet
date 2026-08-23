@@ -35,15 +35,33 @@ jobs:
       - name: Build universal DMG
         run: pnpm tauri build --target universal-apple-darwin --bundles dmg
 
+      - name: Verify macOS bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          app_path="$(find src-tauri/target/universal-apple-darwin/release/bundle/macos -maxdepth 1 -name '*.app' -print -quit)"
+          test -n "$app_path"
+          test "$(plutil -extract CFBundleShortVersionString raw "$app_path/Contents/Info.plist")" = "$version"
+          test -n "$(plutil -extract NSLocalNetworkUsageDescription raw "$app_path/Contents/Info.plist")"
+          test "$(plutil -extract NSBonjourServices.0 raw "$app_path/Contents/Info.plist")" = "_p2p._udp"
+          binary_path="$(find "$app_path/Contents/MacOS" -maxdepth 1 -type f -perm -111 -print -quit)"
+          test -n "$binary_path"
+          archs="$(lipo -archs "$binary_path")"
+          [[ "$archs" == *aarch64* ]]
+          [[ "$archs" == *x86_64* ]]
+
       - name: Collect package and checksum
         shell: bash
         run: |
           set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
           mkdir -p release/macos
           dmg_path="$(find src-tauri/target/universal-apple-darwin/release/bundle/dmg -maxdepth 1 -name '*.dmg' -print -quit)"
           test -n "$dmg_path"
-          cp "$dmg_path" release/macos/Localnet_0.1.0_universal.dmg
-          shasum -a 256 release/macos/Localnet_0.1.0_universal.dmg > release/macos/Localnet_0.1.0_universal.dmg.sha256
+          output="release/macos/Weline_Chat_${version}_universal.dmg"
+          cp "$dmg_path" "$output"
+          shasum -a 256 "$output" > "$output.sha256"
 
       - name: Upload macOS package
         uses: actions/upload-artifact@v4
