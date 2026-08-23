@@ -84,14 +84,14 @@ impl LocalIdentity {
 
     fn encode(&self) -> Result<Vec<u8>, AppError> {
         self.keypair.to_protobuf_encoding().map_err(|error| {
-            AppError::Identity(format!("无法保存设备身份，请重新启动 Localnet：{error}"))
+            AppError::Identity(format!("无法保存设备身份，请重新启动 Weline Chat：{error}"))
         })
     }
 
     fn decode(bytes: &[u8], source: &str) -> Result<Self, AppError> {
         let keypair = Keypair::from_protobuf_encoding(bytes).map_err(|error| {
             AppError::Identity(format!(
-                "{source}中的设备身份已损坏；为避免好友身份变化，Localnet 不会自动重建：{error}"
+                "{source}中的设备身份已损坏；为避免好友身份变化，Weline Chat 不会自动重建：{error}"
             ))
         })?;
         let peer_id = keypair.public().to_peer_id();

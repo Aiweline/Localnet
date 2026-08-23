@@ -12,11 +12,11 @@ pub enum AppError {
     Network(String),
     #[error("{0}")]
     Permission(String),
-    #[error("好友当前不在线，请对方启动 Localnet 后重试")]
+    #[error("好友当前不在线，请对方启动 Weline Chat 后重试")]
     OfflinePeer,
     #[error("对方尚未成为好友，请先发送好友申请并等待接受")]
     NotFriend,
-    #[error("双方软件版本不兼容，请升级 Localnet 后重试")]
+    #[error("双方软件版本不兼容，请升级 Weline Chat 后重试")]
     IncompatibleProtocol,
     #[error("文件完整性校验失败，请重新发送")]
     IntegrityFailure,
@@ -66,6 +66,6 @@ impl Serialize for AppError {
 
 impl From<rusqlite::Error> for AppError {
     fn from(error: rusqlite::Error) -> Self {
-        Self::Storage(format!("本地数据处理失败，请重新启动 Localnet：{error}"))
+        Self::Storage(format!("本地数据处理失败，请重新启动 Weline Chat：{error}"))
     }
 }

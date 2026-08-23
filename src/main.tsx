@@ -115,7 +115,7 @@ function App() {
   if (fatalError && !snapshot.localProfile) return <FatalScreen message={fatalError} onRetry={() => void refresh(true)} />;
   if (!snapshot.localProfile) {
     return <Onboarding busy={busyKey === "onboarding"} onSubmit={async (nickname) => {
-      await act("onboarding", () => invoke("complete_onboarding", { nickname }), "Localnet 已准备好，正在发现附近用户");
+      await act("onboarding", () => invoke("complete_onboarding", { nickname }), "Weline Chat 已准备好，正在发现附近用户");
     }} />;
   }
 
@@ -170,7 +170,7 @@ function App() {
       <aside className="sidebar">
         <header className="brand-row">
           <span className="brand-mark"><MessageCircleMore size={22} /></span>
-          <span><strong>Localnet</strong><small>局域网私密传输</small></span>
+          <span><strong>Weline Chat</strong><small>局域网私密传输</small></span>
           <button className="icon-button" title="设置昵称" onClick={() => setEditingProfile(true)}><Settings2 size={18} /></button>
         </header>
         <button className="profile-card" onClick={() => setEditingProfile(true)}>
@@ -210,7 +210,7 @@ function App() {
                 </button>
               </div>
             ))}
-            {visibleNearby.length === 0 && <SidebarEmpty icon={discoverySlow ? <AlertCircle size={17} /> : <Wifi size={17} />} text={searchText ? "没有匹配的附近用户" : discoverySlow ? "仍未发现？请允许 Localnet 访问本地网络，并检查 Windows 防火墙" : "正在自动发现同一内网的用户"} />}
+            {visibleNearby.length === 0 && <SidebarEmpty icon={discoverySlow ? <AlertCircle size={17} /> : <Wifi size={17} />} text={searchText ? "没有匹配的附近用户" : discoverySlow ? "仍未发现？请允许 Weline Chat 访问本地网络，并检查 Windows 防火墙" : "正在自动发现同一内网的用户"} />}
           </SidebarSection>
           <SidebarSection title="好友" count={visibleFriends.length} icon={<UsersRound size={14} />}>
             {visibleFriends.map((friend) => (
@@ -285,7 +285,7 @@ function Conversation({ friend, messages, transfers, messageText, setMessageText
         <div ref={bottomRef} />
       </div>
       <footer className="composer-wrap">
-        {pending && <div className="offline-banner"><WifiOff size={14} /> 对方离线，启动 Localnet 后即可继续发送</div>}
+        {pending && <div className="offline-banner"><WifiOff size={14} /> 对方离线，启动 Weline Chat 后即可继续发送</div>}
         <div className="composer-tools">
           <button onClick={onSendImage} disabled={pending || busyKey === "send-image"}>{busyKey === "send-image" ? <LoaderCircle size={18} className="spin" /> : <ImageIcon size={18} />}图片</button>
           <button onClick={onSendFile} disabled={pending || busyKey === "send-file"}>{busyKey === "send-file" ? <LoaderCircle size={18} className="spin" /> : <Paperclip size={18} />}文件</button>
@@ -358,12 +358,12 @@ function Avatar({ name, online, large }: { name: string; online: boolean; large?
 }
 
 function WelcomePanel({ nearbyCount, friendCount }: { nearbyCount: number; friendCount: number }) {
-  return <section className="welcome-panel"><div className="welcome-art"><span className="pulse pulse-one" /><span className="pulse pulse-two" /><span className="welcome-logo"><MessageCircleMore size={40} /></span></div><p className="eyebrow">LOCAL · PRIVATE · FAST</p><h1>和身边的人直接连接</h1><p>Localnet 会自动发现同一内网中的用户。添加好友后，即可发送文字、图片和文件。</p><div className="welcome-stats"><span><Wifi size={18} /><strong>{nearbyCount}</strong><small>附近在线</small></span><span><UsersRound size={18} /><strong>{friendCount}</strong><small>我的好友</small></span><span><ShieldCheck size={18} /><strong>本地</strong><small>数据传输</small></span></div></section>;
+  return <section className="welcome-panel"><div className="welcome-art"><span className="pulse pulse-one" /><span className="pulse pulse-two" /><span className="welcome-logo"><MessageCircleMore size={40} /></span></div><p className="eyebrow">LOCAL · PRIVATE · FAST</p><h1>和身边的人直接连接</h1><p>Weline Chat 会自动发现同一内网中的用户。添加好友后，即可发送文字、图片和文件。</p><div className="welcome-stats"><span><Wifi size={18} /><strong>{nearbyCount}</strong><small>附近在线</small></span><span><UsersRound size={18} /><strong>{friendCount}</strong><small>我的好友</small></span><span><ShieldCheck size={18} /><strong>本地</strong><small>数据传输</small></span></div></section>;
 }
 
 function Onboarding({ busy, onSubmit }: { busy: boolean; onSubmit: (nickname: string) => Promise<void> }) {
   const [nickname, setNickname] = useState("");
-  return <main className="onboarding-screen"><section className="onboarding-card"><div className="onboarding-copy"><span className="brand-mark large"><MessageCircleMore size={30} /></span><p className="eyebrow">欢迎使用 LOCALNET</p><h1>无需服务器，直接和内网用户连接。</h1><p>设置一个昵称，其他 Localnet 用户就能在附近列表中发现你。</p><ul><li><Wifi size={17} /> 自动发现同一局域网用户</li><li><ShieldCheck size={17} /> 设备身份保存在本机</li><li><Paperclip size={17} /> 文字、图片和文件直传</li></ul></div><form className="nickname-form" onSubmit={(event) => { event.preventDefault(); if (nickname.trim()) void onSubmit(nickname); }}><span className="form-icon"><CircleUserRound size={25} /></span><h2>你希望别人怎么称呼你？</h2><p>昵称只会显示给同一内网中的 Localnet 用户。</p><label>昵称<input autoFocus maxLength={32} value={nickname} onChange={(event) => setNickname(event.target.value)} placeholder="例如：小林" /></label><button className="primary-button" disabled={busy || !nickname.trim()}>{busy ? <LoaderCircle size={18} className="spin" /> : <Wifi size={18} />}{busy ? "正在启动…" : "进入 Localnet"}</button><small><ShieldCheck size={13} /> 不需要账号、手机号或互联网连接</small></form></section></main>;
+  return <main className="onboarding-screen"><section className="onboarding-card"><div className="onboarding-copy"><span className="brand-mark large"><MessageCircleMore size={30} /></span><p className="eyebrow">欢迎使用 WELINE CHAT</p><h1>无需服务器，直接和内网用户连接。</h1><p>设置一个昵称，其他 Weline Chat 用户就能在附近列表中发现你。</p><ul><li><Wifi size={17} /> 自动发现同一局域网用户</li><li><ShieldCheck size={17} /> 设备身份保存在本机</li><li><Paperclip size={17} /> 文字、图片和文件直传</li></ul></div><form className="nickname-form" onSubmit={(event) => { event.preventDefault(); if (nickname.trim()) void onSubmit(nickname); }}><span className="form-icon"><CircleUserRound size={25} /></span><h2>你希望别人怎么称呼你？</h2><p>昵称只会显示给同一内网中的 Weline Chat 用户。</p><label>昵称<input autoFocus maxLength={32} value={nickname} onChange={(event) => setNickname(event.target.value)} placeholder="例如：小林" /></label><button className="primary-button" disabled={busy || !nickname.trim()}>{busy ? <LoaderCircle size={18} className="spin" /> : <Wifi size={18} />}{busy ? "正在启动…" : "进入 Weline Chat"}</button><small><ShieldCheck size={13} /> 不需要账号、手机号或互联网连接</small></form></section></main>;
 }
 
 function ProfileDialog({ profile, busy, onClose, onSave }: { profile: LocalProfile; busy: boolean; onClose: () => void; onSave: (nickname: string) => Promise<void> }) {
@@ -371,8 +371,8 @@ function ProfileDialog({ profile, busy, onClose, onSave }: { profile: LocalProfi
   return <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}><form className="dialog-card" role="dialog" aria-modal="true" aria-labelledby="profile-title" onSubmit={(event) => { event.preventDefault(); if (nickname.trim()) void onSave(nickname); }}><button type="button" className="dialog-close" onClick={onClose}><X size={18} /></button><Avatar name={nickname || profile.nickname} online large /><h2 id="profile-title">本机资料</h2><p>修改后，附近用户会看到新的昵称。</p><label>昵称<input autoFocus maxLength={32} value={nickname} onChange={(event) => setNickname(event.target.value)} /></label><div className="device-id"><Monitor size={15} /><span><small>设备身份</small><code>{shortPeerId(profile.peerId)}</code></span></div><button className="primary-button" disabled={busy || !nickname.trim()}>{busy && <LoaderCircle size={16} className="spin" />} 保存修改</button></form></div>;
 }
 
-function BootScreen() { return <main className="boot-screen"><section className="boot-card"><div className="boot-mark"><MessageCircleMore size={34} /></div><p className="eyebrow">LOCAL · PRIVATE · FAST</p><h1>Localnet</h1><p>正在准备你的局域网通信空间…</p><div className="loading-track"><span /></div></section></main>; }
-function FatalScreen({ message, onRetry }: { message: string; onRetry: () => void }) { return <main className="boot-screen"><section className="boot-card fatal-card"><div className="boot-mark error"><AlertCircle size={32} /></div><h1>Localnet 无法启动</h1><p>{message}</p><button className="primary-button" onClick={onRetry}><RefreshCw size={17} /> 重试</button></section></main>; }
+function BootScreen() { return <main className="boot-screen"><section className="boot-card"><div className="boot-mark"><MessageCircleMore size={34} /></div><p className="eyebrow">LOCAL · PRIVATE · FAST</p><h1>Weline Chat</h1><p>正在准备你的局域网通信空间…</p><div className="loading-track"><span /></div></section></main>; }
+function FatalScreen({ message, onRetry }: { message: string; onRetry: () => void }) { return <main className="boot-screen"><section className="boot-card fatal-card"><div className="boot-mark error"><AlertCircle size={32} /></div><h1>Weline Chat 无法启动</h1><p>{message}</p><button className="primary-button" onClick={onRetry}><RefreshCw size={17} /> 重试</button></section></main>; }
 function Toast({ toast, onClose }: { toast: ToastState; onClose: () => void }) { return <div className={`toast ${toast.tone}`} role="status">{toast.tone === "success" ? <Check size={17} /> : toast.tone === "error" ? <AlertCircle size={17} /> : <Wifi size={17} />}<span>{toast.message}</span><button onClick={onClose}><X size={14} /></button></div>; }
 
 function errorMessage(error: unknown): string {
