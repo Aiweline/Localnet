@@ -83,6 +83,13 @@ impl Storage {
         Ok(())
     }
 
+    pub fn get_peer(&self, peer_id: &str) -> Result<Option<PeerSummary>, AppError> {
+        Ok(self
+            .list_peers()?
+            .into_iter()
+            .find(|peer| peer.peer_id == peer_id))
+    }
+
     pub fn set_peer_offline(&self, peer_id: &str, last_seen: &str) -> Result<(), AppError> {
         let connection = self.connection()?;
         connection.execute(
@@ -113,6 +120,25 @@ impl Storage {
             ],
         )?;
         Ok(())
+    }
+
+    pub fn get_friend_request(&self, request_id: &str) -> Result<Option<FriendRequest>, AppError> {
+        Ok(self
+            .list_friend_requests()?
+            .into_iter()
+            .find(|request| request.request_id == request_id))
+    }
+
+    pub fn find_pending_friend_request(
+        &self,
+        peer_id: &str,
+        direction: Direction,
+    ) -> Result<Option<FriendRequest>, AppError> {
+        Ok(self.list_friend_requests()?.into_iter().find(|request| {
+            request.peer_id == peer_id
+                && request.direction == direction
+                && request.status == FriendRequestStatus::Pending
+        }))
     }
 
     pub fn resolve_friend_request(
@@ -212,6 +238,13 @@ impl Storage {
         Ok(())
     }
 
+    pub fn get_message(&self, message_id: &str) -> Result<Option<ChatMessage>, AppError> {
+        Ok(self
+            .list_messages()?
+            .into_iter()
+            .find(|message| message.message_id == message_id))
+    }
+
     pub fn upsert_transfer(&self, transfer: &TransferRecord) -> Result<(), AppError> {
         let connection = self.connection()?;
         connection.execute(
@@ -243,6 +276,13 @@ impl Storage {
             ],
         )?;
         Ok(())
+    }
+
+    pub fn get_transfer(&self, transfer_id: &str) -> Result<Option<TransferRecord>, AppError> {
+        Ok(self
+            .list_transfers()?
+            .into_iter()
+            .find(|transfer| transfer.transfer_id == transfer_id))
     }
 
     pub fn snapshot(

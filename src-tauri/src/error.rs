@@ -18,8 +18,6 @@ pub enum AppError {
     NotFriend,
     #[error("双方软件版本不兼容，请升级 Localnet 后重试")]
     IncompatibleProtocol,
-    #[error("对方拒绝了这次传输")]
-    TransferRejected,
     #[error("文件完整性校验失败，请重新发送")]
     IntegrityFailure,
     #[error("{0}")]
@@ -44,7 +42,6 @@ impl AppError {
             Self::OfflinePeer => "peer_offline",
             Self::NotFriend => "not_friend",
             Self::IncompatibleProtocol => "incompatible_protocol",
-            Self::TransferRejected => "transfer_rejected",
             Self::IntegrityFailure => "integrity_failure",
             Self::Io(_) => "io_error",
         }

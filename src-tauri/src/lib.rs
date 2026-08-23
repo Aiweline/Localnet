@@ -2,6 +2,8 @@ mod commands;
 mod domain;
 mod error;
 mod identity;
+mod network;
+mod protocol;
 mod state;
 mod storage;
 
@@ -34,11 +36,20 @@ pub fn run() {
             commands::bootstrap,
             commands::complete_onboarding,
             commands::update_nickname,
+            commands::send_friend_request,
+            commands::resolve_friend_request,
+            commands::send_text,
+            commands::retry_text,
+            commands::send_file,
+            commands::resolve_transfer,
+            commands::cancel_transfer,
+            commands::image_preview,
         ])
         .setup(|app| {
             initialize_logging();
             match initialize_state(app) {
                 Ok(state) => {
+                    state.start_network_if_ready(app.handle().clone())?;
                     app.manage(state);
                     Ok(())
                 }
@@ -69,11 +80,7 @@ fn initialize_state<R: tauri::Runtime>(
     let use_keyring = !(cfg!(debug_assertions) && std::env::var_os("LOCALNET_DATA_DIR").is_some());
     let identity = identity::LocalIdentity::load_or_create(&app_data_dir, use_keyring)?;
     let storage = storage::Storage::open(&app_data_dir.join("localnet.sqlite3"))?;
-    Ok(AppState {
-        storage,
-        identity,
-        app_data_dir,
-    })
+    Ok(AppState::new(storage, identity, app_data_dir))
 }
 
 fn resolve_app_data_dir<R: tauri::Runtime>(
