@@ -1,0 +1,46 @@
+[package]
+name = "localnet"
+version = "0.1.0"
+description = "Private local network chat for Windows and macOS"
+authors = ["Aiweline"]
+edition = "2024"
+rust-version = "1.85"
+
+[lib]
+name = "localnet_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+tauri-plugin-single-instance = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+libp2p = { version = "0.56", features = ["cbor", "dns", "identify", "macros", "mdns", "noise", "request-response", "serde", "tcp", "tokio", "yamux"] }
+libp2p-stream = "0.4.0-alpha"
+rusqlite = { version = "0.37", features = ["bundled"] }
+keyring = { version = "3", features = ["apple-native", "windows-native"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["serde", "v7"] }
+chrono = { version = "0.4", features = ["serde"] }
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures = "0.3"
+
+[profile.dev]
+incremental = true
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true
