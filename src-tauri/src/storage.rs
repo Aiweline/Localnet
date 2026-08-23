@@ -598,6 +598,6 @@ impl Storage {
     fn connection(&self) -> Result<MutexGuard<'_, Connection>, AppError> {
         self.connection
             .lock()
-            .map_err(|_| AppError::Storage("本地数据锁异常，请重新启动 Localnet".to_string()))
+            .map_err(|_| AppError::Storage("本地数据锁异常，请重新启动 Weline Chat".to_string()))
     }
 }
