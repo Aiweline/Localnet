@@ -48,7 +48,10 @@ jobs:
           binary_path="$(find "$app_path/Contents/MacOS" -maxdepth 1 -type f -perm -111 -print -quit)"
           test -n "$binary_path"
           archs="$(lipo -archs "$binary_path")"
-          [[ "$archs" == *aarch64* ]]
+          echo "Verified bundle: $app_path"
+          echo "Bundle version: $version"
+          echo "Executable architectures: $archs"
+          [[ "$archs" == *arm64* ]]
           [[ "$archs" == *x86_64* ]]
 
       - name: Collect package and checksum
