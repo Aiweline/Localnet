@@ -422,6 +422,7 @@ where
     S: FnMut(&Path, &Path) -> io::Result<()>,
     H: FnMut(FinalizationPhase) -> io::Result<()>,
 {
+    let mut hard_link = |source: &Path, destination: &Path| fs::hard_link(source, destination);
     finalize_reserved_receive_durable_internal(
         partial,
         reserved_destination,
@@ -430,22 +431,24 @@ where
         reservation_token,
         &mut persist_switch,
         &mut phase_hook,
-        false,
+        &mut hard_link,
     )
 }
 
 #[cfg(test)]
-fn finalize_reserved_receive_copy_fallback_with_hooks<S, H>(
+pub(crate) fn finalize_reserved_receive_copy_fallback_with_hooks<S, L, H>(
     partial: &Path,
     reserved_destination: &Path,
     file_name: &str,
     transfer_id: &str,
     reservation_token: &str,
     mut persist_switch: S,
+    mut hard_link: L,
     mut phase_hook: H,
 ) -> io::Result<FinalizedReceive>
 where
     S: FnMut(&Path, &Path) -> io::Result<()>,
+    L: FnMut(&Path, &Path) -> io::Result<()>,
     H: FnMut(FinalizationPhase) -> io::Result<()>,
 {
     finalize_reserved_receive_durable_internal(
@@ -456,11 +459,11 @@ where
         reservation_token,
         &mut persist_switch,
         &mut phase_hook,
-        true,
+        &mut hard_link,
     )
 }
 
-fn finalize_reserved_receive_durable_internal<S, H>(
+fn finalize_reserved_receive_durable_internal<S, H, L>(
     partial: &Path,
     reserved_destination: &Path,
     file_name: &str,
@@ -468,11 +471,12 @@ fn finalize_reserved_receive_durable_internal<S, H>(
     reservation_token: &str,
     persist_switch: &mut S,
     phase_hook: &mut H,
-    force_copy_fallback: bool,
+    hard_link: &mut L,
 ) -> io::Result<FinalizedReceive>
 where
     S: FnMut(&Path, &Path) -> io::Result<()>,
     H: FnMut(FinalizationPhase) -> io::Result<()>,
+    L: FnMut(&Path, &Path) -> io::Result<()>,
 {
     let directory = reserved_destination
         .parent()
@@ -494,30 +498,52 @@ where
         read_finalization_record(reserved_destination, transfer_id, reservation_token)?
     {
         if record.state == FinalizationState::CopyPrepared {
-            let staged = record.staged.as_deref().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "复制暂存日志缺少暂存文件")
-            })?;
             candidate = directory.join(record.candidate);
             previous = record
                 .previous
                 .into_iter()
                 .map(|name| directory.join(name))
                 .collect();
-            let staged = directory.join(staged);
-            let staged_file = open_regular_file_no_follow(&staged, true)?;
-            if file_identity(&staged_file)? != record.identity {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "复制暂存文件所有权已变化",
-                ));
+            let retained_legacy_stage = if let Some(staged) = record.staged.as_deref() {
+                let staged = directory.join(staged);
+                let expected_identity = record.staged_identity.unwrap_or(record.identity);
+                match open_regular_file_no_follow(&staged, false) {
+                    Ok(file) => (file_identity(&file)? == expected_identity)
+                        .then_some((staged, expected_identity)),
+                    Err(error) if is_no_follow_rejection(&error) => None,
+                    Err(error) => return Err(error),
+                }
+            } else {
+                None
+            };
+            if reservation_is_owned(&candidate, transfer_id, reservation_token)? {
+                match open_regular_file_no_follow(&candidate, true) {
+                    Ok(candidate_file) if file_identity(&candidate_file)? == record.identity => {
+                        return materialize_copy_candidate(
+                            &partial_file,
+                            candidate_file,
+                            reserved_destination,
+                            candidate,
+                            previous,
+                            retained_legacy_stage,
+                            file_name,
+                            transfer_id,
+                            reservation_token,
+                            persist_switch,
+                            phase_hook,
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) if is_no_follow_rejection(&error) => {}
+                    Err(error) => return Err(error),
+                }
             }
-            return materialize_copy_stage(
+            return prepare_copy_candidate(
                 &partial_file,
-                staged_file,
-                &staged,
                 reserved_destination,
                 candidate,
                 previous,
+                retained_legacy_stage,
                 file_name,
                 transfer_id,
                 reservation_token,
@@ -543,18 +569,10 @@ where
                 "部分文件所有权在完成前已变化",
             ));
         }
-        let link_result = if force_copy_fallback {
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "forced copy fallback",
-            ))
-        } else {
-            fs::hard_link(partial, &candidate)
-        };
+        let link_result = hard_link(partial, &candidate);
         match link_result {
             Ok(()) => {
                 if !path_has_file_identity(&candidate, partial_identity)? {
-                    let _ = fs::remove_file(&candidate);
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         "部分文件所有权在完成时已变化",
@@ -635,28 +653,12 @@ where
     S: FnMut(&Path, &Path) -> io::Result<()>,
     H: FnMut(FinalizationPhase) -> io::Result<()>,
 {
-    let directory = reserved_destination
-        .parent()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "接收文件保存位置无效"))?;
-    let (staged, staged_file) = reserve_finalization_stage(directory, transfer_id)?;
-    let staged_identity = file_identity(&staged_file)?;
-    append_finalization_record_with_stage(
-        reserved_destination,
-        transfer_id,
-        reservation_token,
-        &candidate,
-        &previous,
-        Some(&staged),
-        staged_identity,
-        FinalizationState::CopyPrepared,
-    )?;
-    materialize_copy_stage(
+    prepare_copy_candidate(
         partial_file,
-        staged_file,
-        &staged,
         reserved_destination,
         candidate,
         previous,
+        None,
         file_name,
         transfer_id,
         reservation_token,
@@ -665,6 +667,7 @@ where
     )
 }
 
+#[cfg(test)]
 fn reserve_finalization_stage(directory: &Path, transfer_id: &str) -> io::Result<(PathBuf, File)> {
     let digest = hex::encode(Sha256::digest(transfer_id.as_bytes()));
     let mut sequence = 0_u32;
@@ -699,13 +702,12 @@ fn reserve_finalization_stage(directory: &Path, transfer_id: &str) -> io::Result
 }
 
 #[allow(clippy::too_many_arguments)]
-fn materialize_copy_stage<S, H>(
+fn prepare_copy_candidate<S, H>(
     partial_file: &File,
-    mut staged_file: File,
-    staged: &Path,
     reserved_destination: &Path,
     mut candidate: PathBuf,
     mut previous: Vec<PathBuf>,
+    retained_legacy_stage: Option<(PathBuf, FileIdentity)>,
     file_name: &str,
     transfer_id: &str,
     reservation_token: &str,
@@ -719,8 +721,7 @@ where
     let directory = reserved_destination
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "接收文件保存位置无效"))?;
-    let staged_identity = file_identity(&staged_file)?;
-    let source_length = partial_file.metadata()?.len();
+    let mut switch_from = None;
 
     loop {
         if !reservation_is_owned(&candidate, transfer_id, reservation_token)? {
@@ -729,33 +730,78 @@ where
                 "复制完成前目标文件占位所有权已变化",
             ));
         }
-        match open_regular_file_no_follow(&candidate, false) {
-            Ok(candidate_file) if file_identity(&candidate_file)? == staged_identity => {
-                if candidate_file.metadata()?.len() != source_length {
+        match create_new_regular_file_no_follow(&candidate) {
+            Ok(candidate_file) => {
+                candidate_file.sync_all()?;
+                if !reservation_is_owned(&candidate, transfer_id, reservation_token)? {
                     return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "已公开的复制文件长度不完整",
+                        io::ErrorKind::PermissionDenied,
+                        "复制目标创建后占位所有权已变化",
                     ));
                 }
-                phase_hook(FinalizationPhase::BeforeCopyMaterializedJournal)?;
-                append_finalization_record_with_stage(
+                let candidate_identity = file_identity(&candidate_file)?;
+                if let Some(previous_candidate) = switch_from.take() {
+                    if !previous.contains(&previous_candidate) {
+                        previous.push(previous_candidate.clone());
+                    }
+                    append_finalization_record_with_stage(
+                        reserved_destination,
+                        transfer_id,
+                        reservation_token,
+                        &candidate,
+                        &previous,
+                        retained_legacy_stage
+                            .as_ref()
+                            .map(|(path, _)| path.as_path()),
+                        retained_legacy_stage
+                            .as_ref()
+                            .map(|(_, identity)| *identity),
+                        candidate_identity,
+                        FinalizationState::CopyPrepared,
+                    )?;
+                    phase_hook(FinalizationPhase::AfterJournalUpdate)?;
+                    persist_switch(&previous_candidate, &candidate)?;
+                    phase_hook(FinalizationPhase::AfterMetadataSwitch)?;
+                    remove_owned_reservation(&previous_candidate, transfer_id, reservation_token)?;
+                    phase_hook(FinalizationPhase::AfterOldReservationRelease)?;
+                } else {
+                    append_finalization_record_with_stage(
+                        reserved_destination,
+                        transfer_id,
+                        reservation_token,
+                        &candidate,
+                        &previous,
+                        retained_legacy_stage
+                            .as_ref()
+                            .map(|(path, _)| path.as_path()),
+                        retained_legacy_stage
+                            .as_ref()
+                            .map(|(_, identity)| *identity),
+                        candidate_identity,
+                        FinalizationState::CopyPrepared,
+                    )?;
+                }
+                return materialize_copy_candidate(
+                    partial_file,
+                    candidate_file,
                     reserved_destination,
+                    candidate,
+                    previous,
+                    retained_legacy_stage,
+                    file_name,
                     transfer_id,
                     reservation_token,
-                    &candidate,
-                    &previous,
-                    Some(staged),
-                    staged_identity,
-                    FinalizationState::Created,
-                )?;
-                phase_hook(FinalizationPhase::AfterFinalJournalSync)?;
-                return Ok(FinalizedReceive {
-                    path: candidate,
-                    reservation_released: false,
-                });
+                    persist_switch,
+                    phase_hook,
+                );
             }
-            Ok(_) => {
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 phase_hook(FinalizationPhase::BeforeReplacementReserve)?;
+                if switch_from.is_none() {
+                    switch_from = Some(candidate.clone());
+                } else if !previous.contains(&candidate) {
+                    previous.push(candidate.clone());
+                }
                 let replacement = reserve_available_receive_path(
                     directory,
                     file_name,
@@ -763,76 +809,107 @@ where
                     reservation_token,
                 )?;
                 phase_hook(FinalizationPhase::AfterReplacementReserve)?;
-                previous.push(candidate.clone());
-                append_finalization_record_with_stage(
-                    reserved_destination,
-                    transfer_id,
-                    reservation_token,
-                    &replacement,
-                    &previous,
-                    Some(staged),
-                    staged_identity,
-                    FinalizationState::CopyPrepared,
-                )?;
-                phase_hook(FinalizationPhase::AfterJournalUpdate)?;
-                persist_switch(&candidate, &replacement)?;
-                phase_hook(FinalizationPhase::AfterMetadataSwitch)?;
-                remove_owned_reservation(&candidate, transfer_id, reservation_token)?;
-                phase_hook(FinalizationPhase::AfterOldReservationRelease)?;
                 candidate = replacement;
-                continue;
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
+    }
+}
 
-        phase_hook(FinalizationPhase::BeforeCopy)?;
-        staged_file.set_len(0)?;
-        staged_file.seek(SeekFrom::Start(0))?;
-        let mut source = partial_file;
-        source.seek(SeekFrom::Start(0))?;
-        let mut buffer = vec![0_u8; 64 * 1024];
-        let mut injected_during_copy = false;
-        loop {
-            let read = source.read(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
-            staged_file.write_all(&buffer[..read])?;
-            if !injected_during_copy {
-                injected_during_copy = true;
-                phase_hook(FinalizationPhase::DuringCopy)?;
-            }
+#[allow(clippy::too_many_arguments)]
+fn materialize_copy_candidate<S, H>(
+    partial_file: &File,
+    mut candidate_file: File,
+    reserved_destination: &Path,
+    candidate: PathBuf,
+    previous: Vec<PathBuf>,
+    retained_legacy_stage: Option<(PathBuf, FileIdentity)>,
+    file_name: &str,
+    transfer_id: &str,
+    reservation_token: &str,
+    persist_switch: &mut S,
+    phase_hook: &mut H,
+) -> io::Result<FinalizedReceive>
+where
+    S: FnMut(&Path, &Path) -> io::Result<()>,
+    H: FnMut(FinalizationPhase) -> io::Result<()>,
+{
+    if !reservation_is_owned(&candidate, transfer_id, reservation_token)? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "复制完成前目标文件占位所有权已变化",
+        ));
+    }
+    let candidate_identity = file_identity(&candidate_file)?;
+    let source_length = partial_file.metadata()?.len();
+    phase_hook(FinalizationPhase::BeforeCopy)?;
+    candidate_file.set_len(0)?;
+    candidate_file.seek(SeekFrom::Start(0))?;
+    let mut source = partial_file;
+    source.seek(SeekFrom::Start(0))?;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    let mut injected_during_copy = false;
+    loop {
+        let read = source.read(&mut buffer)?;
+        if read == 0 {
+            break;
         }
+        candidate_file.write_all(&buffer[..read])?;
         if !injected_during_copy {
+            injected_during_copy = true;
             phase_hook(FinalizationPhase::DuringCopy)?;
         }
-        staged_file.flush()?;
-        staged_file.sync_all()?;
-        phase_hook(FinalizationPhase::AfterCopySync)?;
-        match fs::hard_link(staged, &candidate) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
-        }
-        phase_hook(FinalizationPhase::AfterFinalNameCreation)?;
-        phase_hook(FinalizationPhase::BeforeCopyMaterializedJournal)?;
-        append_finalization_record_with_stage(
+    }
+    if !injected_during_copy {
+        phase_hook(FinalizationPhase::DuringCopy)?;
+    }
+    candidate_file.flush()?;
+    candidate_file.sync_all()?;
+    if candidate_file.metadata()?.len() != source_length {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "复制目标文件长度不完整",
+        ));
+    }
+    phase_hook(FinalizationPhase::AfterCopySync)?;
+    if !reservation_is_owned(&candidate, transfer_id, reservation_token)?
+        || !path_has_file_identity(&candidate, candidate_identity)?
+    {
+        return prepare_copy_candidate(
+            partial_file,
             reserved_destination,
+            candidate,
+            previous,
+            retained_legacy_stage,
+            file_name,
             transfer_id,
             reservation_token,
-            &candidate,
-            &previous,
-            Some(staged),
-            staged_identity,
-            FinalizationState::Created,
-        )?;
-        phase_hook(FinalizationPhase::AfterFinalJournalSync)?;
-        return Ok(FinalizedReceive {
-            path: candidate,
-            reservation_released: false,
-        });
+            persist_switch,
+            phase_hook,
+        );
     }
+    phase_hook(FinalizationPhase::AfterFinalNameCreation)?;
+    phase_hook(FinalizationPhase::BeforeCopyMaterializedJournal)?;
+    append_finalization_record_with_stage(
+        reserved_destination,
+        transfer_id,
+        reservation_token,
+        &candidate,
+        &previous,
+        retained_legacy_stage
+            .as_ref()
+            .map(|(path, _)| path.as_path()),
+        retained_legacy_stage
+            .as_ref()
+            .map(|(_, identity)| *identity),
+        candidate_identity,
+        FinalizationState::Created,
+    )?;
+    phase_hook(FinalizationPhase::AfterFinalJournalSync)?;
+    Ok(FinalizedReceive {
+        path: candidate,
+        reservation_released: false,
+    })
 }
 
 pub fn owned_finalized_receive_path(
@@ -905,6 +982,41 @@ pub fn remove_owned_finalization_stage(
     transfer_id: &str,
     reservation_token: &str,
 ) -> io::Result<bool> {
+    remove_owned_finalization_stage_internal(
+        reserved_destination,
+        transfer_id,
+        reservation_token,
+        || Ok(()),
+    )
+}
+
+#[cfg(test)]
+fn remove_owned_finalization_stage_with_hook<H>(
+    reserved_destination: &Path,
+    transfer_id: &str,
+    reservation_token: &str,
+    after_verified_open: H,
+) -> io::Result<bool>
+where
+    H: FnOnce() -> io::Result<()>,
+{
+    remove_owned_finalization_stage_internal(
+        reserved_destination,
+        transfer_id,
+        reservation_token,
+        after_verified_open,
+    )
+}
+
+fn remove_owned_finalization_stage_internal<H>(
+    reserved_destination: &Path,
+    transfer_id: &str,
+    reservation_token: &str,
+    after_verified_open: H,
+) -> io::Result<bool>
+where
+    H: FnOnce() -> io::Result<()>,
+{
     let Some(record) =
         read_finalization_record(reserved_destination, transfer_id, reservation_token)?
     else {
@@ -925,11 +1037,11 @@ pub fn remove_owned_finalization_stage(
         Err(error) if is_no_follow_rejection(&error) => return Ok(false),
         Err(error) => return Err(error),
     };
-    if file_identity(&staged_file)? != record.identity {
+    if file_identity(&staged_file)? != record.staged_identity.unwrap_or(record.identity) {
         return Ok(false);
     }
-    fs::remove_file(staged)?;
-    Ok(true)
+    after_verified_open()?;
+    Ok(false)
 }
 
 pub fn finalize_reserved_receive(
@@ -1015,6 +1127,8 @@ struct FinalizationRecord {
     previous: Vec<String>,
     #[serde(default)]
     staged: Option<String>,
+    #[serde(default)]
+    staged_identity: Option<FileIdentity>,
     identity: FileIdentity,
     state: FinalizationState,
 }
@@ -1035,6 +1149,7 @@ fn append_finalization_record(
         candidate,
         previous,
         None,
+        None,
         identity,
         state,
     )
@@ -1047,6 +1162,7 @@ fn append_finalization_record_with_stage(
     candidate: &Path,
     previous: &[PathBuf],
     staged: Option<&Path>,
+    staged_identity: Option<FileIdentity>,
     identity: FileIdentity,
     state: FinalizationState,
 ) -> io::Result<()> {
@@ -1079,6 +1195,7 @@ fn append_finalization_record_with_stage(
         candidate,
         previous,
         staged,
+        staged_identity,
         identity,
         state,
     };
@@ -1144,7 +1261,7 @@ fn read_finalization_record(
                 .staged
                 .as_deref()
                 .is_some_and(|name| !valid_finalization_stage_name(name, transfer_id))
-            || (record.state == FinalizationState::CopyPrepared && record.staged.is_none())
+            || (record.staged_identity.is_some() && record.staged.is_none())
         {
             continue;
         }
@@ -1260,6 +1377,49 @@ fn is_no_follow_rejection(error: &io::Error) -> bool {
         return true;
     }
     false
+}
+
+#[cfg(unix)]
+fn create_new_regular_file_no_follow(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "复制目标不是普通文件",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn create_new_regular_file_no_follow(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let information = windows_file_information(&file)?;
+    if information.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY) != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "复制目标是重解析点或目录",
+        ));
+    }
+    Ok(file)
 }
 
 #[cfg(unix)]
@@ -1523,17 +1683,18 @@ fn reservation_payload(transfer_id: &str, reservation_token: &str) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, io};
+    use std::{fs, io, io::Write as _};
 
     use super::{
-        FinalizationPhase, commit_without_overwrite, copy_without_overwrite,
-        finalize_reserved_receive, finalize_reserved_receive_copy_fallback_with_hooks,
-        finalize_reserved_receive_durable, finalize_reserved_receive_durable_with_hooks,
-        owned_finalization_reservations, owned_finalized_receive_path, partial_owner_sidecar_path,
-        remove_owned_finalization_stage, remove_owned_partial, remove_owned_reservation,
-        reservation_is_owned, reserve_available_receive_path, reserve_receive_path,
-        reserve_resumable_partial, resumable_partial_is_owned, resumable_partial_path,
-        safe_file_name,
+        FinalizationPhase, FinalizationState, append_finalization_record_with_stage,
+        commit_without_overwrite, copy_without_overwrite, file_identity, finalize_reserved_receive,
+        finalize_reserved_receive_copy_fallback_with_hooks, finalize_reserved_receive_durable,
+        finalize_reserved_receive_durable_with_hooks, owned_finalization_reservations,
+        owned_finalized_receive_path, partial_owner_sidecar_path, remove_owned_finalization_stage,
+        remove_owned_finalization_stage_with_hook, remove_owned_partial, remove_owned_reservation,
+        reservation_is_owned, reserve_available_receive_path, reserve_finalization_stage,
+        reserve_receive_path, reserve_resumable_partial, resumable_partial_is_owned,
+        resumable_partial_path, safe_file_name,
     };
 
     fn temporary_directory(label: &str) -> std::path::PathBuf {
@@ -2059,6 +2220,7 @@ mod tests {
             FinalizationPhase::DuringCopy,
             FinalizationPhase::AfterCopySync,
             FinalizationPhase::BeforeCopyMaterializedJournal,
+            FinalizationPhase::AfterFinalJournalSync,
         ];
         for phase in phases {
             let directory = temporary_directory(&format!("copy-fallback-{phase:?}"));
@@ -2070,6 +2232,7 @@ mod tests {
                 .expect("reserve partial");
             let payload = vec![0x5a; 192 * 1024];
             fs::write(&partial, &payload).expect("write complete partial");
+            let hard_link_calls = std::cell::Cell::new(0_u32);
 
             let error = finalize_reserved_receive_copy_fallback_with_hooks(
                 &partial,
@@ -2078,6 +2241,13 @@ mod tests {
                 "copy-transfer",
                 "copy-token",
                 |_, _| Ok(()),
+                |_, _| {
+                    hard_link_calls.set(hard_link_calls.get() + 1);
+                    Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "representative filesystem does not support hard links",
+                    ))
+                },
                 |current| {
                     if current == phase {
                         Err(io::Error::other(format!(
@@ -2092,38 +2262,127 @@ mod tests {
             .expect("copy crash is injected");
             assert!(error.to_string().contains("injected copy crash"));
             assert_eq!(fs::read(&partial).unwrap(), payload);
-            assert_eq!(
-                owned_finalized_receive_path(&destination, "copy-transfer", "copy-token").unwrap(),
-                None,
-                "prepared or unjournaled copy output is never complete"
+            assert!(
+                destination.exists(),
+                "the exact token-owned candidate is the copy target"
             );
-            if phase != FinalizationPhase::BeforeCopyMaterializedJournal {
-                assert!(!destination.exists(), "incomplete bytes stay hidden");
+            if phase == FinalizationPhase::AfterFinalJournalSync {
+                assert_eq!(
+                    owned_finalized_receive_path(&destination, "copy-transfer", "copy-token")
+                        .unwrap(),
+                    Some(destination.clone()),
+                    "a fully synced materialized record is restart completion authority"
+                );
+            } else {
+                assert_eq!(
+                    owned_finalized_receive_path(&destination, "copy-transfer", "copy-token")
+                        .unwrap(),
+                    None,
+                    "an incomplete or unmaterialized candidate is never complete"
+                );
             }
 
-            let finalized = finalize_reserved_receive_copy_fallback_with_hooks(
-                &partial,
-                &destination,
-                "report.bin",
-                "copy-transfer",
-                "copy-token",
-                |_, _| Ok(()),
-                |_| Ok(()),
-            )
-            .expect("retry copy finalization");
+            let finalized = if phase == FinalizationPhase::AfterFinalJournalSync {
+                super::FinalizedReceive {
+                    path: owned_finalized_receive_path(&destination, "copy-transfer", "copy-token")
+                        .unwrap()
+                        .expect("restart recovers fully materialized candidate"),
+                    reservation_released: false,
+                }
+            } else {
+                finalize_reserved_receive_copy_fallback_with_hooks(
+                    &partial,
+                    &destination,
+                    "report.bin",
+                    "copy-transfer",
+                    "copy-token",
+                    |_, _| Ok(()),
+                    |_, _| {
+                        hard_link_calls.set(hard_link_calls.get() + 1);
+                        Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "representative filesystem does not support hard links",
+                        ))
+                    },
+                    |_| Ok(()),
+                )
+                .expect("retry copy finalization")
+            };
             assert_eq!(finalized.path, destination);
             assert_eq!(fs::read(&destination).unwrap(), payload);
+            assert_eq!(
+                hard_link_calls.get(),
+                1,
+                "unsupported hard links are probed once and never required by fallback"
+            );
             assert_eq!(
                 owned_finalized_receive_path(&destination, "copy-transfer", "copy-token").unwrap(),
                 Some(destination.clone())
             );
             assert!(
                 remove_owned_finalization_stage(&destination, "copy-transfer", "copy-token")
-                    .expect("remove exact owned copy stage")
+                    .expect("a stage-free fallback has nothing unsafe to remove")
             );
             assert_eq!(fs::read(&destination).unwrap(), payload);
+            assert!(
+                fs::read_dir(&directory).unwrap().all(|entry| {
+                    !entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".weline-localnet-finalize-stage-")
+                }),
+                "new copy fallback never persists a hidden stage pathname"
+            );
             fs::remove_dir_all(directory).expect("remove fixture");
         }
+    }
+
+    #[test]
+    fn unsupported_hard_link_fallback_materializes_without_a_second_link_attempt() {
+        let directory = temporary_directory("copy-fallback-no-second-link");
+        fs::create_dir_all(&directory).expect("create receive directory");
+        let destination = directory.join("report.bin");
+        reserve_receive_path(&destination, "copy-no-link", "copy-token")
+            .expect("reserve destination");
+        let partial = reserve_resumable_partial(&destination, "copy-no-link", "copy-token")
+            .expect("reserve partial");
+        let payload = vec![0xa5; 160 * 1024];
+        fs::write(&partial, &payload).expect("write complete partial");
+        let hard_link_calls = std::cell::Cell::new(0_u32);
+
+        let finalized = finalize_reserved_receive_copy_fallback_with_hooks(
+            &partial,
+            &destination,
+            "report.bin",
+            "copy-no-link",
+            "copy-token",
+            |_, _| Ok(()),
+            |_, _| {
+                hard_link_calls.set(hard_link_calls.get() + 1);
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "representative filesystem does not support hard links",
+                ))
+            },
+            |_| Ok(()),
+        )
+        .expect("ordinary create, write, flush, and sync materialize the fallback");
+
+        assert_eq!(hard_link_calls.get(), 1);
+        assert_eq!(finalized.path, destination);
+        assert_eq!(fs::read(&destination).unwrap(), payload);
+        assert!(
+            fs::read_dir(&directory).unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".weline-localnet-finalize-stage-")
+            }),
+            "fallback must not create a stage that itself needs a hard link"
+        );
+        fs::remove_dir_all(directory).expect("remove fixture");
     }
 
     #[test]
@@ -2140,6 +2399,8 @@ mod tests {
         fs::write(&partial, &payload).expect("write partial");
         let injected = std::cell::Cell::new(false);
         let switched = std::cell::RefCell::new(None);
+        let displaced_owned_candidate = directory.join("detached-owned-copy.bin");
+        let hard_link_calls = std::cell::Cell::new(0_u32);
 
         let finalized = finalize_reserved_receive_copy_fallback_with_hooks(
             &partial,
@@ -2151,8 +2412,16 @@ mod tests {
                 *switched.borrow_mut() = Some((previous.to_path_buf(), next.to_path_buf()));
                 Ok(())
             },
+            |_, _| {
+                hard_link_calls.set(hard_link_calls.get() + 1);
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "representative filesystem does not support hard links",
+                ))
+            },
             |phase| {
                 if phase == FinalizationPhase::AfterCopySync && !injected.replace(true) {
+                    fs::rename(&destination, &displaced_owned_candidate)?;
                     fs::write(&destination, b"late user collision")?;
                 }
                 Ok(())
@@ -2163,10 +2432,173 @@ mod tests {
         assert_eq!(finalized.path, replacement);
         assert_eq!(fs::read(&destination).unwrap(), b"late user collision");
         assert_eq!(fs::read(&replacement).unwrap(), payload);
+        assert_eq!(fs::read(&displaced_owned_candidate).unwrap(), payload);
+        assert_eq!(hard_link_calls.get(), 1);
         assert_eq!(
             *switched.borrow(),
             Some((destination.clone(), replacement.clone()))
         );
+        fs::remove_dir_all(directory).expect("remove fixture");
+    }
+
+    #[test]
+    fn hard_link_identity_mismatch_never_deletes_a_concurrent_candidate_replacement() {
+        let directory = temporary_directory("hard-link-candidate-replacement");
+        fs::create_dir_all(&directory).expect("create receive directory");
+        let destination = directory.join("report.bin");
+        let detached_owned_link = directory.join("detached-owned-link.bin");
+        reserve_receive_path(&destination, "link-replacement", "link-token")
+            .expect("reserve destination");
+        let partial = reserve_resumable_partial(&destination, "link-replacement", "link-token")
+            .expect("reserve partial");
+        fs::write(&partial, b"owned link payload").expect("write partial");
+
+        let error = finalize_reserved_receive_copy_fallback_with_hooks(
+            &partial,
+            &destination,
+            "report.bin",
+            "link-replacement",
+            "link-token",
+            |_, _| Ok(()),
+            |source, candidate| {
+                fs::hard_link(source, candidate)?;
+                fs::rename(candidate, &detached_owned_link)?;
+                fs::write(candidate, b"concurrent user replacement")?;
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .err()
+        .expect("identity mismatch aborts this finalization attempt");
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            fs::read(&destination).unwrap(),
+            b"concurrent user replacement"
+        );
+        assert_eq!(
+            fs::read(&detached_owned_link).unwrap(),
+            b"owned link payload"
+        );
+        assert_eq!(fs::read(&partial).unwrap(), b"owned link payload");
+        fs::remove_dir_all(directory).expect("remove fixture");
+    }
+
+    #[test]
+    fn legacy_stage_cleanup_never_unlinks_a_concurrent_path_replacement() {
+        let directory = temporary_directory("legacy-stage-cleanup-race");
+        fs::create_dir_all(&directory).expect("create receive directory");
+        let destination = directory.join("report.bin");
+        reserve_receive_path(&destination, "legacy-stage", "legacy-token")
+            .expect("reserve destination");
+        let (staged, mut staged_file) =
+            reserve_finalization_stage(&directory, "legacy-stage").expect("reserve legacy stage");
+        staged_file
+            .write_all(b"legacy owned stage")
+            .expect("write legacy stage");
+        staged_file.sync_all().expect("sync legacy stage");
+        let staged_identity = file_identity(&staged_file).expect("capture legacy stage identity");
+        append_finalization_record_with_stage(
+            &destination,
+            "legacy-stage",
+            "legacy-token",
+            &destination,
+            &[],
+            Some(&staged),
+            None,
+            staged_identity,
+            FinalizationState::CopyPrepared,
+        )
+        .expect("write backward-compatible CopyPrepared row");
+        drop(staged_file);
+        let detached = directory.join("detached-legacy-stage");
+
+        let cleaned = remove_owned_finalization_stage_with_hook(
+            &destination,
+            "legacy-stage",
+            "legacy-token",
+            || {
+                fs::rename(&staged, &detached)?;
+                fs::write(&staged, b"concurrent user replacement")?;
+                Ok(())
+            },
+        )
+        .expect("legacy cleanup remains fail-closed");
+
+        assert_eq!(fs::read(&staged).unwrap(), b"concurrent user replacement");
+        assert!(
+            !cleaned,
+            "legacy cleanup retains authority instead of unlinking by name"
+        );
+        assert_eq!(fs::read(&detached).unwrap(), b"legacy owned stage");
+        fs::remove_dir_all(directory).expect("remove fixture");
+    }
+
+    #[test]
+    fn legacy_copy_prepared_stage_recovers_without_hard_links_and_retains_cleanup_authority() {
+        let directory = temporary_directory("legacy-stage-recovery");
+        fs::create_dir_all(&directory).expect("create receive directory");
+        let destination = directory.join("report.bin");
+        reserve_receive_path(&destination, "legacy-recovery", "legacy-token")
+            .expect("reserve destination");
+        let partial = reserve_resumable_partial(&destination, "legacy-recovery", "legacy-token")
+            .expect("reserve partial");
+        let payload = vec![0x77; 80 * 1024];
+        fs::write(&partial, &payload).expect("write complete partial");
+        let (staged, mut staged_file) = reserve_finalization_stage(&directory, "legacy-recovery")
+            .expect("reserve legacy stage");
+        staged_file
+            .write_all(&payload[..32 * 1024])
+            .expect("write interrupted legacy stage");
+        staged_file
+            .sync_all()
+            .expect("sync interrupted legacy stage");
+        let staged_identity = file_identity(&staged_file).expect("capture legacy stage identity");
+        append_finalization_record_with_stage(
+            &destination,
+            "legacy-recovery",
+            "legacy-token",
+            &destination,
+            &[],
+            Some(&staged),
+            None,
+            staged_identity,
+            FinalizationState::CopyPrepared,
+        )
+        .expect("write old CopyPrepared journal shape");
+        drop(staged_file);
+        let hard_link_calls = std::cell::Cell::new(0_u32);
+
+        let finalized = finalize_reserved_receive_copy_fallback_with_hooks(
+            &partial,
+            &destination,
+            "report.bin",
+            "legacy-recovery",
+            "legacy-token",
+            |_, _| Ok(()),
+            |_, _| {
+                hard_link_calls.set(hard_link_calls.get() + 1);
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "legacy filesystem still does not support hard links",
+                ))
+            },
+            |_| Ok(()),
+        )
+        .expect("recover old stage journal through direct candidate copy");
+
+        assert_eq!(hard_link_calls.get(), 0);
+        assert_eq!(finalized.path, destination);
+        assert_eq!(fs::read(&destination).unwrap(), payload);
+        let cleaned =
+            remove_owned_finalization_stage(&destination, "legacy-recovery", "legacy-token")
+                .expect("clean legacy stage using retained identity authority");
+        assert!(
+            !cleaned,
+            "legacy pathname cleanup remains deliberately pending"
+        );
+        assert!(staged.exists());
+        assert_eq!(fs::read(&destination).unwrap(), payload);
         fs::remove_dir_all(directory).expect("remove fixture");
     }
 }

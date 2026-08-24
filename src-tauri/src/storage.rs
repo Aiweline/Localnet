@@ -2824,7 +2824,7 @@ fn validate_loaded_optional_sha256(value: Option<String>) -> Result<Option<Strin
 #[cfg(test)]
 mod tests {
     use std::{
-        fs,
+        fs, io,
         path::{Path, PathBuf},
         sync::{Arc, Barrier},
         thread,
@@ -2840,6 +2840,7 @@ mod tests {
             TransferStatus,
         },
         receive_paths::{
+            FinalizationPhase, finalize_reserved_receive_copy_fallback_with_hooks,
             finalize_reserved_receive_durable, finalize_reserved_receive_durable_with_hooks,
             reservation_is_owned, reserve_receive_path, reserve_resumable_partial,
             resumable_partial_path,
@@ -4802,6 +4803,143 @@ mod tests {
 
         drop(storage);
         fs::remove_dir_all(fixture).expect("remove storage fixture");
+    }
+
+    #[test]
+    fn startup_never_accepts_an_incomplete_copy_candidate_and_completes_after_retry() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-copy-candidate-restart-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&fixture).expect("create storage fixture");
+        let database = fixture.join("localnet.sqlite3");
+        initialize_database(&database);
+        let destination = fixture.join("report.bin");
+        let transfer_id = "copy-candidate-restart";
+        let token = "token-copy-candidate-restart";
+        let payload = vec![0x6d; 192 * 1024];
+        let chunk = TransferChunk {
+            index: 0,
+            length: u32::try_from(payload.len()).expect("small payload"),
+            sha256: Sha256::digest(&payload).into(),
+        };
+        reserve_receive_path(&destination, transfer_id, token).expect("reserve destination");
+        let partial = reserve_resumable_partial(&destination, transfer_id, token)
+            .expect("reserve owned partial");
+        fs::write(&partial, &payload).expect("write completed partial");
+        {
+            let connection = Connection::open(&database).expect("open fixture database");
+            connection
+                .execute(
+                    "INSERT INTO transfers
+                       (transfer_id, peer_id, direction, kind, file_name, file_size, mime_type,
+                        sha256, local_path, destination_reserved, reservation_token,
+                        receive_claimed, transfer_protocol, chunk_size, chunk_count, manifest_sha256,
+                        partial_path, transferred_bytes, status, created_at, updated_at)
+                     VALUES (?1, 'peer-one', 'incoming', 'file', 'report.bin', ?2,
+                             'application/octet-stream', ?3, ?4, 1, ?5, 1, 2, ?6, 1, ?7,
+                             ?8, ?2, 'transferring', ?9, ?9)",
+                    rusqlite::params![
+                        transfer_id,
+                        payload.len(),
+                        hex::encode(Sha256::digest(&payload)),
+                        destination.to_string_lossy(),
+                        token,
+                        TRANSFER_CHUNK_BYTES,
+                        hex::encode(manifest_root(std::slice::from_ref(&chunk))),
+                        partial.to_string_lossy(),
+                        "2026-08-24T00:00:00.000Z",
+                    ],
+                )
+                .expect("insert claimed incoming transfer");
+            connection
+                .execute(
+                    "INSERT INTO transfer_chunks
+                       (transfer_id, chunk_index, chunk_length, sha256)
+                     VALUES (?1, 0, ?2, ?3)",
+                    rusqlite::params![transfer_id, chunk.length, chunk.sha256.as_slice()],
+                )
+                .expect("insert committed chunk");
+        }
+        let first_link_calls = std::cell::Cell::new(0_u32);
+        let error = finalize_reserved_receive_copy_fallback_with_hooks(
+            &partial,
+            &destination,
+            "report.bin",
+            transfer_id,
+            token,
+            |_, _| Ok(()),
+            |_, _| {
+                first_link_calls.set(first_link_calls.get() + 1);
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "representative filesystem does not support hard links",
+                ))
+            },
+            |phase| {
+                if phase == FinalizationPhase::DuringCopy {
+                    Err(io::Error::other("injected copy interruption"))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .err()
+        .expect("copy interruption precedes candidate sync and materialized journal");
+        assert!(error.to_string().contains("injected copy interruption"));
+        assert_eq!(first_link_calls.get(), 1);
+        assert!(destination.metadata().unwrap().len() < payload.len() as u64);
+
+        let storage = Storage::open(&database).expect("restart with incomplete copy candidate");
+        let paused = storage
+            .get_transfer(transfer_id)
+            .unwrap()
+            .expect("transfer remains recoverable");
+        assert_eq!(paused.status, TransferStatus::Paused);
+        assert!(paused.destination_reserved);
+        assert_eq!(paused.transferred_bytes, payload.len() as u64);
+        assert!(destination.metadata().unwrap().len() < payload.len() as u64);
+        drop(storage);
+
+        let retry_link_calls = std::cell::Cell::new(0_u32);
+        let finalized = finalize_reserved_receive_copy_fallback_with_hooks(
+            &partial,
+            &destination,
+            "report.bin",
+            transfer_id,
+            token,
+            |_, _| Ok(()),
+            |_, _| {
+                retry_link_calls.set(retry_link_calls.get() + 1);
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "representative filesystem does not support hard links",
+                ))
+            },
+            |_| Ok(()),
+        )
+        .expect("retry restarts through the same owned candidate identity");
+        assert_eq!(retry_link_calls.get(), 0);
+        assert_eq!(finalized.path, destination);
+        assert_eq!(fs::read(&destination).unwrap(), payload);
+
+        let storage = Storage::open(&database).expect("restart after candidate materialization");
+        let completed = storage
+            .get_transfer(transfer_id)
+            .unwrap()
+            .expect("transfer completes from durable journal");
+        assert_eq!(completed.status, TransferStatus::Completed);
+        assert_eq!(
+            completed.local_path.as_deref(),
+            Some(destination.to_string_lossy().as_ref())
+        );
+        assert!(!completed.destination_reserved);
+        assert!(completed.reservation_token.is_none());
+        assert!(completed.partial_path.is_none());
+        assert_eq!(fs::read(&destination).unwrap(), payload);
+
+        drop(storage);
+        fs::remove_dir_all(fixture).expect("remove fixture");
     }
 
     #[test]
