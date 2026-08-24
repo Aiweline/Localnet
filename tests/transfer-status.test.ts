@@ -58,6 +58,10 @@ test("keeps persisted network and unknown paused errors on the resumable waiting
     "UnexpectedEof while receiving stream",
     "BrokenPipe: peer offline",
     "network permission denied",
+    "cannot access network peer",
+    "unable to write to network stream",
+    "peer access denied",
+    "source file permission denied",
     "opaque backend failure 472",
   ]) {
     const presentation = present({
@@ -83,9 +87,22 @@ test("keeps only volume and destination paused errors actionable", () => {
     "FAT32 volume does not support this file size",
     "insufficient free disk space on the destination volume",
     "disk is full",
+    "volume has no space",
     "filesystem permission denied",
+    "cannot access destination directory",
+    "unable to access destination volume",
+    "cannot write destination",
+    "unable to write receive folder",
+    "filesystem access denied",
     "read-only volume",
     "missing destination directory",
+    "destination is not ready",
+    "destination file size limit exceeded",
+    "无法访问目标目录",
+    "无法写入保存目录",
+    "访问失败：接收目录不可用",
+    "写入失败：磁盘已满",
+    "文件系统权限不足",
   ]) {
     const presentation = present({
       direction: "incoming",

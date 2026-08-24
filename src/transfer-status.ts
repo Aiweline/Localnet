@@ -81,7 +81,7 @@ function isActionableDestinationError(error: string): boolean {
   if (filesystemLimit) return true;
 
   const destinationObject = /\b(?:disk|drive|volume|filesystem|file system|destination|directory|receive folder)\b|磁盘|磁碟|驱动器|驅動器|卷|文件系统|文件系統|目标|目標|保存目录|保存目錄|接收目录|接收目錄/i;
-  const actionableCondition = /\b(?:full|no space|insufficient|free space|permission denied|read[- ]only|not writable|unavailable|not found|missing|not ready|disconnected device|limit|too large)\b|空间不足|空間不足|已满|已滿|不可写|不可寫|权限|權限|只读|只讀|不可用|未找到|未就绪|未就緒|限制|过大|過大|无法访问|無法訪問|无法写入|無法寫入/i;
+  const actionableCondition = /\b(?:full|no space|insufficient|free space|permission denied|access denied|read[- ]only|not writable|unavailable|not found|missing|not ready|disconnected device|limit|too large|cannot access|unable to access|cannot write|unable to write|unsupported|maximum file size|file size limit)\b|空间不足|空間不足|已满|已滿|不可写|不可寫|权限|權限|只读|只讀|不可用|未找到|未就绪|未就緒|限制|过大|過大|无法访问|無法訪問|无法写入|無法寫入|访问失败|訪問失敗|写入失败|寫入失敗|无法识别|無法識別|不可访问|不可訪問/i;
   return destinationObject.test(normalized) && actionableCondition.test(normalized);
 }
 
