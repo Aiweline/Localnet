@@ -8,6 +8,7 @@ mod receive_paths;
 mod state;
 mod storage;
 pub mod transfer_policy;
+pub mod volume_preflight;
 
 use std::{path::PathBuf, sync::OnceLock};
 

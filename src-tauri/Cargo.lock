@@ -3069,6 +3069,7 @@ dependencies = [
  "hex",
  "if-addrs",
  "keyring",
+ "libc",
  "libp2p",
  "libp2p-stream",
  "rusqlite",
@@ -3087,6 +3088,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
