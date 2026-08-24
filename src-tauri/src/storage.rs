@@ -1,5 +1,5 @@
 use std::{
-    fs::{self, OpenOptions},
+    fs,
     io::Read,
     path::{Path, PathBuf},
     str::FromStr,
@@ -17,8 +17,9 @@ use crate::{
     },
     error::AppError,
     receive_paths::{
-        owned_finalization_reservations, owned_finalized_receive_path,
-        remove_owned_finalization_marker, remove_owned_partial,
+        open_owned_resumable_partial_file, owned_finalization_reservations,
+        owned_finalized_receive_path, remove_owned_finalization_marker,
+        remove_owned_finalization_stage, remove_owned_partial,
         remove_owned_partial_marker_after_file_cleanup, remove_owned_reservation,
         remove_owned_reservations_in_directory, reserve_resumable_partial,
         resumable_partial_is_owned, resumable_partial_path,
@@ -1724,6 +1725,17 @@ impl Storage {
         &self,
         record: &PartialRecoveryRecord,
     ) -> Result<(), AppError> {
+        self.reconcile_claimed_resumable_partial_with_hook(record, || Ok(()))
+    }
+
+    fn reconcile_claimed_resumable_partial_with_hook<F>(
+        &self,
+        record: &PartialRecoveryRecord,
+        after_owned_open: F,
+    ) -> Result<(), AppError>
+    where
+        F: FnOnce() -> std::io::Result<()>,
+    {
         let file_size = u64::try_from(record.file_size)
             .map_err(|_| AppError::Storage("可恢复文件大小无效".to_string()))?;
         let chunk_size = u32::try_from(record.chunk_size)
@@ -1779,21 +1791,27 @@ impl Storage {
             return Ok(());
         }
 
-        let active_partial = if resumable_partial_is_owned(
+        let (active_partial, active_file) = match open_owned_resumable_partial_file(
             &persisted_partial,
             destination,
             &record.transfer_id,
             token,
         )? {
-            persisted_partial
-        } else {
-            reserve_resumable_partial(destination, &record.transfer_id, token)?
+            Some(file) => (persisted_partial, file),
+            None => {
+                let partial = reserve_resumable_partial(destination, &record.transfer_id, token)?;
+                let file = open_owned_resumable_partial_file(
+                    &partial,
+                    destination,
+                    &record.transfer_id,
+                    token,
+                )?
+                .ok_or_else(|| AppError::Storage("新建部分文件的所有权验证失败".to_string()))?;
+                (partial, file)
+            }
         };
-        let partial_metadata = fs::metadata(&active_partial)?;
-        if !partial_metadata.is_file() {
-            return Err(AppError::Storage("可恢复部分路径不是普通文件".to_string()));
-        }
-        let partial_length = partial_metadata.len();
+        after_owned_open()?;
+        let partial_length = active_file.metadata()?.len();
         let available_bytes = partial_length.min(committed_bytes);
         let trusted_bytes = self.largest_complete_received_boundary(
             record,
@@ -1802,10 +1820,10 @@ impl Storage {
             available_bytes,
         )?;
         if trusted_bytes < committed_bytes {
-            truncate_and_sync(&active_partial, trusted_bytes)?;
+            truncate_file_and_sync(&active_file, trusted_bytes)?;
             self.rollback_resumable_progress(record, trusted_bytes, Some(&active_partial))?;
         } else if partial_length > committed_bytes {
-            truncate_and_sync(&active_partial, committed_bytes)?;
+            truncate_file_and_sync(&active_file, committed_bytes)?;
             self.finish_claimed_incoming_recovery(record, &active_partial)?;
         } else {
             self.finish_claimed_incoming_recovery(record, &active_partial)?;
@@ -2242,15 +2260,30 @@ impl Storage {
                 record.destination.as_deref(),
                 record.reservation_token.as_deref(),
             ) {
-                if let Err(error) =
-                    remove_owned_finalization_marker(destination, &record.transfer_id, token)
-                {
-                    finalization_marker_cleaned = false;
-                    tracing::warn!(
-                        transfer_id = %record.transfer_id,
-                        %error,
-                        "failed to clean receive finalization marker"
-                    );
+                match remove_owned_finalization_stage(destination, &record.transfer_id, token) {
+                    Ok(true) => {
+                        if let Err(error) = remove_owned_finalization_marker(
+                            destination,
+                            &record.transfer_id,
+                            token,
+                        ) {
+                            finalization_marker_cleaned = false;
+                            tracing::warn!(
+                                transfer_id = %record.transfer_id,
+                                %error,
+                                "failed to clean receive finalization marker"
+                            );
+                        }
+                    }
+                    Ok(false) => finalization_marker_cleaned = false,
+                    Err(error) => {
+                        finalization_marker_cleaned = false;
+                        tracing::warn!(
+                            transfer_id = %record.transfer_id,
+                            %error,
+                            "failed to clean receive finalization stage"
+                        );
+                    }
                 }
             }
         }
@@ -2383,7 +2416,17 @@ impl Storage {
                 .collect::<Result<Vec<_>, _>>()?
         };
         for record in records {
-            self.cleanup_pending_terminal_artifact(&record)?;
+            if let Err(error) = self.cleanup_pending_terminal_artifact(&record) {
+                if terminal_cleanup_media_is_unavailable(&error) {
+                    tracing::warn!(
+                        transfer_id = %record.transfer_id,
+                        %error,
+                        "deferring terminal artifact cleanup until destination media returns"
+                    );
+                    continue;
+                }
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -2468,6 +2511,9 @@ impl Storage {
             record.destination.as_deref(),
             record.reservation_token.as_deref(),
         ) {
+            if !remove_owned_finalization_stage(destination, &record.transfer_id, token)? {
+                return Ok(());
+            }
             remove_owned_finalization_marker(destination, &record.transfer_id, token)?;
         }
         self.connection()?.execute(
@@ -2525,11 +2571,31 @@ struct OwnedArtifactRecord {
     status: String,
 }
 
-fn truncate_and_sync(path: &Path, length: u64) -> Result<(), AppError> {
-    let file = OpenOptions::new().write(true).open(path)?;
+fn truncate_file_and_sync(file: &fs::File, length: u64) -> Result<(), AppError> {
     file.set_len(length)?;
     file.sync_all()?;
     Ok(())
+}
+
+fn terminal_cleanup_media_is_unavailable(error: &AppError) -> bool {
+    let AppError::Io(error) = error else {
+        return false;
+    };
+    if error.kind() == std::io::ErrorKind::NotFound {
+        return true;
+    }
+    #[cfg(windows)]
+    if matches!(error.raw_os_error(), Some(15 | 21 | 1167)) {
+        return true;
+    }
+    #[cfg(unix)]
+    if matches!(
+        error.raw_os_error(),
+        Some(libc::ENODEV | libc::ENXIO | libc::ESTALE)
+    ) {
+        return true;
+    }
+    false
 }
 
 #[derive(Debug)]
@@ -5087,6 +5153,77 @@ mod tests {
     }
 
     #[test]
+    fn recovery_truncates_the_verified_handle_not_a_replacement_path() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-recovery-handle-race-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&fixture).expect("create storage fixture");
+        let database = fixture.join("localnet.sqlite3");
+        let storage = Storage::open(&database).expect("open storage before fixture insertion");
+        let destination = fixture.join("report.bin");
+        let committed = u64::from(TRANSFER_CHUNK_BYTES);
+        let partial = seed_resumable_incoming(
+            &database,
+            &destination,
+            "recovery-handle-race",
+            committed,
+            Some(committed + 73),
+        );
+        {
+            let connection = storage.connection().expect("pause recovery fixture");
+            connection
+                .execute(
+                    "UPDATE transfers SET status = 'paused', receive_claimed = 0
+                     WHERE transfer_id = 'recovery-handle-race'",
+                    [],
+                )
+                .expect("pause transfer");
+        }
+        let record = PartialRecoveryRecord {
+            transfer_id: "recovery-handle-race".to_string(),
+            peer_id: "peer-one".to_string(),
+            destination: Some(destination),
+            partial: Some(partial.clone()),
+            file_size: i64::from(TRANSFER_CHUNK_BYTES) * 2 + 2,
+            chunk_size: i64::from(TRANSFER_CHUNK_BYTES),
+            chunk_count: 3,
+            manifest_sha256: Some("0".repeat(64)),
+            committed_bytes: i64::from(TRANSFER_CHUNK_BYTES),
+            sha256: "0".repeat(64),
+            destination_reserved: true,
+            reservation_token: Some("token-recovery-handle-race".to_string()),
+        };
+        assert!(storage.try_claim_incoming_recovery(&record).unwrap());
+        let detached_owned = fixture.join("detached-owned-partial");
+        let replacement_length = committed + 211;
+
+        storage
+            .reconcile_claimed_resumable_partial_with_hook(&record, || {
+                fs::rename(&partial, &detached_owned)?;
+                fs::File::create(&partial)?.set_len(replacement_length)?;
+                Ok(())
+            })
+            .expect("reconcile through the verified open handle");
+
+        assert_eq!(
+            fs::metadata(&partial).expect("replacement metadata").len(),
+            replacement_length,
+            "the unowned replacement path must not be truncated"
+        );
+        assert_eq!(
+            fs::metadata(&detached_owned)
+                .expect("detached owned metadata")
+                .len(),
+            committed,
+            "the originally verified handle receives the safe truncation"
+        );
+
+        drop(storage);
+        fs::remove_dir_all(fixture).expect("remove fixture");
+    }
+
+    #[test]
     fn startup_never_truncates_an_unowned_deterministic_partial() {
         let fixture = std::env::temp_dir().join(format!(
             "weline-localnet-unowned-recovery-partial-{}",
@@ -5653,6 +5790,138 @@ mod tests {
                 .pending_terminal_cleanup("terminal-cleanup-retry")
                 .unwrap()
                 .is_none()
+        );
+
+        drop(storage);
+        fs::remove_dir_all(fixture).expect("remove fixture");
+    }
+
+    #[test]
+    fn startup_defers_terminal_tombstone_cleanup_while_media_is_unavailable() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-terminal-missing-media-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let media = fixture.join("selected-media");
+        let detached_media = fixture.join("detached-media");
+        fs::create_dir_all(&media).expect("create selected media fixture");
+        let database = fixture.join("localnet.sqlite3");
+        initialize_database(&database);
+        let destination = media.join("report.bin");
+        let partial = seed_resumable_incoming(
+            &database,
+            &destination,
+            "terminal-missing-media",
+            u64::from(TRANSFER_CHUNK_BYTES),
+            Some(u64::from(TRANSFER_CHUNK_BYTES)),
+        );
+        let storage = Storage::open(&database).expect("open storage");
+        {
+            let connection = storage.connection().expect("make transfer terminal");
+            connection
+                .execute(
+                    "UPDATE transfers SET status = 'failed', receive_claimed = 0
+                     WHERE transfer_id = 'terminal-missing-media'",
+                    [],
+                )
+                .expect("persist terminal state");
+        }
+        let record = OwnedArtifactRecord {
+            transfer_id: "terminal-missing-media".to_string(),
+            destination: Some(destination.clone()),
+            partial: Some(partial.clone()),
+            reservation_token: Some("token-terminal-missing-media".to_string()),
+            destination_reserved: true,
+            transfer_protocol: 2,
+            status: "failed".to_string(),
+        };
+        storage
+            .stage_terminal_cleanup(&record)
+            .expect("stage terminal cleanup");
+        drop(storage);
+        fs::rename(&media, &detached_media).expect("simulate removed destination media");
+
+        let storage = Storage::open(&database)
+            .expect("unavailable owned media must not prevent application startup");
+        assert!(
+            storage
+                .pending_terminal_cleanup("terminal-missing-media")
+                .unwrap()
+                .is_some()
+        );
+        drop(storage);
+
+        fs::rename(&detached_media, &media).expect("restore destination media");
+        let storage = Storage::open(&database).expect("retry cleanup after media returns");
+        assert!(
+            storage
+                .pending_terminal_cleanup("terminal-missing-media")
+                .unwrap()
+                .is_none()
+        );
+        assert!(!partial.exists());
+        assert!(
+            !reservation_is_owned(
+                &destination,
+                "terminal-missing-media",
+                "token-terminal-missing-media"
+            )
+            .unwrap()
+        );
+
+        drop(storage);
+        fs::remove_dir_all(fixture).expect("remove fixture");
+    }
+
+    #[test]
+    fn terminal_cleanup_identity_mismatch_preserves_data_and_tombstone() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-terminal-identity-mismatch-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&fixture).expect("create storage fixture");
+        let database = fixture.join("localnet.sqlite3");
+        initialize_database(&database);
+        let destination = fixture.join("report.bin");
+        let partial = seed_resumable_incoming(
+            &database,
+            &destination,
+            "terminal-identity-mismatch",
+            u64::from(TRANSFER_CHUNK_BYTES),
+            Some(u64::from(TRANSFER_CHUNK_BYTES)),
+        );
+        let storage = Storage::open(&database).expect("open storage");
+        {
+            let connection = storage.connection().expect("make transfer terminal");
+            connection
+                .execute(
+                    "UPDATE transfers SET status = 'failed', receive_claimed = 0
+                     WHERE transfer_id = 'terminal-identity-mismatch'",
+                    [],
+                )
+                .expect("persist terminal state");
+        }
+        let record = OwnedArtifactRecord {
+            transfer_id: "terminal-identity-mismatch".to_string(),
+            destination: Some(destination),
+            partial: Some(partial.clone()),
+            reservation_token: Some("token-terminal-identity-mismatch".to_string()),
+            destination_reserved: true,
+            transfer_protocol: 2,
+            status: "failed".to_string(),
+        };
+        storage.stage_terminal_cleanup(&record).unwrap();
+        fs::remove_file(&partial).expect("remove originally owned inode");
+        fs::write(&partial, b"replacement user data").expect("replace partial path");
+        drop(storage);
+
+        let storage = Storage::open(&database).expect("startup keeps unresolved tombstone");
+        assert_eq!(fs::read(&partial).unwrap(), b"replacement user data");
+        assert!(
+            storage
+                .pending_terminal_cleanup("terminal-identity-mismatch")
+                .unwrap()
+                .is_some()
         );
 
         drop(storage);
