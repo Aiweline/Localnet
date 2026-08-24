@@ -55,8 +55,9 @@ export function transferStatusPresentation(
     case "transferring":
       return { label: labels.transferring(percent), tone: "active", percent, showProgress: true, showCancel: false };
     case "paused":
+      const pausedError = normalizePausedError(transfer.error);
       return {
-        label: transfer.error?.trim() || labels.paused,
+        label: isActionableDestinationError(pausedError) ? pausedError : labels.paused,
         tone: "paused",
         percent,
         showProgress: true,
@@ -69,6 +70,21 @@ export function transferStatusPresentation(
     case "failed":
       return { label: labels.failed, tone: "danger", percent, showProgress: false, showCancel: false };
   }
+}
+
+function isActionableDestinationError(error: string): boolean {
+  if (!error) return false;
+
+  const normalized = error.toLowerCase();
+  if (/fat\s*32|\bmsdos\b/.test(normalized)) return true;
+
+  const destination = /磁盘|磁碟|卷|文件系统|文件系統|接收目录|接收目錄|目标目录|目標目錄|保存目录|保存目錄|目的地目录|目的地目錄|目标位置|目標位置|接收位置|destination|target directory|receive directory|receiving directory|disk|drive|volume|filesystem|file system/i;
+  const actionable = /可用空间|可用空間|空间不足|空間不足|可写|可寫|不可写|不可寫|不可用|无法访问|無法訪問|无法写入|無法寫入|无法识别|無法識別|只读|只讀|不可访问|不可訪問|not writable|unavailable|insufficient|free space|no space|read[- ]only|not found|cannot access|unable to access|cannot write|unable to write|unsupported|maximum file size|file size limit/i;
+  return destination.test(error) && actionable.test(error);
+}
+
+function normalizePausedError(error: string | undefined): string {
+  return error?.replace(/\s+/g, " ").trim() ?? "";
 }
 
 function transferPercent(transfer: TransferStatusInput): number {
