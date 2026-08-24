@@ -155,14 +155,18 @@ impl Storage {
 
     pub fn upsert_peer(&self, peer: &PeerSummary) -> Result<(), AppError> {
         let connection = self.connection()?;
+        let capabilities_json = serde_json::to_string(&peer.capabilities)
+            .map_err(|error| AppError::Storage(format!("无法序列化设备能力信息：{error}")))?;
         connection.execute(
-            "INSERT INTO peers (peer_id, nickname, platform, online, protocol_version, last_seen)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO peers
+               (peer_id, nickname, platform, online, protocol_version, capabilities_json, last_seen)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(peer_id) DO UPDATE SET
                nickname = excluded.nickname,
                platform = excluded.platform,
                online = excluded.online,
                protocol_version = excluded.protocol_version,
+               capabilities_json = excluded.capabilities_json,
                last_seen = excluded.last_seen",
             params![
                 peer.peer_id,
@@ -170,6 +174,7 @@ impl Storage {
                 peer.platform.as_str(),
                 peer.online,
                 peer.protocol_version,
+                capabilities_json,
                 peer.last_seen,
             ],
         )?;
@@ -519,28 +524,40 @@ impl Storage {
     fn list_peers(&self) -> Result<Vec<PeerSummary>, AppError> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT peer_id, nickname, platform, online, protocol_version, last_seen
+            "SELECT peer_id, nickname, platform, online, protocol_version, capabilities_json, last_seen
              FROM peers ORDER BY online DESC, nickname COLLATE NOCASE",
         )?;
         let rows = statement.query_map([], |row| {
             let platform: String = row.get(2)?;
+            let capabilities_json: String = row.get(5)?;
             Ok((
                 row.get(0)?,
                 row.get(1)?,
                 platform,
                 row.get(3)?,
                 row.get(4)?,
-                row.get(5)?,
+                capabilities_json,
+                row.get(6)?,
             ))
         })?;
         rows.map(|row| {
-            let (peer_id, nickname, platform, online, protocol_version, last_seen) = row?;
+            let (
+                peer_id,
+                nickname,
+                platform,
+                online,
+                protocol_version,
+                capabilities_json,
+                last_seen,
+            ) = row?;
             Ok(PeerSummary {
                 peer_id,
                 nickname,
                 platform: Platform::from_str(&platform)?,
                 online,
                 protocol_version,
+                capabilities: serde_json::from_str(&capabilities_json)
+                    .map_err(|error| AppError::Storage(format!("本地设备能力信息无效：{error}")))?,
                 last_seen,
             })
         })
@@ -747,6 +764,7 @@ impl Storage {
                platform TEXT NOT NULL,
                online INTEGER NOT NULL DEFAULT 0,
                protocol_version INTEGER NOT NULL,
+               capabilities_json TEXT NOT NULL DEFAULT '[]',
                last_seen TEXT NOT NULL
              );
              CREATE TABLE IF NOT EXISTS friend_requests (
@@ -839,6 +857,19 @@ impl Storage {
                 [],
             )?;
         }
+        let has_capabilities_json: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('peers')
+             WHERE name = 'capabilities_json'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_capabilities_json == 0 {
+            transaction.execute(
+                "ALTER TABLE peers
+                 ADD COLUMN capabilities_json TEXT NOT NULL DEFAULT '[]'",
+                [],
+            )?;
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -911,7 +942,7 @@ mod tests {
     use rusqlite::Connection;
 
     use super::Storage;
-    use crate::domain::{TransferPreferences, TransferStatus};
+    use crate::domain::{PeerSummary, Platform, TransferPreferences, TransferStatus};
 
     #[test]
     fn transfer_preferences_default_to_manual_and_persist_selected_directory() {
@@ -1000,6 +1031,67 @@ mod tests {
             .expect("query migrated column");
         assert_eq!(columns, 3);
         drop(connection);
+        drop(storage);
+        fs::remove_dir_all(fixture).expect("remove storage fixture");
+    }
+
+    #[test]
+    fn existing_peer_table_migrates_and_persists_capabilities() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-peer-capabilities-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&fixture).expect("create storage fixture");
+        let database = fixture.join("localnet.sqlite3");
+        {
+            let connection = Connection::open(&database).expect("open legacy database");
+            connection
+                .execute_batch(
+                    "CREATE TABLE peers (
+                       peer_id TEXT PRIMARY KEY NOT NULL,
+                       nickname TEXT NOT NULL,
+                       platform TEXT NOT NULL,
+                       online INTEGER NOT NULL DEFAULT 0,
+                       protocol_version INTEGER NOT NULL,
+                       last_seen TEXT NOT NULL
+                     );",
+                )
+                .expect("create legacy peers table");
+        }
+
+        let storage = Storage::open(&database).expect("migrate legacy database");
+        let peer = PeerSummary {
+            peer_id: "peer-one".to_string(),
+            nickname: "Peer One".to_string(),
+            platform: Platform::Windows,
+            online: true,
+            protocol_version: 1,
+            capabilities: vec!["file-resume-v2".to_string()],
+            last_seen: "2026-08-24T00:00:00.000Z".to_string(),
+        };
+        storage
+            .upsert_peer(&peer)
+            .expect("persist peer capabilities");
+
+        let connection = storage.connection().expect("inspect migrated database");
+        let columns: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('peers') WHERE name = 'capabilities_json'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query capabilities column");
+        assert_eq!(columns, 1);
+        drop(connection);
+        assert_eq!(
+            storage
+                .get_peer("peer-one")
+                .expect("load peer")
+                .expect("persisted peer")
+                .capabilities,
+            vec!["file-resume-v2"]
+        );
+
         drop(storage);
         fs::remove_dir_all(fixture).expect("remove storage fixture");
     }

@@ -11,6 +11,8 @@ pub struct HelloPayload {
     pub version: u16,
     pub nickname: String,
     pub platform: Platform,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +39,8 @@ pub enum ControlRequest {
         version: u16,
         nickname: String,
         platform: Platform,
+        #[serde(default)]
+        capabilities: Vec<String>,
     },
     FriendRequest {
         request_id: String,
@@ -70,4 +74,31 @@ pub enum ControlResponse {
     Accepted,
     Rejected { code: String, message: String },
     Hello { payload: HelloPayload },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ControlRequest, ControlResponse};
+
+    #[test]
+    fn legacy_hello_messages_default_capabilities_to_empty() {
+        let request: ControlRequest = serde_json::from_str(
+            r#"{"type":"hello","version":1,"nickname":"Legacy","platform":"windows"}"#,
+        )
+        .expect("deserialize legacy hello request");
+        let response: ControlResponse = serde_json::from_str(
+            r#"{"type":"hello","payload":{"version":1,"nickname":"Legacy","platform":"windows"}}"#,
+        )
+        .expect("deserialize legacy hello response");
+
+        let ControlRequest::Hello { capabilities, .. } = request else {
+            panic!("expected hello request");
+        };
+        let ControlResponse::Hello { payload } = response else {
+            panic!("expected hello response");
+        };
+
+        assert!(capabilities.is_empty());
+        assert!(payload.capabilities.is_empty());
+    }
 }

@@ -38,6 +38,7 @@ use crate::{
         ensure_writable_directory, remove_owned_reservation, reserve_available_receive_path,
     },
     storage::Storage,
+    transfer_policy::FILE_RESUME_V2_CAPABILITY,
 };
 
 const EVENT_NAME: &str = "localnet://event";
@@ -451,6 +452,7 @@ impl NetworkRuntime {
                         version: PROTOCOL_VERSION,
                         nickname: self.local_profile.nickname.clone(),
                         platform: self.local_profile.platform,
+                        capabilities: vec![FILE_RESUME_V2_CAPABILITY.to_string()],
                     },
                 );
                 self.pending.insert(outbound_id, PendingAction::Hello);
@@ -589,13 +591,15 @@ impl NetworkRuntime {
                 version,
                 nickname,
                 platform,
+                capabilities,
             } => {
-                self.record_hello(peer_id, version, nickname, platform)?;
+                self.record_hello(peer_id, version, nickname, platform, capabilities)?;
                 Ok(ControlResponse::Hello {
                     payload: HelloPayload {
                         version: PROTOCOL_VERSION,
                         nickname: self.local_profile.nickname.clone(),
                         platform: self.local_profile.platform,
+                        capabilities: vec![FILE_RESUME_V2_CAPABILITY.to_string()],
                     },
                 })
             }
@@ -935,7 +939,13 @@ impl NetworkRuntime {
         };
         match (action, response) {
             (PendingAction::Hello, ControlResponse::Hello { payload }) => {
-                self.record_hello(peer_id, payload.version, payload.nickname, payload.platform)?;
+                self.record_hello(
+                    peer_id,
+                    payload.version,
+                    payload.nickname,
+                    payload.platform,
+                    payload.capabilities,
+                )?;
             }
             (PendingAction::Text { message_id }, ControlResponse::Accepted) => {
                 self.set_message_status(&message_id, MessageStatus::Delivered, None)?;
@@ -1039,6 +1049,7 @@ impl NetworkRuntime {
         version: u16,
         nickname: String,
         platform: Platform,
+        capabilities: Vec<String>,
     ) -> Result<(), AppError> {
         let peer = PeerSummary {
             peer_id: peer_id.to_string(),
@@ -1046,6 +1057,7 @@ impl NetworkRuntime {
             platform,
             online: true,
             protocol_version: version,
+            capabilities,
             last_seen: now_rfc3339(),
         };
         self.storage.upsert_peer(&peer)?;

@@ -7,6 +7,7 @@ mod protocol;
 mod receive_paths;
 mod state;
 mod storage;
+pub mod transfer_policy;
 
 use std::{path::PathBuf, sync::OnceLock};
 

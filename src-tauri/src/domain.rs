@@ -4,10 +4,10 @@ use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
+pub use crate::transfer_policy::LEGACY_MAX_FILE_BYTES as MAX_FILE_BYTES;
 
 pub const MAX_NICKNAME_CHARS: usize = 32;
 pub const MAX_TEXT_BYTES: usize = 16 * 1024;
-pub const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const PROTOCOL_VERSION: u16 = 1;
 
 macro_rules! string_enum {
@@ -116,6 +116,8 @@ pub struct PeerSummary {
     pub platform: Platform,
     pub online: bool,
     pub protocol_version: u16,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
     pub last_seen: String,
 }
 
