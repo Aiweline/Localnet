@@ -17,6 +17,7 @@ use crate::{
 };
 
 const CHUNK_FRAME_HEADER_BYTES: usize = 40;
+const DESTINATION_PREFLIGHT_PAUSE_MARKER: &str = "[weline-localnet:destination-preflight:v1]";
 
 #[cfg(test)]
 pub(super) fn claim_paused_incoming_with_preflight<P>(
@@ -60,6 +61,7 @@ where
         return Ok(None);
     }
 
+    let mut destination_preflight_failed = false;
     let preflight_result = match storage.get_transfer(&candidate.transfer_id) {
         Ok(Some(claimed)) => (|| {
             if claimed.direction != Direction::Incoming
@@ -108,7 +110,10 @@ where
                     "可恢复接收的部分文件不在目标目录所在磁盘，请取消后重新接收".to_string(),
                 ));
             }
-            preflight(directory, claimed.file_size, claimed.transferred_bytes)?;
+            if let Err(error) = preflight(directory, claimed.file_size, claimed.transferred_bytes) {
+                destination_preflight_failed = true;
+                return Err(error);
+            }
             Ok(claimed)
         })(),
         Ok(None) => Err(AppError::Storage(
@@ -120,10 +125,15 @@ where
     match preflight_result {
         Ok(claimed) => Ok(Some(claimed)),
         Err(error) => {
+            let persisted_error = if destination_preflight_failed {
+                format!("{DESTINATION_PREFLIGHT_PAUSE_MARKER}{error}")
+            } else {
+                error.to_string()
+            };
             if !storage.try_pause_claimed_incoming_transfer(
                 &candidate.transfer_id,
                 &candidate.peer_id,
-                &error.to_string(),
+                &persisted_error,
             )? {
                 return Err(AppError::Storage(
                     "接收流校验失败后无法原子释放接收占用，请刷新传输状态".to_string(),
@@ -1186,6 +1196,56 @@ mod tests {
         );
         drop(storage);
         std::fs::remove_dir_all(directory).expect("remove shrink fixture");
+    }
+
+    #[test]
+    fn resume_destination_preflight_persists_marker_across_restart_and_returns_plain_error() {
+        let (directory, storage, paused) = paused_receive_fixture("resume-destination-marker");
+        let database = directory.join("receiver.sqlite3");
+        let not_directory = directory.join("not-a-directory");
+        std::fs::write(&not_directory, b"file, not directory").expect("write invalid destination");
+
+        let error = claim_paused_incoming_with_preflight(
+            &storage,
+            &paused,
+            &|_, file_size, committed_bytes| {
+                crate::volume_preflight::preflight_destination(
+                    &not_directory,
+                    file_size,
+                    committed_bytes,
+                )
+                .map(|_| ())
+            },
+        )
+        .expect_err("real destination preflight must block resumed receive");
+        let plain_message = error.to_string();
+        assert!(plain_message.contains("不是目录"));
+        assert!(!plain_message.contains("weline-localnet:destination-preflight"));
+
+        drop(storage);
+        let restarted = Storage::open(&database).expect("reopen receiver storage");
+        let blocked = restarted
+            .get_transfer(&paused.transfer_id)
+            .expect("reload blocked resume after restart")
+            .expect("blocked resume remains after restart");
+        assert_eq!(blocked.status, TransferStatus::Paused);
+        assert_eq!(
+            blocked.error.as_deref(),
+            Some(format!("[weline-localnet:destination-preflight:v1]{plain_message}").as_str())
+        );
+
+        assert!(
+            restarted
+                .try_cancel_unclaimed_incoming_transfer(
+                    &blocked.transfer_id,
+                    &blocked.peer_id,
+                    blocked.transfer_protocol,
+                    "test cleanup",
+                )
+                .expect("destination-preflight failure must release receive claim")
+        );
+        drop(restarted);
+        std::fs::remove_dir_all(directory).expect("remove destination marker fixture");
     }
 
     #[test]

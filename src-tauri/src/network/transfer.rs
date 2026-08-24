@@ -1671,6 +1671,46 @@ mod tests {
         fs::remove_dir_all(directory).expect("remove preflight receive fixture");
     }
 
+    #[tokio::test]
+    async fn recoverable_receive_stream_pause_remains_untagged_after_restart() {
+        let (directory, storage, paused) = paused_receive_with_real_partial("stream-pause-tag");
+        let database = directory.join("localnet.sqlite3");
+        let expected = "connection reset while receiving body";
+
+        let error = run_resumable_receive_body_with(
+            &storage,
+            &paused,
+            paused.transferred_bytes,
+            &|_, _, _| Ok(()),
+            move |_, _| Box::pin(async move { Err(AppError::Network(expected.to_string())) }),
+        )
+        .await
+        .expect_err("recoverable stream error must pause production receive path");
+        assert_eq!(error.to_string(), expected);
+
+        drop(storage);
+        let restarted = Storage::open(&database).expect("reopen receiver storage");
+        let blocked = restarted
+            .get_transfer(&paused.transfer_id)
+            .expect("reload stream pause after restart")
+            .expect("stream pause remains after restart");
+        assert_eq!(blocked.status, TransferStatus::Paused);
+        assert_eq!(blocked.error.as_deref(), Some(expected));
+        assert!(
+            restarted
+                .try_cancel_unclaimed_incoming_transfer(
+                    &blocked.transfer_id,
+                    &blocked.peer_id,
+                    blocked.transfer_protocol,
+                    "test cleanup",
+                )
+                .expect("stream pause must release receive claim")
+        );
+
+        drop(restarted);
+        fs::remove_dir_all(directory).expect("remove stream pause fixture");
+    }
+
     #[test]
     fn live_v2_send_claims_before_work_and_recoverable_disconnect_pauses() {
         let fixture = std::env::temp_dir().join(format!(

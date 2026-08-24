@@ -3,6 +3,43 @@ import test from "node:test";
 
 const statusModule = await import("../src/transfer-status.ts").catch(() => ({}));
 
+const DEFAULT_PAUSED_LABEL = "网络中断，等待自动恢复";
+const DESTINATION_PREFLIGHT_MARKER = "[weline-localnet:destination-preflight:v1]";
+
+const actionableDestinationErrors = [
+  "接收位置 E:\\Downloads 不是目录；请选择可写入的目录后重试",
+  "接收目录位于 NTFS 文件系统，可用空间不足：请选择可用空间更多的目录后重试",
+  "接收目录位于 FAT32 文件系统，单个文件最大支持 4294967295 字节",
+  "无法访问接收目录 E:\\Downloads：请选择可访问且可写入的目录后重试",
+  "无法写入接收目录 E:\\Downloads：请选择可写入的目录后重试",
+  "接收目录或磁盘当前不可用",
+  "Destination directory is unavailable; choose a writable folder and retry",
+  "FAT32 volume does not support this file size",
+  "insufficient free disk space on the destination volume",
+  "disk is full",
+  "volume has no space",
+  "filesystem permission denied",
+  "cannot access destination directory",
+  "unable to access destination volume",
+  "cannot write destination",
+  "unable to write receive folder",
+  "filesystem access denied",
+  "read-only volume",
+  "missing destination directory",
+  "destination is not ready",
+  "destination file size limit exceeded",
+  "destination network drive is full",
+  "接收目录所在网络磁盘空间不足，请释放空间后重试",
+  "destination disk is full; peer can resume after space is freed",
+  "disk is full; free space and then retry",
+  "filesystem permission denied; choose another writable folder and retry",
+  "无法访问目标目录",
+  "无法写入保存目录",
+  "访问失败：接收目录不可用",
+  "写入失败：磁盘已满",
+  "文件系统权限不足",
+];
+
 function present(transfer: {
   direction: "incoming" | "outgoing";
   fileSize: number;
@@ -27,7 +64,7 @@ test("shows the resumable network-waiting label with retained progress and Cance
   });
 
   assert.deepEqual(presentation, {
-    label: "网络中断，等待自动恢复",
+    label: DEFAULT_PAUSED_LABEL,
     tone: "paused",
     percent: 43,
     showProgress: true,
@@ -35,16 +72,17 @@ test("shows the resumable network-waiting label with retained progress and Cance
   });
 });
 
-test("keeps an actionable paused destination error while retaining its progress and Cancel", () => {
+test("shows only a backend-marked incoming destination error while retaining progress and Cancel", () => {
+  const message = "目标磁盘可用空间不足，请释放空间后 保持应用打开";
   const presentation = present({
     direction: "incoming",
     fileSize: 1_000,
     transferredBytes: 420,
     status: "paused",
-    error: "目标磁盘可用空间不足，请释放空间后保持应用打开",
+    error: `${DESTINATION_PREFLIGHT_MARKER}  目标磁盘可用空间不足，请释放空间后\n保持应用打开  `,
   });
 
-  assert.equal(presentation.label, "目标磁盘可用空间不足，请释放空间后保持应用打开");
+  assert.equal(presentation.label, message);
   assert.equal(presentation.tone, "paused");
   assert.equal(presentation.percent, 42);
   assert.equal(presentation.showProgress, true);
@@ -72,7 +110,7 @@ test("keeps persisted network and unknown paused errors on the resumable waiting
       error,
     });
 
-    assert.equal(presentation.label, "网络中断，等待自动恢复", error);
+    assert.equal(presentation.label, DEFAULT_PAUSED_LABEL, error);
   }
 });
 
@@ -130,42 +168,46 @@ test("does not expose source, sender, peer, network, or connection storage failu
       error,
     });
 
-    assert.equal(presentation.label, "网络中断，等待自动恢复", error);
+    assert.equal(presentation.label, DEFAULT_PAUSED_LABEL, error);
   }
 });
 
-test("keeps only volume and destination paused errors actionable", () => {
+test("keeps every untagged legacy destination-looking paused error on the safe default", () => {
+  for (const error of actionableDestinationErrors) {
+    const presentation = present({
+      direction: "incoming",
+      fileSize: 1_000,
+      transferredBytes: 420,
+      status: "paused",
+      error,
+    });
+
+    assert.equal(presentation.label, DEFAULT_PAUSED_LABEL, error);
+  }
+});
+
+test("shows legitimate backend-marked destination preflight messages without the marker", () => {
+  for (const message of actionableDestinationErrors) {
+    const presentation = present({
+      direction: "incoming",
+      fileSize: 1_000,
+      transferredBytes: 420,
+      status: "paused",
+      error: `${DESTINATION_PREFLIGHT_MARKER}${message}`,
+    });
+
+    assert.equal(presentation.label, message, message);
+  }
+});
+
+test("parked mixed-context and arbitrary FAT32 counterexamples stay on the safe default", () => {
   for (const error of [
-    "接收目录位于 NTFS 文件系统，可用空间不足：请选择可用空间更多的目录后重试",
-    "接收目录位于 FAT32 文件系统，单个文件最大支持 4294967295 字节",
-    "无法访问接收目录 E:\\Downloads：请选择可访问且可写入的目录后重试",
-    "无法写入接收目录 E:\\Downloads：请选择可写入的目录后重试",
-    "接收目录或磁盘当前不可用",
-    "Destination directory is unavailable; choose a writable folder and retry",
-    "FAT32 volume does not support this file size",
-    "insufficient free disk space on the destination volume",
-    "disk is full",
-    "volume has no space",
-    "filesystem permission denied",
-    "cannot access destination directory",
-    "unable to access destination volume",
-    "cannot write destination",
-    "unable to write receive folder",
-    "filesystem access denied",
-    "read-only volume",
-    "missing destination directory",
-    "destination is not ready",
-    "destination file size limit exceeded",
-    "destination network drive is full",
-    "接收目录所在网络磁盘空间不足，请释放空间后重试",
-    "destination disk is full; peer can resume after space is freed",
-    "disk is full; free space and retry",
-    "filesystem permission denied; choose another folder",
-    "无法访问目标目录",
-    "无法写入保存目录",
-    "访问失败：接收目录不可用",
-    "写入失败：磁盘已满",
-    "文件系统权限不足",
+    "source file permission denied; destination directory is unavailable",
+    "network peer disconnected while destination disk is full",
+    "fat32 volume file size limit exceeded on c:\\source\\payload.bin",
+    "FAT32 VOLUME FILE SIZE LIMIT EXCEEDED FOR ARBITRARY BACKEND OBJECT",
+    "C:\\source\\payload.bin exceeds the FAT32 volume file size limit",
+    "FAT32 volume file size limit exceeded on cache payload",
   ]) {
     const presentation = present({
       direction: "incoming",
@@ -175,7 +217,38 @@ test("keeps only volume and destination paused errors actionable", () => {
       error,
     });
 
-    assert.equal(presentation.label, error, error);
+    assert.equal(presentation.label, DEFAULT_PAUSED_LABEL, error);
+  }
+});
+
+test("rejects outgoing forged markers and malformed or empty incoming markers", () => {
+  const forgedOutgoing = present({
+    direction: "outgoing",
+    fileSize: 1_000,
+    transferredBytes: 420,
+    status: "paused",
+    error: `${DESTINATION_PREFLIGHT_MARKER}destination disk is full`,
+  });
+  assert.equal(forgedOutgoing.label, DEFAULT_PAUSED_LABEL);
+
+  for (const error of [
+    DESTINATION_PREFLIGHT_MARKER,
+    `${DESTINATION_PREFLIGHT_MARKER}   \n\t`,
+    " [weline-localnet:destination-preflight:v1]destination disk is full",
+    "[weline-localnet:destination-preflight:v2]destination disk is full",
+    "[weline-localnet:destination-preflight:v1 destination disk is full",
+    `${DESTINATION_PREFLIGHT_MARKER}${DESTINATION_PREFLIGHT_MARKER}destination disk is full`,
+    `network disconnected ${DESTINATION_PREFLIGHT_MARKER}destination disk is full`,
+  ]) {
+    const presentation = present({
+      direction: "incoming",
+      fileSize: 1_000,
+      transferredBytes: 420,
+      status: "paused",
+      error,
+    });
+
+    assert.equal(presentation.label, DEFAULT_PAUSED_LABEL, error);
   }
 });
 
