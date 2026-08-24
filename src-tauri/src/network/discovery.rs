@@ -15,6 +15,9 @@ use tokio::{
     time,
 };
 
+#[cfg(target_os = "windows")]
+mod mdns_compat;
+
 const DISCOVERY_MAGIC: &str = "LOCALNET";
 const DISCOVERY_VERSION: u8 = 1;
 const DISCOVERY_PROBE_VERSION: u8 = 2;
@@ -64,7 +67,10 @@ impl DiscoveryService {
             event_sender.clone(),
         ));
         tauri::async_runtime::spawn(announce_beacons(peer_id, listen_port.clone()));
-        tauri::async_runtime::spawn(probe_peers(peer_id, listen_port, event_sender));
+        tauri::async_runtime::spawn(probe_peers(peer_id, listen_port, event_sender.clone()));
+
+        #[cfg(target_os = "windows")]
+        mdns_compat::spawn(peer_id, event_sender.clone());
 
         event_receiver
     }
