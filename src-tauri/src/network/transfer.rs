@@ -1533,6 +1533,13 @@ mod tests {
             .expect("stale loser remains");
         assert_eq!(paused.status, TransferStatus::Paused);
         assert_eq!(paused.transferred_bytes, advanced.transferred_bytes);
+        assert_eq!(paused.error.as_deref(), Some(error.to_string().as_str()));
+        assert!(
+            !paused
+                .error
+                .as_deref()
+                .is_some_and(|value| value.contains("weline-localnet:destination-preflight"))
+        );
 
         let fresh_body_started = Arc::new(AtomicBool::new(false));
         let fresh_flag = fresh_body_started.clone();

@@ -30,6 +30,8 @@ use crate::{
     },
 };
 
+const DESTINATION_PREFLIGHT_PAUSE_MARKER: &str = "[weline-localnet:destination-preflight:v1]";
+
 #[derive(Clone)]
 pub struct Storage {
     connection: Arc<Mutex<Connection>>,
@@ -2695,18 +2697,34 @@ impl Storage {
         record: &PartialRecoveryRecord,
         error: &str,
     ) -> Result<(), AppError> {
-        let connection = self.connection()?;
-        let changed = connection.execute(
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current_error = transaction
+            .query_row(
+                "SELECT error FROM transfers
+                 WHERE transfer_id = ?1 AND peer_id = ?2 AND direction = 'incoming'
+                   AND transfer_protocol = 2 AND status = 'paused' AND receive_claimed = 1",
+                params![record.transfer_id, record.peer_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        let persisted_error = current_error
+            .as_deref()
+            .filter(|value| is_valid_destination_preflight_pause_error(value))
+            .unwrap_or(error);
+        let changed = transaction.execute(
             "UPDATE transfers
              SET error = ?3, receive_claimed = 0,
                  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
              WHERE transfer_id = ?1 AND peer_id = ?2 AND direction = 'incoming'
                AND transfer_protocol = 2 AND status = 'paused' AND receive_claimed = 1",
-            params![record.transfer_id, record.peer_id, error],
+            params![record.transfer_id, record.peer_id, persisted_error],
         )?;
         if changed != 1 {
             return Err(AppError::Storage("可恢复接收错误状态已变化".to_string()));
         }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -3297,6 +3315,14 @@ impl Storage {
             AppError::Storage("本地数据锁异常，请重新启动 Weline Localnet".to_string())
         })
     }
+}
+
+fn is_valid_destination_preflight_pause_error(error: &str) -> bool {
+    let Some(message) = error.strip_prefix(DESTINATION_PREFLIGHT_PAUSE_MARKER) else {
+        return false;
+    };
+    let message = message.trim();
+    !message.is_empty() && !message.contains(DESTINATION_PREFLIGHT_PAUSE_MARKER)
 }
 
 #[derive(Debug)]
@@ -7163,6 +7189,54 @@ mod tests {
     }
 
     #[test]
+    fn startup_unavailable_media_replaces_a_malformed_destination_pause_marker() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-startup-malformed-destination-marker-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&fixture).expect("create storage fixture");
+        let database = fixture.join("localnet.sqlite3");
+        initialize_database(&database);
+        let media = fixture.join("destination-media");
+        fs::create_dir_all(&media).expect("create destination media");
+        let destination = media.join("report.bin");
+        let transfer_id = "startup-malformed-destination-marker";
+        seed_resumable_incoming(&database, &destination, transfer_id, 0, Some(0));
+        let malformed = "[weline-localnet:destination-preflight:v1]   \n\t";
+        {
+            let connection = Connection::open(&database).expect("open fixture database");
+            connection
+                .execute(
+                    "UPDATE transfers
+                     SET status = 'paused', receive_claimed = 0, error = ?2
+                     WHERE transfer_id = ?1",
+                    rusqlite::params![transfer_id, malformed],
+                )
+                .expect("persist malformed destination marker");
+        }
+        let detached_media = fixture.join("detached-destination-media");
+        fs::rename(&media, &detached_media).expect("detach destination media");
+
+        let storage = Storage::open(&database).expect("reconcile unavailable destination media");
+        let paused = storage
+            .get_transfer(transfer_id)
+            .expect("load unavailable-media pause")
+            .expect("unavailable-media pause exists");
+        assert_eq!(paused.status, TransferStatus::Paused);
+        assert_ne!(paused.error.as_deref(), Some(malformed));
+        assert!(
+            !paused
+                .error
+                .as_deref()
+                .is_some_and(|value| value.contains("weline-localnet:destination-preflight"))
+        );
+
+        drop(storage);
+        fs::rename(&detached_media, &media).expect("restore destination media");
+        fs::remove_dir_all(fixture).expect("remove storage fixture");
+    }
+
+    #[test]
     fn startup_keeps_v1_fail_and_owned_reservation_cleanup_behavior() {
         let fixture = std::env::temp_dir().join(format!(
             "weline-localnet-startup-v1-cleanup-{}",
@@ -7231,6 +7305,17 @@ mod tests {
             committed,
             Some(committed),
         );
+        storage
+            .connection()
+            .expect("mark pre-terminal transfer")
+            .execute(
+                "UPDATE transfers SET error = ?2 WHERE transfer_id = ?1",
+                rusqlite::params![
+                    "terminal-failure",
+                    "[weline-localnet:destination-preflight:v1]destination unavailable",
+                ],
+            )
+            .expect("persist pre-terminal destination marker");
         fs::write(&destination, b"completed-or-user-data").expect("write protected destination");
         let unrelated_destination = fixture.join("unrelated-legacy.bin");
         reserve_receive_path(
@@ -7274,6 +7359,7 @@ mod tests {
             .expect("load failed transfer")
             .expect("failed transfer exists");
         assert_eq!(failed.status, TransferStatus::Failed);
+        assert_eq!(failed.error.as_deref(), Some("integrity failure"));
         assert!(!failed.destination_reserved);
         assert_eq!(failed.reservation_token, None);
         assert_eq!(failed.partial_path, None);

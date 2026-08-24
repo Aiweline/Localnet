@@ -967,6 +967,8 @@ mod tests {
     fn paused_receive_fixture(name: &str) -> (PathBuf, Storage, TransferRecord) {
         let directory = fixture_directory(name);
         std::fs::create_dir_all(&directory).expect("create paused receive fixture");
+        let media = directory.join("destination-media");
+        std::fs::create_dir_all(&media).expect("create destination media fixture");
         let storage = Storage::open(&directory.join("receiver.sqlite3"))
             .expect("open paused receive storage");
         let chunks = vec![
@@ -988,7 +990,7 @@ mod tests {
             chunks: chunks.clone(),
             source_modified_ns: 0,
         };
-        let destination = directory.join("payload.bin");
+        let destination = media.join("payload.bin");
         let token = uuid::Uuid::now_v7().to_string();
         let mut transfer = transfer_record(Direction::Incoming, None, None, None, &manifest);
         transfer.transfer_id = uuid::Uuid::now_v7().to_string();
@@ -1202,15 +1204,26 @@ mod tests {
     fn resume_destination_preflight_persists_marker_across_restart_and_returns_plain_error() {
         let (directory, storage, paused) = paused_receive_fixture("resume-destination-marker");
         let database = directory.join("receiver.sqlite3");
-        let not_directory = directory.join("not-a-directory");
-        std::fs::write(&not_directory, b"file, not directory").expect("write invalid destination");
+        let destination = paused
+            .local_path
+            .as_deref()
+            .map(Path::new)
+            .expect("paused destination path");
+        let media = destination
+            .parent()
+            .expect("destination media directory")
+            .to_path_buf();
+        let detached_media = directory.join("detached-destination-media");
+        std::fs::rename(&media, &detached_media).expect("detach actual destination media");
+        std::fs::write(&media, b"file, not directory")
+            .expect("replace destination media directory with file");
 
         let error = claim_paused_incoming_with_preflight(
             &storage,
             &paused,
-            &|_, file_size, committed_bytes| {
+            &|directory, file_size, committed_bytes| {
                 crate::volume_preflight::preflight_destination(
-                    &not_directory,
+                    directory,
                     file_size,
                     committed_bytes,
                 )
@@ -1221,19 +1234,29 @@ mod tests {
         let plain_message = error.to_string();
         assert!(plain_message.contains("不是目录"));
         assert!(!plain_message.contains("weline-localnet:destination-preflight"));
+        let marked_message = format!("[weline-localnet:destination-preflight:v1]{plain_message}");
+        assert_eq!(
+            storage
+                .get_transfer(&paused.transfer_id)
+                .expect("load marked resume before restart")
+                .expect("marked resume remains before restart")
+                .error
+                .as_deref(),
+            Some(marked_message.as_str())
+        );
 
         drop(storage);
-        let restarted = Storage::open(&database).expect("reopen receiver storage");
+        let restarted = Storage::open(&database)
+            .expect("reopen receiver storage while actual destination remains invalid");
         let blocked = restarted
             .get_transfer(&paused.transfer_id)
             .expect("reload blocked resume after restart")
             .expect("blocked resume remains after restart");
         assert_eq!(blocked.status, TransferStatus::Paused);
-        assert_eq!(
-            blocked.error.as_deref(),
-            Some(format!("[weline-localnet:destination-preflight:v1]{plain_message}").as_str())
-        );
+        assert_eq!(blocked.error.as_deref(), Some(marked_message.as_str()));
 
+        std::fs::remove_file(&media).expect("remove invalid destination media replacement");
+        std::fs::rename(&detached_media, &media).expect("restore actual destination media");
         assert!(
             restarted
                 .try_cancel_unclaimed_incoming_transfer(
