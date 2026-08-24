@@ -398,19 +398,20 @@ pub fn resolve_transfer(
                 "文件保存位置必须是绝对路径".to_string(),
             ));
         }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let reservation_token = uuid::Uuid::new_v4().to_string();
-        reserve_receive_path(&path, &transfer.transfer_id, &reservation_token).map_err(
-            |error| {
-                if error.kind() == std::io::ErrorKind::AlreadyExists {
-                    AppError::InvalidInput("保存位置已经存在同名文件，请重新选择".to_string())
-                } else {
-                    AppError::Permission(format!("无法占用文件保存位置，请重新选择：{error}"))
-                }
-            },
-        )?;
+        reserve_manual_receive_destination(
+            transfer.transfer_protocol,
+            &path,
+            &transfer.transfer_id,
+            &reservation_token,
+        )
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                AppError::InvalidInput("保存位置已经存在同名文件，请重新选择".to_string())
+            } else {
+                AppError::Permission(format!("无法占用文件保存位置，请重新选择：{error}"))
+            }
+        })?;
         transfer.local_path = Some(path.to_string_lossy().into_owned());
         transfer.destination_reserved = true;
         transfer.reservation_token = Some(reservation_token);
@@ -444,6 +445,7 @@ pub fn resolve_transfer(
         if !state.storage.try_cancel_unclaimed_incoming_transfer(
             &transfer.transfer_id,
             &transfer.peer_id,
+            transfer.transfer_protocol,
             "你拒绝了这次传输",
         )? {
             return Err(AppError::InvalidInput(
@@ -638,6 +640,28 @@ fn prepare_receive_directory(
         .map_err(|error| AppError::Permission(format!("文件接收目录不可写，请重新选择：{error}")))
 }
 
+fn reserve_manual_receive_destination(
+    transfer_protocol: u8,
+    path: &Path,
+    transfer_id: &str,
+    reservation_token: &str,
+) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "接收文件保存位置无效")
+    })?;
+    if transfer_protocol == TransferProtocol::ResumableV2 as u8 {
+        if !parent.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "接收目录或磁盘当前不可用",
+            ));
+        }
+    } else {
+        std::fs::create_dir_all(parent)?;
+    }
+    reserve_receive_path(path, transfer_id, reservation_token)
+}
+
 fn prepare_transfer_preferences(
     auto_receive_files: bool,
     receive_directory: &str,
@@ -803,7 +827,10 @@ fn detect_mime_type(path: &Path) -> String {
 mod tests {
     use std::fs;
 
-    use super::{prepare_receive_directory, prepare_source, prepare_transfer_preferences};
+    use super::{
+        prepare_receive_directory, prepare_source, prepare_transfer_preferences,
+        reserve_manual_receive_destination,
+    };
     use crate::{
         domain::{TransferKind, TransferPreferences},
         transfer_policy::{FILE_RESUME_V2_CAPABILITY, TRANSFER_CHUNK_BYTES, TransferProtocol},
@@ -857,6 +884,26 @@ mod tests {
         assert_eq!(prepared, unavailable);
         assert!(!prepared.exists());
         let _ = fs::remove_dir_all(fixture);
+    }
+
+    #[test]
+    fn manual_v2_acceptance_never_recreates_a_missing_selected_parent() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-manual-v2-missing-parent-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let destination = fixture.join("unplugged-volume").join("report.bin");
+
+        let error = reserve_manual_receive_destination(
+            TransferProtocol::ResumableV2 as u8,
+            &destination,
+            "transfer-one",
+            "token-one",
+        )
+        .expect_err("missing selected parent must reject v2 acceptance");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(!fixture.exists());
     }
 
     #[test]

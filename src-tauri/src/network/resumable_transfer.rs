@@ -7,7 +7,7 @@ use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
 use crate::{
     domain::{Direction, TransferRecord},
     error::AppError,
-    receive_paths::resumable_partial_is_owned,
+    receive_paths::open_owned_resumable_partial_file,
     storage::Storage,
     transfer_manifest::{
         TransferChunk, capture_source_snapshot, decode_sha256, expected_chunk_count,
@@ -188,6 +188,7 @@ impl DurableChunkWriter for tokio::fs::File {
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn open_resumable_partial(
     partial_path: &Path,
     committed_offset: u64,
@@ -225,12 +226,24 @@ pub(crate) async fn open_owned_resumable_partial(
             "接收目录或磁盘当前不可用",
         )));
     }
-    if !resumable_partial_is_owned(partial_path, destination, transfer_id, reservation_token)? {
-        return Err(AppError::Permission(
-            "可恢复部分文件缺少匹配的所有权凭据".to_string(),
+    let file = open_owned_resumable_partial_file(
+        partial_path,
+        destination,
+        transfer_id,
+        reservation_token,
+    )?
+    .ok_or_else(|| AppError::Permission("可恢复部分文件缺少匹配的所有权凭据".to_string()))?;
+    let current_length = file.metadata()?.len();
+    if current_length < committed_offset {
+        return Err(AppError::InvalidInput(
+            "部分文件短于数据库已提交偏移量".to_string(),
         ));
     }
-    open_resumable_partial(partial_path, committed_offset).await
+    if current_length > committed_offset {
+        file.set_len(committed_offset)?;
+        file.sync_all()?;
+    }
+    Ok(tokio::fs::File::from_std(file))
 }
 
 pub(crate) async fn send_acknowledged_chunks<S, P>(

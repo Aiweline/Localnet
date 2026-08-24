@@ -35,10 +35,11 @@ use crate::{
     protocol::{ControlRequest, ControlResponse, FILE_PROTOCOL, HelloPayload, TransferOffer},
     receive_paths::{
         ensure_writable_directory, remove_owned_reservation, reserve_available_receive_path,
+        validate_existing_writable_directory,
     },
     storage::Storage,
     transfer_manifest::validate_transfer_metadata,
-    transfer_policy::FILE_RESUME_V2_CAPABILITY,
+    transfer_policy::{FILE_RESUME_V2_CAPABILITY, TransferProtocol},
 };
 
 const EVENT_NAME: &str = "localnet://event";
@@ -733,19 +734,22 @@ impl NetworkRuntime {
                 let preferences = self
                     .storage
                     .load_transfer_preferences(&self.default_receive_directory)?;
-                let (local_path, reservation_token, automatic_receive_error) = if preferences
-                    .auto_receive_files
-                {
-                    match automatic_receive_path(&preferences, &offer.file_name, &offer.transfer_id)
-                    {
-                        Ok((path, token)) => {
-                            (Some(path.to_string_lossy().into_owned()), Some(token), None)
+                let (local_path, reservation_token, automatic_receive_error) =
+                    if preferences.auto_receive_files {
+                        match automatic_receive_path(
+                            &preferences,
+                            &offer.file_name,
+                            &offer.transfer_id,
+                            offer.transfer_protocol,
+                        ) {
+                            Ok((path, token)) => {
+                                (Some(path.to_string_lossy().into_owned()), Some(token), None)
+                            }
+                            Err(error) => (None, None, Some(error.to_string())),
                         }
-                        Err(error) => (None, None, Some(error.to_string())),
-                    }
-                } else {
-                    (None, None, None)
-                };
+                    } else {
+                        (None, None, None)
+                    };
                 let destination_reserved = reservation_token.is_some();
                 let auto_accept = local_path.is_some();
                 let now = now_rfc3339();
@@ -900,6 +904,7 @@ impl NetworkRuntime {
                 if !self.storage.try_cancel_unclaimed_incoming_transfer(
                     &transfer.transfer_id,
                     &transfer.peer_id,
+                    transfer.transfer_protocol,
                     "对方取消了传输",
                 )? {
                     return Ok(ControlResponse::Accepted);
@@ -1231,9 +1236,14 @@ fn automatic_receive_path(
     preferences: &TransferPreferences,
     file_name: &str,
     transfer_id: &str,
+    transfer_protocol: u8,
 ) -> Result<(PathBuf, String), AppError> {
-    let directory =
-        ensure_writable_directory(std::path::Path::new(&preferences.receive_directory))?;
+    let configured = std::path::Path::new(&preferences.receive_directory);
+    let directory = if transfer_protocol == TransferProtocol::ResumableV2 as u8 {
+        validate_existing_writable_directory(configured)?
+    } else {
+        ensure_writable_directory(configured)?
+    };
     let reservation_token = uuid::Uuid::new_v4().to_string();
     let path =
         reserve_available_receive_path(&directory, file_name, transfer_id, &reservation_token)?;
@@ -1242,9 +1252,11 @@ fn automatic_receive_path(
 
 #[cfg(test)]
 mod tests {
-    use super::validate_transfer_offer;
+    use std::fs;
+
+    use super::{automatic_receive_path, validate_transfer_offer};
     use crate::{
-        domain::TransferKind,
+        domain::{TransferKind, TransferPreferences},
         protocol::TransferOffer,
         transfer_policy::{TRANSFER_CHUNK_BYTES, TransferProtocol},
     };
@@ -1282,5 +1294,30 @@ mod tests {
         offer.transfer_protocol = TransferProtocol::LegacyV1 as u8;
 
         assert!(validate_transfer_offer(&offer).is_err());
+    }
+
+    #[test]
+    fn automatic_v2_acceptance_never_recreates_a_missing_selected_directory() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-auto-v2-missing-directory-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let missing = fixture.join("unplugged-volume");
+        let preferences = TransferPreferences {
+            auto_receive_files: true,
+            receive_directory: missing.to_string_lossy().into_owned(),
+        };
+
+        let error = automatic_receive_path(
+            &preferences,
+            "report.bin",
+            "transfer-one",
+            TransferProtocol::ResumableV2 as u8,
+        )
+        .expect_err("missing selected media must reject automatic v2 acceptance");
+
+        assert_eq!(error.code(), "io_error");
+        assert!(!fixture.exists());
+        let _ = fs::remove_dir_all(fixture);
     }
 }

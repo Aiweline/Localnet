@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use futures::{AsyncReadExt as _, AsyncWriteExt as _, StreamExt as _};
+use futures::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, StreamExt as _};
 use libp2p::{PeerId, StreamProtocol};
 use sha2::{Digest, Sha256};
 use tauri::AppHandle;
@@ -25,8 +25,8 @@ use crate::{
     error::AppError,
     protocol::{FILE_PROTOCOL, FILE_PROTOCOL_V2, TransferStreamHeader},
     receive_paths::{
-        commit_without_overwrite, finalize_reserved_receive, finalize_reserved_receive_durable,
-        remove_owned_reservation,
+        commit_without_overwrite, finalize_reserved_receive,
+        finalize_reserved_receive_durable_with_hooks, remove_owned_reservation,
     },
     storage::Storage,
     transfer_policy::{TRANSFER_CHUNK_BYTES, TransferProtocol},
@@ -37,6 +37,30 @@ const PROGRESS_BYTES: u64 = 1024 * 1024;
 const MAX_HEADER_BYTES: usize = 8 * 1024;
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const INCOMING_START_TIMEOUT: Duration = Duration::from_secs(35);
+
+trait ResumableIo: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T> ResumableIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
+
+enum ResumableStreamOpener<'a> {
+    Network(&'a mut libp2p_stream::Control, PeerId),
+    #[cfg(test)]
+    Scripted(Box<dyn ResumableIo>),
+}
+
+impl ResumableStreamOpener<'_> {
+    async fn open(self) -> Result<Box<dyn ResumableIo>, AppError> {
+        match self {
+            Self::Network(control, peer_id) => control
+                .open_stream(peer_id, StreamProtocol::new(FILE_PROTOCOL_V2))
+                .await
+                .map(|stream| Box::new(stream) as Box<dyn ResumableIo>)
+                .map_err(|error| AppError::Network(format!("无法建立可恢复文件传输流：{error}"))),
+            #[cfg(test)]
+            Self::Scripted(stream) => Ok(stream),
+        }
+    }
+}
 
 pub fn spawn_incoming_transfers(
     mut incoming: libp2p_stream::IncomingStreams,
@@ -204,7 +228,11 @@ async fn send_transfer(
             send_legacy_transfer(control, peer_id, transfer, storage, app_handle).await
         }
         value if value == TransferProtocol::ResumableV2 as u8 => {
-            send_resumable_transfer(control, peer_id, transfer, storage, app_handle).await
+            let opener = ResumableStreamOpener::Network(control, peer_id);
+            send_resumable_transfer(opener, transfer, storage, &mut |event| {
+                emit_event(app_handle, &event);
+            })
+            .await
         }
         _ => Err(AppError::InvalidInput("文件传输协议版本无效".to_string())),
     }
@@ -281,44 +309,39 @@ async fn send_legacy_transfer(
     complete_outgoing(storage, app_handle, transfer.clone())
 }
 
-async fn send_resumable_transfer(
-    control: &mut libp2p_stream::Control,
-    peer_id: PeerId,
+async fn send_resumable_transfer<P>(
+    opener: ResumableStreamOpener<'_>,
     transfer: &TransferRecord,
     storage: &Storage,
-    app_handle: &AppHandle,
-) -> Result<(), AppError> {
+    publish: &mut P,
+) -> Result<(), AppError>
+where
+    P: FnMut(NetworkEvent),
+{
     let Some(transfer) =
         claim_resumable_outgoing(storage, &transfer.transfer_id, &transfer.peer_id)?
     else {
         return Ok(());
     };
-    let result =
-        send_claimed_resumable_transfer(control, peer_id, &transfer, storage, app_handle).await;
+    let result = send_claimed_resumable_transfer(opener, &transfer, storage, publish).await;
     if let Err(error) = &result {
         if persist_claimed_outgoing_error(storage, &transfer, error)? {
             if let Some(updated) = storage.get_transfer(&transfer.transfer_id)? {
                 let terminal = updated.status == TransferStatus::Failed;
-                emit_event(
-                    app_handle,
-                    &NetworkEvent::TransferUpdated {
-                        transfer: updated.clone(),
-                    },
-                );
+                publish(NetworkEvent::TransferUpdated {
+                    transfer: updated.clone(),
+                });
                 if terminal {
                     let _ = storage.update_message_status(
                         &updated.transfer_id,
                         MessageStatus::Failed,
                         updated.error.as_deref(),
                     );
-                    emit_event(
-                        app_handle,
-                        &NetworkEvent::MessageStatusChanged {
-                            message_id: updated.transfer_id,
-                            status: MessageStatus::Failed,
-                            error: updated.error,
-                        },
-                    );
+                    publish(NetworkEvent::MessageStatusChanged {
+                        message_id: updated.transfer_id,
+                        status: MessageStatus::Failed,
+                        error: updated.error,
+                    });
                 }
             }
         }
@@ -326,23 +349,22 @@ async fn send_resumable_transfer(
     result
 }
 
-async fn send_claimed_resumable_transfer(
-    control: &mut libp2p_stream::Control,
-    peer_id: PeerId,
+async fn send_claimed_resumable_transfer<P>(
+    opener: ResumableStreamOpener<'_>,
     transfer: &TransferRecord,
     storage: &Storage,
-    app_handle: &AppHandle,
-) -> Result<(), AppError> {
+    publish: &mut P,
+) -> Result<(), AppError>
+where
+    P: FnMut(NetworkEvent),
+{
     let source_path = transfer
         .local_path
         .as_deref()
         .map(PathBuf::from)
         .ok_or_else(|| AppError::Io(std::io::Error::other("发送文件路径缺失")))?;
     let chunks = storage.list_transfer_chunks(&transfer.transfer_id)?;
-    let mut stream = control
-        .open_stream(peer_id, StreamProtocol::new(FILE_PROTOCOL_V2))
-        .await
-        .map_err(|error| AppError::Network(format!("无法建立可恢复文件传输流：{error}")))?;
+    let mut stream = opener.open().await?;
     let header = serde_json::to_vec(&TransferStreamHeader {
         transfer_id: transfer.transfer_id.clone(),
         version: TransferProtocol::ResumableV2 as u16,
@@ -375,10 +397,7 @@ async fn send_claimed_resumable_transfer(
             }
             previous_offset = acknowledged_offset;
             if let Some(updated) = storage.get_transfer(&transfer.transfer_id)? {
-                emit_event(
-                    app_handle,
-                    &NetworkEvent::TransferUpdated { transfer: updated },
-                );
+                publish(NetworkEvent::TransferUpdated { transfer: updated });
             }
             Ok(())
         },
@@ -393,20 +412,14 @@ async fn send_claimed_resumable_transfer(
         .get_transfer(&transfer.transfer_id)?
         .ok_or_else(|| AppError::Storage("完成的可恢复发送记录不存在".to_string()))?;
     storage.update_message_status(&completed.transfer_id, MessageStatus::Delivered, None)?;
-    emit_event(
-        app_handle,
-        &NetworkEvent::TransferUpdated {
-            transfer: completed.clone(),
-        },
-    );
-    emit_event(
-        app_handle,
-        &NetworkEvent::MessageStatusChanged {
-            message_id: completed.transfer_id,
-            status: MessageStatus::Delivered,
-            error: None,
-        },
-    );
+    publish(NetworkEvent::TransferUpdated {
+        transfer: completed.clone(),
+    });
+    publish(NetworkEvent::MessageStatusChanged {
+        message_id: completed.transfer_id,
+        status: MessageStatus::Delivered,
+        error: None,
+    });
     if let Err(error) = stream.close().await {
         tracing::debug!(transfer_id = %transfer.transfer_id, %error, "ignored stream close after resumable send completion");
     }
@@ -672,6 +685,8 @@ async fn receive_resumable_body(
             let reservation_token = transfer_for_finalize.reservation_token.clone();
             let partial_for_commit = partial_for_finalize.clone();
             let destination_for_commit = destination_for_finalize.clone();
+            let storage_for_switch = storage_for_finalize.clone();
+            let peer_for_switch = transfer_for_finalize.peer_id.clone();
             let completed_path = tokio::task::spawn_blocking(move || {
                 if !destination_reserved {
                     return Err(std::io::Error::new(
@@ -682,19 +697,35 @@ async fn receive_resumable_body(
                 let token = reservation_token.as_deref().ok_or_else(|| {
                     std::io::Error::new(std::io::ErrorKind::InvalidData, "接收文件占位凭据缺失")
                 })?;
-                finalize_reserved_receive_durable(
+                finalize_reserved_receive_durable_with_hooks(
                     &partial_for_commit,
                     &destination_for_commit,
                     &file_name,
                     &transfer_id,
                     token,
+                    |previous, next| {
+                        if storage_for_switch
+                            .try_switch_claimed_incoming_destination(
+                                &transfer_id,
+                                &peer_for_switch,
+                                previous,
+                                next,
+                                token,
+                            )
+                            .map_err(|error| std::io::Error::other(error.to_string()))?
+                        {
+                            Ok(())
+                        } else {
+                            Err(std::io::Error::other("可恢复接收目标切换状态已变化"))
+                        }
+                    },
+                    |_| Ok(()),
                 )
             })
             .await
             .map_err(|error| AppError::Io(std::io::Error::other(error.to_string())))??;
             let mut completed = transfer_for_finalize;
             completed.local_path = Some(completed_path.path.to_string_lossy().into_owned());
-            completed.partial_path = None;
             completed.destination_reserved = !completed_path.reservation_released;
             if completed_path.reservation_released {
                 completed.reservation_token = None;
@@ -971,7 +1002,8 @@ mod tests {
     use futures::io::{AsyncRead, AsyncWrite};
 
     use super::{
-        claim_resumable_outgoing, persist_claimed_outgoing_error, send_acknowledged_chunks,
+        ResumableStreamOpener, claim_resumable_outgoing, persist_claimed_outgoing_error,
+        send_resumable_transfer,
     };
     use crate::{
         domain::{Direction, TransferKind, TransferRecord, TransferStatus},
@@ -982,6 +1014,64 @@ mod tests {
     };
 
     struct DisconnectingStream;
+
+    struct CancellingAckStream {
+        incoming: Vec<u8>,
+        cursor: usize,
+        storage: Storage,
+        transfer_id: String,
+        peer_id: String,
+        cancelled: bool,
+    }
+
+    impl AsyncRead for CancellingAckStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            buffer: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            if !self.cancelled {
+                self.storage
+                    .try_pause_claimed_outgoing_transfer(
+                        &self.transfer_id,
+                        &self.peer_id,
+                        "cancel raced with acknowledgement",
+                    )
+                    .expect("pause active send at ACK boundary");
+                self.storage
+                    .try_cancel_unclaimed_outgoing_transfer(
+                        &self.transfer_id,
+                        &self.peer_id,
+                        "cancelled while ACK callback was pending",
+                    )
+                    .expect("cancel paused send at ACK boundary");
+                self.cancelled = true;
+            }
+            let remaining = &self.incoming[self.cursor..];
+            let read = remaining.len().min(buffer.len());
+            buffer[..read].copy_from_slice(&remaining[..read]);
+            self.cursor += read;
+            Poll::Ready(Ok(read))
+        }
+    }
+
+    impl AsyncWrite for CancellingAckStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            buffer: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buffer.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     impl AsyncRead for DisconnectingStream {
         fn poll_read(
@@ -1125,7 +1215,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acknowledged_send_disconnect_pauses_the_claimed_database_row() {
+    async fn production_resumable_send_disconnect_pauses_the_claimed_database_row() {
         let fixture = std::env::temp_dir().join(format!(
             "weline-localnet-acknowledged-send-disconnect-{}",
             uuid::Uuid::now_v7()
@@ -1145,23 +1235,16 @@ mod tests {
         storage
             .create_outgoing_transfer_with_manifest(&transfer, &manifest.chunks)
             .expect("persist outgoing manifest");
-        let claimed = claim_resumable_outgoing(&storage, &transfer.transfer_id, &transfer.peer_id)
-            .expect("claim outgoing transfer")
-            .expect("claim wins");
-        let mut stream = DisconnectingStream;
-
-        let error =
-            send_acknowledged_chunks(&mut stream, &source, &claimed, &manifest.chunks, 0, |_| {
-                Ok(())
-            })
-            .await
-            .expect_err("transport disconnect must stop acknowledged send");
+        let error = send_resumable_transfer(
+            ResumableStreamOpener::Scripted(Box::new(DisconnectingStream)),
+            &transfer,
+            &storage,
+            &mut |_| {},
+        )
+        .await
+        .expect_err("transport disconnect must stop production send");
         assert!(
             matches!(error, AppError::Io(ref error) if error.kind() == io::ErrorKind::BrokenPipe)
-        );
-        assert!(
-            persist_claimed_outgoing_error(&storage, &claimed, &error)
-                .expect("persist disconnect outcome")
         );
         let paused = storage
             .get_transfer(&transfer.transfer_id)
@@ -1170,6 +1253,57 @@ mod tests {
         assert_eq!(paused.status, TransferStatus::Paused);
         assert!(!paused.send_claimed);
         assert_eq!(paused.transferred_bytes, 0);
+
+        drop(storage);
+        fs::remove_dir_all(fixture).expect("remove fixture");
+    }
+
+    #[tokio::test]
+    async fn production_resumable_send_rejects_stale_ack_progress_after_cancel() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-production-send-cancel-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&fixture).expect("create fixture");
+        let source = fixture.join("source.bin");
+        fs::write(&source, b"payload").expect("write source");
+        let manifest = build_manifest(&source, TRANSFER_CHUNK_BYTES).expect("build manifest");
+        let mut transfer = outgoing_transfer("cancel-during-ack");
+        transfer.file_size = manifest.file_size;
+        transfer.sha256 = hex::encode(manifest.file_sha256);
+        transfer.local_path = Some(source.to_string_lossy().into_owned());
+        transfer.chunk_count = u32::try_from(manifest.chunks.len()).expect("small manifest");
+        transfer.manifest_sha256 = Some(hex::encode(manifest.manifest_sha256));
+        transfer.source_modified_ns = Some(manifest.source_modified_ns);
+        let storage = Storage::open(&fixture.join("localnet.sqlite3")).expect("open storage");
+        storage
+            .create_outgoing_transfer_with_manifest(&transfer, &manifest.chunks)
+            .expect("persist outgoing manifest");
+        let stream = CancellingAckStream {
+            incoming: manifest.file_size.to_be_bytes().to_vec(),
+            cursor: 0,
+            storage: storage.clone(),
+            transfer_id: transfer.transfer_id.clone(),
+            peer_id: transfer.peer_id.clone(),
+            cancelled: false,
+        };
+
+        let error = send_resumable_transfer(
+            ResumableStreamOpener::Scripted(Box::new(stream)),
+            &transfer,
+            &storage,
+            &mut |_| {},
+        )
+        .await
+        .expect_err("stale ACK progress must lose its claim-scoped CAS");
+        assert!(matches!(error, AppError::Storage(_)));
+        let cancelled = storage
+            .get_transfer(&transfer.transfer_id)
+            .unwrap()
+            .expect("cancelled transfer exists");
+        assert_eq!(cancelled.status, TransferStatus::Cancelled);
+        assert!(!cancelled.send_claimed);
+        assert_eq!(cancelled.transferred_bytes, 0);
 
         drop(storage);
         fs::remove_dir_all(fixture).expect("remove fixture");
