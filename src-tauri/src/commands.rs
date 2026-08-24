@@ -3,6 +3,7 @@ use std::{
     io::{BufReader, Read},
     path::{Path, PathBuf},
     str::FromStr,
+    sync::{Arc, Mutex},
 };
 
 use base64::Engine as _;
@@ -371,11 +372,10 @@ pub async fn send_file(
 }
 
 #[tauri::command]
-pub fn resolve_transfer(
+pub async fn resolve_transfer(
     transfer_id: String,
     accepted: bool,
     save_path: Option<String>,
-    app_handle: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<TransferRecord, AppError> {
     uuid::Uuid::parse_str(&transfer_id)
@@ -393,6 +393,8 @@ pub fn resolve_transfer(
     }
     require_online_peer(&transfer.peer_id, &state)?;
     if accepted {
+        let (completion_sender, completion_receiver) = tokio::sync::oneshot::channel();
+        let completion = Arc::new(Mutex::new(Some(completion_sender)));
         let path = save_path
             .filter(|path| !path.trim().is_empty())
             .map(PathBuf::from)
@@ -412,15 +414,28 @@ pub fn resolve_transfer(
                     peer_id: accepted.peer_id.clone(),
                     transfer_id: accepted.transfer_id.clone(),
                     accepted: true,
+                    completion: Some(completion.clone()),
                 })
             },
         )?;
-        crate::network::spawn_incoming_start_timeout(
-            transfer.transfer_id.clone(),
-            state.storage.clone(),
-            app_handle,
-        );
-        return Ok(transfer);
+        match completion_receiver.await {
+            Ok(Ok(())) => {
+                return state
+                    .storage
+                    .get_transfer(&transfer.transfer_id)?
+                    .ok_or_else(|| AppError::Storage("接收确认提交后传输记录不存在".to_string()));
+            }
+            Ok(Err(message)) => return Err(AppError::Network(message)),
+            Err(error) => {
+                let message = format!("接收确认未提交，请重新确认：{error}");
+                crate::network::return_pending_incoming_decision_to_manual(
+                    &transfer.transfer_id,
+                    &state.storage,
+                    message.clone(),
+                )?;
+                return Err(AppError::Network(message));
+            }
+        }
     } else {
         if !state.storage.try_cancel_unclaimed_incoming_transfer(
             &transfer.transfer_id,
@@ -471,6 +486,7 @@ pub fn resolve_transfer(
         peer_id: transfer.peer_id.clone(),
         transfer_id: transfer_id.clone(),
         accepted,
+        completion: None,
     }) {
         if transfer.destination_reserved {
             if let (Some(path), Some(token)) = (
@@ -614,7 +630,6 @@ fn prepare_receive_directory(
 }
 
 fn reserve_manual_receive_destination(
-    transfer_protocol: u8,
     path: &Path,
     transfer_id: &str,
     reservation_token: &str,
@@ -622,15 +637,11 @@ fn reserve_manual_receive_destination(
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "接收文件保存位置无效")
     })?;
-    if transfer_protocol == TransferProtocol::ResumableV2 as u8 {
-        if !parent.is_dir() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "接收目录或磁盘当前不可用",
-            ));
-        }
-    } else {
-        std::fs::create_dir_all(parent)?;
+    if !parent.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "接收目录或磁盘当前不可用",
+        ));
     }
     reserve_receive_path(path, transfer_id, reservation_token)
 }
@@ -654,18 +665,11 @@ where
     let parent = path
         .parent()
         .ok_or_else(|| AppError::InvalidInput("接收文件保存位置无效".to_string()))?;
-    if transfer.transfer_protocol == TransferProtocol::ResumableV2 as u8 {
-        preflight(parent, transfer.file_size, 0)?;
-    }
+    preflight(parent, transfer.file_size, 0)?;
 
     let reservation_token = uuid::Uuid::new_v4().to_string();
-    reserve_manual_receive_destination(
-        transfer.transfer_protocol,
-        path,
-        &transfer.transfer_id,
-        &reservation_token,
-    )
-    .map_err(map_receive_reservation_error)?;
+    reserve_manual_receive_destination(path, &transfer.transfer_id, &reservation_token)
+        .map_err(map_receive_reservation_error)?;
 
     let mut accepted = transfer.clone();
     accepted.local_path = Some(path.to_string_lossy().into_owned());
@@ -689,13 +693,11 @@ where
     }
 
     if let Err(error) = dispatch(&accepted) {
-        cleanup_manual_reservation(&accepted);
-        accepted.destination_reserved = false;
-        accepted.reservation_token = None;
-        accepted.status = TransferStatus::Failed;
-        accepted.error = Some(error.to_string());
-        accepted.updated_at = now_rfc3339();
-        storage.upsert_transfer(&accepted)?;
+        crate::network::return_pending_incoming_decision_to_manual(
+            &accepted.transfer_id,
+            storage,
+            error.to_string(),
+        )?;
         return Err(error);
     }
     Ok(accepted)
@@ -968,6 +970,18 @@ mod tests {
         assert!(!destination.exists());
     }
 
+    fn legacy_acceptance_fixture(name: &str, file_size: u64) -> (PathBuf, Storage, TransferRecord) {
+        let (directory, storage, mut transfer) = acceptance_fixture(name, file_size);
+        transfer.transfer_protocol = TransferProtocol::LegacyV1 as u8;
+        transfer.chunk_size = 0;
+        transfer.chunk_count = 0;
+        transfer.manifest_sha256 = None;
+        storage
+            .upsert_transfer(&transfer)
+            .expect("persist legacy acceptance fixture");
+        (directory, storage, transfer)
+    }
+
     #[test]
     fn upgraded_peer_prepares_a_v2_manifest_before_offering_a_source() {
         let fixture = std::env::temp_dir().join(format!(
@@ -1145,6 +1159,145 @@ mod tests {
     }
 
     #[test]
+    fn manual_v1_acceptance_preflights_space_and_missing_directory_before_side_effects() {
+        let file_size = GIB;
+        for unavailable in ["insufficient", "missing"] {
+            let (directory, storage, transfer) = legacy_acceptance_fixture(unavailable, file_size);
+            let destination = if unavailable == "missing" {
+                directory.join("missing-volume").join("archive.bin")
+            } else {
+                directory.join("archive.bin")
+            };
+            let mut decisions = 0_u8;
+            let snapshot =
+                VolumeSnapshot::known("NTFS", file_size + DESTINATION_RESERVE_BYTES - 1, None);
+            let error = accept_incoming_transfer_with_preflight(
+                &storage,
+                &transfer,
+                &destination,
+                &|target, size, committed| {
+                    if unavailable == "missing" {
+                        preflight_receive_directory(target, size, committed)
+                    } else {
+                        validate_volume(&snapshot, size, committed)
+                    }
+                },
+                &mut |_| {
+                    decisions += 1;
+                    Ok(())
+                },
+            )
+            .expect_err("legacy acceptance must fail preflight before reservation");
+
+            let expected = if unavailable == "missing" {
+                "请选择可访问且可写入的目录"
+            } else {
+                "可用空间不足"
+            };
+            assert!(error.to_string().contains(expected));
+            assert_eq!(decisions, 0);
+            assert_manual_acceptance_unchanged(&storage, &transfer.transfer_id, &destination);
+            assert!(!directory.join("missing-volume").exists());
+            drop(storage);
+            fs::remove_dir_all(directory).expect("remove legacy preflight fixture");
+        }
+    }
+
+    #[test]
+    fn manual_v1_acceptance_allows_exact_remaining_plus_64_mib() {
+        let file_size = GIB;
+        let (directory, storage, transfer) =
+            legacy_acceptance_fixture("v1-exact-margin", file_size);
+        let destination = directory.join("archive.bin");
+        let snapshot = VolumeSnapshot::known("NTFS", file_size + DESTINATION_RESERVE_BYTES, None);
+        let probes = std::cell::Cell::new(0_u8);
+
+        let accepted = accept_incoming_transfer_with_preflight(
+            &storage,
+            &transfer,
+            &destination,
+            &|_, size, committed| {
+                probes.set(probes.get() + 1);
+                validate_volume(&snapshot, size, committed)
+            },
+            &mut |_| Ok(()),
+        )
+        .expect("legacy acceptance must permit the exact safety margin");
+
+        assert_eq!(probes.get(), 1);
+        assert_eq!(accepted.status, TransferStatus::Transferring);
+        assert!(accepted.destination_reserved);
+        assert!(
+            storage
+                .try_cancel_unclaimed_incoming_transfer(
+                    &accepted.transfer_id,
+                    &accepted.peer_id,
+                    accepted.transfer_protocol,
+                    "test cleanup",
+                )
+                .expect("clean accepted legacy fixture")
+        );
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove exact-margin legacy fixture");
+    }
+
+    #[test]
+    fn manual_decision_enqueue_failure_reverts_v1_and_v2_to_awaiting_without_owned_artifacts() {
+        for protocol in [
+            TransferProtocol::LegacyV1 as u8,
+            TransferProtocol::ResumableV2 as u8,
+        ] {
+            let (directory, storage, transfer) = if protocol == TransferProtocol::LegacyV1 as u8 {
+                legacy_acceptance_fixture("v1-dispatch-failure", MIB)
+            } else {
+                acceptance_fixture("v2-dispatch-failure", MIB)
+            };
+            let destination = directory.join("archive.bin");
+
+            let error = accept_incoming_transfer_with_preflight(
+                &storage,
+                &transfer,
+                &destination,
+                &|_, _, _| Ok(()),
+                &mut |_| {
+                    Err(AppError::Network(
+                        "injected offline command queue failure".to_string(),
+                    ))
+                },
+            )
+            .expect_err("failed network enqueue must compensate acceptance");
+
+            assert!(error.to_string().contains("offline command queue"));
+            let stored = storage
+                .get_transfer(&transfer.transfer_id)
+                .expect("reload compensated manual transfer")
+                .expect("compensated manual transfer exists");
+            assert_eq!(stored.status, TransferStatus::AwaitingAcceptance);
+            assert!(
+                stored
+                    .error
+                    .as_deref()
+                    .is_some_and(|value| value.contains("offline command queue"))
+            );
+            assert!(!stored.destination_reserved);
+            assert!(stored.local_path.is_none());
+            assert!(stored.reservation_token.is_none());
+            assert!(stored.partial_path.is_none());
+            assert!(
+                fs::read_dir(&directory)
+                    .expect("list manual compensation directory")
+                    .filter_map(Result::ok)
+                    .all(|entry| !entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".weline-localnet"))
+            );
+            drop(storage);
+            fs::remove_dir_all(directory).expect("remove manual dispatch failure fixture");
+        }
+    }
+
+    #[test]
     fn disabling_auto_receive_accepts_an_unavailable_absolute_directory() {
         let fixture = std::env::temp_dir().join(format!(
             "weline-localnet-disabled-directory-{}",
@@ -1173,13 +1326,8 @@ mod tests {
         ));
         let destination = fixture.join("unplugged-volume").join("report.bin");
 
-        let error = reserve_manual_receive_destination(
-            TransferProtocol::ResumableV2 as u8,
-            &destination,
-            "transfer-one",
-            "token-one",
-        )
-        .expect_err("missing selected parent must reject v2 acceptance");
+        let error = reserve_manual_receive_destination(&destination, "transfer-one", "token-one")
+            .expect_err("missing selected parent must reject v2 acceptance");
 
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
         assert!(!fixture.exists());

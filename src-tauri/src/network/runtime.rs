@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -17,7 +18,7 @@ use libp2p::{
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, UserAttentionType};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use super::{
     behaviour::{LocalnetBehaviour, LocalnetBehaviourEvent},
@@ -34,12 +35,11 @@ use crate::{
     identity::LocalIdentity,
     protocol::{ControlRequest, ControlResponse, FILE_PROTOCOL, HelloPayload, TransferOffer},
     receive_paths::{
-        ensure_writable_directory, preflight_receive_directory, remove_owned_reservation,
-        reserve_available_receive_path,
+        preflight_receive_directory, remove_owned_reservation, reserve_available_receive_path,
     },
     storage::Storage,
     transfer_manifest::validate_transfer_metadata,
-    transfer_policy::{FILE_RESUME_V2_CAPABILITY, TransferProtocol},
+    transfer_policy::FILE_RESUME_V2_CAPABILITY,
 };
 
 const EVENT_NAME: &str = "localnet://event";
@@ -61,12 +61,15 @@ pub enum NetworkCommand {
         peer_id: String,
         transfer_id: String,
         accepted: bool,
+        completion: Option<TransferDecisionCompletion>,
     },
     CancelTransfer {
         peer_id: String,
         transfer_id: String,
     },
 }
+
+pub type TransferDecisionCompletion = Arc<Mutex<Option<oneshot::Sender<Result<(), String>>>>>;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
@@ -115,6 +118,22 @@ impl NetworkHandle {
         self.sender
             .try_send(command)
             .map_err(|error| AppError::Network(format!("网络服务暂时不可用，请稍后重试：{error}")))
+    }
+}
+
+fn complete_transfer_decision(
+    completion: &Option<TransferDecisionCompletion>,
+    result: Result<(), String>,
+) {
+    let Some(completion) = completion else {
+        return;
+    };
+    let sender = completion
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    if let Some(sender) = sender {
+        let _ = sender.send(result);
     }
 }
 
@@ -349,6 +368,7 @@ impl NetworkRuntime {
                 peer_id,
                 transfer_id,
                 accepted,
+                completion,
             } => {
                 let peer_id = parse_peer_id(&peer_id)?;
                 self.ensure_connected(&peer_id)?;
@@ -366,6 +386,25 @@ impl NetworkRuntime {
                         accepted,
                     },
                 );
+                if accepted {
+                    let submitted = self.storage.get_transfer(&transfer_id)?.ok_or_else(|| {
+                        AppError::Storage("已提交的接收确认记录不存在".to_string())
+                    })?;
+                    if submitted.status != TransferStatus::Transferring {
+                        return Err(AppError::Storage(
+                            "接收确认提交后状态不一致，请刷新后重试".to_string(),
+                        ));
+                    }
+                    self.emit(NetworkEvent::TransferUpdated {
+                        transfer: submitted,
+                    });
+                    transfer::spawn_incoming_start_timeout(
+                        transfer_id,
+                        self.storage.clone(),
+                        self.app_handle.clone(),
+                    );
+                }
+                complete_transfer_decision(&completion, Ok(()));
             }
             NetworkCommand::CancelTransfer {
                 peer_id,
@@ -399,10 +438,30 @@ impl NetworkRuntime {
             NetworkCommand::OfferTransfer(transfer) => {
                 self.set_transfer_failed(&transfer.transfer_id, error.to_string())?;
             }
+            NetworkCommand::ResolveTransfer {
+                transfer_id,
+                accepted,
+                completion,
+                ..
+            } => {
+                let compensation = if *accepted {
+                    let message = format!("接收确认未提交，请重新确认：{error}");
+                    transfer::return_pending_incoming_decision_to_manual(
+                        transfer_id,
+                        &self.storage,
+                        message,
+                    )
+                } else {
+                    Ok(None)
+                };
+                complete_transfer_decision(completion, Err(error.to_string()));
+                if let Some(transfer) = compensation? {
+                    self.emit(NetworkEvent::TransferUpdated { transfer });
+                }
+            }
             NetworkCommand::SetProfile(_)
             | NetworkCommand::SendFriendRequest(_)
             | NetworkCommand::ResolveFriendRequest { .. }
-            | NetworkCommand::ResolveTransfer { .. }
             | NetworkCommand::CancelTransfer { .. } => {}
         }
         Ok(())
@@ -742,15 +801,6 @@ impl NetworkRuntime {
                     &preflight_receive_directory,
                 )?;
                 let transfer = outcome.transfer;
-                self.emit(NetworkEvent::TransferUpdated {
-                    transfer: transfer.clone(),
-                });
-                if let Some(message) = outcome.automatic_receive_error {
-                    self.emit(NetworkEvent::NetworkError {
-                        code: "transfer.auto_receive_unavailable".to_string(),
-                        message: format!("自动接收目录当前不可用，请手动选择保存位置：{message}"),
-                    });
-                }
                 if outcome.transfer_decision == Some(true) {
                     let outbound_id = self.swarm.behaviour_mut().control.send_request(
                         &peer_id,
@@ -766,11 +816,41 @@ impl NetworkRuntime {
                             accepted: true,
                         },
                     );
-                    transfer::spawn_incoming_start_timeout(
-                        transfer.transfer_id,
-                        self.storage.clone(),
-                        self.app_handle.clone(),
-                    );
+                    match finalize_accepted_transfer_submission(
+                        &self.storage,
+                        &transfer.transfer_id,
+                        Ok(()),
+                    )? {
+                        AcceptedSubmissionOutcome::Submitted { transfer } => {
+                            self.emit(NetworkEvent::TransferUpdated {
+                                transfer: transfer.clone(),
+                            });
+                            transfer::spawn_incoming_start_timeout(
+                                transfer.transfer_id,
+                                self.storage.clone(),
+                                self.app_handle.clone(),
+                            );
+                        }
+                        AcceptedSubmissionOutcome::Reverted { transfer, error } => {
+                            self.emit(NetworkEvent::TransferUpdated { transfer });
+                            self.emit(NetworkEvent::NetworkError {
+                                code: error.code().to_string(),
+                                message: error.to_string(),
+                            });
+                        }
+                    }
+                } else {
+                    self.emit(NetworkEvent::TransferUpdated {
+                        transfer: transfer.clone(),
+                    });
+                    if let Some(message) = outcome.automatic_receive_error {
+                        self.emit(NetworkEvent::NetworkError {
+                            code: "transfer.auto_receive_unavailable".to_string(),
+                            message: format!(
+                                "自动接收目录当前不可用，请手动选择保存位置：{message}"
+                            ),
+                        });
+                    }
                 }
                 Ok(ControlResponse::Accepted)
             }
@@ -1207,17 +1287,16 @@ where
     P: Fn(&std::path::Path, u64, u64) -> Result<(), AppError>,
 {
     let configured = std::path::Path::new(&preferences.receive_directory);
-    let directory = if transfer_protocol == TransferProtocol::ResumableV2 as u8 {
-        if !configured.is_absolute() {
-            return Err(AppError::InvalidInput(
-                "文件接收目录必须是绝对路径".to_string(),
-            ));
-        }
-        preflight(configured, file_size, 0)?;
-        configured.to_path_buf()
-    } else {
-        ensure_writable_directory(configured)?
-    };
+    if !matches!(transfer_protocol, 1 | 2) {
+        return Err(AppError::InvalidInput("接收文件协议版本无效".to_string()));
+    }
+    if !configured.is_absolute() {
+        return Err(AppError::InvalidInput(
+            "文件接收目录必须是绝对路径".to_string(),
+        ));
+    }
+    preflight(configured, file_size, 0)?;
+    let directory = configured.to_path_buf();
     let reservation_token = uuid::Uuid::new_v4().to_string();
     let path =
         reserve_available_receive_path(&directory, file_name, transfer_id, &reservation_token)?;
@@ -1230,6 +1309,50 @@ struct IncomingOfferOutcome {
     transfer_decision: Option<bool>,
 }
 
+enum AcceptedSubmissionOutcome {
+    Submitted {
+        transfer: TransferRecord,
+    },
+    Reverted {
+        transfer: TransferRecord,
+        error: AppError,
+    },
+}
+
+fn finalize_accepted_transfer_submission(
+    storage: &Storage,
+    transfer_id: &str,
+    submission: Result<(), AppError>,
+) -> Result<AcceptedSubmissionOutcome, AppError> {
+    match submission {
+        Ok(()) => {
+            let transfer = storage
+                .get_transfer(transfer_id)?
+                .ok_or_else(|| AppError::Storage("已提交的接收确认记录不存在".to_string()))?;
+            if transfer.direction != Direction::Incoming
+                || transfer.status != TransferStatus::Transferring
+            {
+                return Err(AppError::Storage(
+                    "接收确认提交后状态不一致，请刷新后重试".to_string(),
+                ));
+            }
+            Ok(AcceptedSubmissionOutcome::Submitted { transfer })
+        }
+        Err(error) => {
+            let message = format!("接收确认未提交，请重新确认：{error}");
+            let transfer = transfer::return_pending_incoming_decision_to_manual(
+                transfer_id,
+                storage,
+                message,
+            )?
+            .ok_or_else(|| {
+                AppError::Storage("接收确认失败时传输状态已变化，请刷新后重试".to_string())
+            })?;
+            Ok(AcceptedSubmissionOutcome::Reverted { transfer, error })
+        }
+    }
+}
+
 fn persist_incoming_offer_with_preflight<P>(
     storage: &Storage,
     peer_id: &str,
@@ -1240,26 +1363,30 @@ fn persist_incoming_offer_with_preflight<P>(
 where
     P: Fn(&std::path::Path, u64, u64) -> Result<(), AppError>,
 {
-    let (local_path, reservation_token, automatic_receive_error) = if preferences.auto_receive_files
-    {
-        match automatic_receive_path_with_preflight(
-            preferences,
-            &offer.file_name,
-            &offer.transfer_id,
-            offer.transfer_protocol,
-            offer.file_size,
-            preflight,
-        ) {
-            Ok((path, token)) => (Some(path.to_string_lossy().into_owned()), Some(token), None),
-            Err(error) => (None, None, Some(error.to_string())),
-        }
-    } else {
-        (None, None, None)
-    };
-    let destination_reserved = reservation_token.is_some();
-    let auto_accept = local_path.is_some();
+    persist_incoming_offer_with_preflight_and_accept(
+        storage,
+        peer_id,
+        offer,
+        preferences,
+        preflight,
+        &|storage, accepted| storage.try_accept_incoming_transfer(accepted),
+    )
+}
+
+fn persist_incoming_offer_with_preflight_and_accept<P, A>(
+    storage: &Storage,
+    peer_id: &str,
+    offer: &TransferOffer,
+    preferences: &TransferPreferences,
+    preflight: &P,
+    accept: &A,
+) -> Result<IncomingOfferOutcome, AppError>
+where
+    P: Fn(&std::path::Path, u64, u64) -> Result<(), AppError>,
+    A: Fn(&Storage, &TransferRecord) -> Result<bool, AppError>,
+{
     let now = now_rfc3339();
-    let transfer = TransferRecord {
+    let mut transfer = TransferRecord {
         transfer_id: offer.transfer_id.clone(),
         peer_id: peer_id.to_string(),
         direction: Direction::Incoming,
@@ -1268,9 +1395,9 @@ where
         file_size: offer.file_size,
         mime_type: offer.mime_type.clone(),
         sha256: offer.sha256.clone(),
-        local_path,
-        destination_reserved,
-        reservation_token,
+        local_path: None,
+        destination_reserved: false,
+        reservation_token: None,
         transfer_protocol: offer.transfer_protocol,
         chunk_size: offer.chunk_size,
         chunk_count: offer.chunk_count,
@@ -1279,34 +1406,118 @@ where
         source_modified_ns: None,
         send_claimed: false,
         transferred_bytes: 0,
-        status: if auto_accept {
-            TransferStatus::Transferring
-        } else {
-            TransferStatus::AwaitingAcceptance
-        },
-        error: automatic_receive_error.clone(),
+        status: TransferStatus::AwaitingAcceptance,
+        error: None,
         created_at: now.clone(),
         updated_at: now,
     };
-    if let Err(error) = storage.upsert_transfer(&transfer) {
-        if transfer.destination_reserved {
-            if let (Some(path), Some(token)) = (
-                transfer.local_path.as_deref(),
-                transfer.reservation_token.as_deref(),
-            ) {
-                let _ = remove_owned_reservation(
-                    std::path::Path::new(path),
-                    &transfer.transfer_id,
-                    token,
-                );
-            }
-        }
-        return Err(error);
+    storage.upsert_transfer(&transfer)?;
+    if !preferences.auto_receive_files {
+        return Ok(IncomingOfferOutcome {
+            transfer,
+            automatic_receive_error: None,
+            transfer_decision: None,
+        });
     }
+
+    let (path, reservation_token) = match automatic_receive_path_with_preflight(
+        preferences,
+        &offer.file_name,
+        &offer.transfer_id,
+        offer.transfer_protocol,
+        offer.file_size,
+        preflight,
+    ) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let message = error.to_string();
+            transfer.error = Some(message.clone());
+            transfer.updated_at = now_rfc3339();
+            storage.upsert_transfer(&transfer)?;
+            return Ok(IncomingOfferOutcome {
+                transfer,
+                automatic_receive_error: Some(message),
+                transfer_decision: None,
+            });
+        }
+    };
+
+    let mut accepted = transfer.clone();
+    accepted.local_path = Some(path.to_string_lossy().into_owned());
+    accepted.destination_reserved = true;
+    accepted.reservation_token = Some(reservation_token.clone());
+    accepted.status = TransferStatus::Transferring;
+    accepted.updated_at = now_rfc3339();
+    let setup_result = accept(storage, &accepted);
+    match setup_result {
+        Ok(true) => {
+            let accepted = storage
+                .get_transfer(&accepted.transfer_id)?
+                .ok_or_else(|| AppError::Storage("自动接收记录在确认后消失".to_string()))?;
+            Ok(IncomingOfferOutcome {
+                transfer: accepted,
+                automatic_receive_error: None,
+                transfer_decision: Some(true),
+            })
+        }
+        Ok(false) => {
+            let error = AppError::InvalidInput(
+                "自动接收准备期间传输状态已变化，请手动选择保存位置".to_string(),
+            );
+            compensate_automatic_acceptance_setup(
+                storage,
+                transfer,
+                &path,
+                &reservation_token,
+                error,
+            )
+        }
+        Err(error) => compensate_automatic_acceptance_setup(
+            storage,
+            transfer,
+            &path,
+            &reservation_token,
+            error,
+        ),
+    }
+}
+
+fn compensate_automatic_acceptance_setup(
+    storage: &Storage,
+    mut awaiting: TransferRecord,
+    destination: &std::path::Path,
+    reservation_token: &str,
+    error: AppError,
+) -> Result<IncomingOfferOutcome, AppError> {
+    let message = format!("自动接收准备失败，请手动选择保存位置：{error}");
+    if let Some(current) = storage.get_transfer(&awaiting.transfer_id)? {
+        if current.status == TransferStatus::Transferring {
+            let transfer = transfer::return_pending_incoming_decision_to_manual(
+                &awaiting.transfer_id,
+                storage,
+                message.clone(),
+            )?
+            .ok_or_else(|| {
+                AppError::Storage("自动接收回退期间传输状态已变化，请刷新后重试".to_string())
+            })?;
+            return Ok(IncomingOfferOutcome {
+                transfer,
+                automatic_receive_error: Some(message),
+                transfer_decision: None,
+            });
+        }
+    }
+    remove_owned_reservation(destination, &awaiting.transfer_id, reservation_token)?;
+    awaiting.error = Some(message.clone());
+    awaiting.updated_at = now_rfc3339();
+    storage.upsert_transfer(&awaiting)?;
+    let transfer = storage
+        .get_transfer(&awaiting.transfer_id)?
+        .ok_or_else(|| AppError::Storage("自动接收回退记录不存在".to_string()))?;
     Ok(IncomingOfferOutcome {
         transfer,
-        automatic_receive_error,
-        transfer_decision: auto_accept.then_some(true),
+        automatic_receive_error: Some(message),
+        transfer_decision: None,
     })
 }
 
@@ -1315,14 +1526,16 @@ mod tests {
     use std::{fs, path::PathBuf};
 
     use super::{
-        automatic_receive_path, persist_incoming_offer_with_preflight, validate_transfer_offer,
+        AcceptedSubmissionOutcome, automatic_receive_path, finalize_accepted_transfer_submission,
+        persist_incoming_offer_with_preflight, persist_incoming_offer_with_preflight_and_accept,
+        validate_transfer_offer,
     };
     use crate::{
         domain::{TransferKind, TransferPreferences, TransferStatus},
         error::AppError,
         protocol::TransferOffer,
-        receive_paths::preflight_receive_directory,
-        storage::Storage,
+        receive_paths::{preflight_receive_directory, reservation_is_owned},
+        storage::{IncomingAcceptancePhase, Storage},
         transfer_policy::{TRANSFER_CHUNK_BYTES, TransferProtocol},
         volume_preflight::{VolumeSnapshot, validate_volume},
     };
@@ -1354,6 +1567,16 @@ mod tests {
         offer.chunk_count =
             u32::try_from(offer.file_size.div_ceil(u64::from(TRANSFER_CHUNK_BYTES)))
                 .expect("large offer chunk count");
+        offer
+    }
+
+    fn large_v1_offer() -> TransferOffer {
+        let mut offer = large_v2_offer();
+        offer.file_size = GIB;
+        offer.transfer_protocol = TransferProtocol::LegacyV1 as u8;
+        offer.chunk_size = 0;
+        offer.chunk_count = 0;
+        offer.manifest_sha256 = None;
         offer
     }
 
@@ -1557,6 +1780,298 @@ mod tests {
         assert_automatic_fallback(&storage, &offer.transfer_id, "无法写入接收目录");
         drop(storage);
         fs::remove_dir_all(directory).expect("remove unwritable automatic fixture");
+    }
+
+    #[test]
+    fn automatic_v1_acceptance_preflights_space_and_missing_directory_without_a_decision() {
+        for unavailable in ["insufficient", "missing"] {
+            let (directory, storage, mut preferences) =
+                automatic_fixture(&format!("v1-{unavailable}"));
+            let offer = large_v1_offer();
+            if unavailable == "missing" {
+                preferences.receive_directory = directory
+                    .join("missing-volume")
+                    .to_string_lossy()
+                    .into_owned();
+            }
+            let snapshot = VolumeSnapshot::known(
+                "NTFS",
+                offer.file_size + DESTINATION_RESERVE_BYTES - 1,
+                None,
+            );
+
+            let outcome = persist_incoming_offer_with_preflight(
+                &storage,
+                "automatic-preflight-peer",
+                &offer,
+                &preferences,
+                &|target, size, committed| {
+                    if unavailable == "missing" {
+                        preflight_receive_directory(target, size, committed)
+                    } else {
+                        validate_volume(&snapshot, size, committed)
+                    }
+                },
+            )
+            .expect("legacy automatic preflight failure must persist manual fallback");
+
+            assert!(outcome.transfer_decision.is_none());
+            let expected = if unavailable == "missing" {
+                "请选择可访问且可写入的目录"
+            } else {
+                "可用空间不足"
+            };
+            assert_automatic_fallback(&storage, &offer.transfer_id, expected);
+            assert!(!directory.join("missing-volume").exists());
+            drop(storage);
+            fs::remove_dir_all(directory).expect("remove legacy automatic fixture");
+        }
+    }
+
+    #[test]
+    fn automatic_v1_acceptance_allows_exact_remaining_plus_64_mib() {
+        let (directory, storage, preferences) = automatic_fixture("v1-exact-margin");
+        let offer = large_v1_offer();
+        let snapshot =
+            VolumeSnapshot::known("NTFS", offer.file_size + DESTINATION_RESERVE_BYTES, None);
+        let probes = std::cell::Cell::new(0_u8);
+
+        let outcome = persist_incoming_offer_with_preflight(
+            &storage,
+            "automatic-preflight-peer",
+            &offer,
+            &preferences,
+            &|_, size, committed| {
+                probes.set(probes.get() + 1);
+                validate_volume(&snapshot, size, committed)
+            },
+        )
+        .expect("legacy automatic acceptance must permit the exact safety margin");
+
+        assert_eq!(probes.get(), 1);
+        assert_eq!(outcome.transfer_decision, Some(true));
+        let accepted = storage
+            .get_transfer(&offer.transfer_id)
+            .expect("reload legacy automatic transfer")
+            .expect("legacy automatic transfer exists");
+        assert_eq!(accepted.status, TransferStatus::Transferring);
+        assert!(accepted.destination_reserved);
+        assert!(
+            storage
+                .try_cancel_unclaimed_incoming_transfer(
+                    &accepted.transfer_id,
+                    &accepted.peer_id,
+                    accepted.transfer_protocol,
+                    "test cleanup",
+                )
+                .expect("clean legacy automatic fixture")
+        );
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove exact legacy automatic fixture");
+    }
+
+    #[test]
+    fn automatic_setup_failure_after_reservation_compensates_to_manual_fallback() {
+        let (directory, storage, preferences) = automatic_fixture("after-reservation-failure");
+        let offer = v2_offer();
+        let reservation_observed = std::cell::Cell::new(false);
+
+        let outcome = persist_incoming_offer_with_preflight_and_accept(
+            &storage,
+            "automatic-preflight-peer",
+            &offer,
+            &preferences,
+            &|_, _, _| Ok(()),
+            &|_, accepted| {
+                let destination = std::path::Path::new(
+                    accepted
+                        .local_path
+                        .as_deref()
+                        .expect("prepared destination"),
+                );
+                let token = accepted
+                    .reservation_token
+                    .as_deref()
+                    .expect("prepared reservation token");
+                reservation_observed.set(
+                    reservation_is_owned(destination, &accepted.transfer_id, token)
+                        .expect("inspect prepared reservation"),
+                );
+                Err(AppError::Storage(
+                    "injected failure after reservation".to_string(),
+                ))
+            },
+        )
+        .expect("post-reservation setup failure must become manual fallback");
+
+        assert!(reservation_observed.get());
+        assert!(outcome.transfer_decision.is_none());
+        assert_automatic_fallback(&storage, &offer.transfer_id, "after reservation");
+        assert!(
+            fs::read_dir(&directory)
+                .expect("list compensated directory")
+                .filter_map(Result::ok)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".weline-localnet"))
+        );
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove post-reservation fixture");
+    }
+
+    #[test]
+    fn automatic_partial_setup_failure_cleans_owned_partial_and_retains_awaiting_row() {
+        let (directory, storage, preferences) = automatic_fixture("partial-setup-failure");
+        let offer = v2_offer();
+        let partial_observed = std::cell::Cell::new(false);
+
+        let outcome = persist_incoming_offer_with_preflight_and_accept(
+            &storage,
+            "automatic-preflight-peer",
+            &offer,
+            &preferences,
+            &|_, _, _| Ok(()),
+            &|storage, accepted| {
+                storage.try_accept_incoming_transfer_with_hook(accepted, &mut |phase| {
+                    if phase == IncomingAcceptancePhase::AfterPersistence {
+                        partial_observed.set(true);
+                        return Err(AppError::Storage(
+                            "injected failure during partial persistence".to_string(),
+                        ));
+                    }
+                    Ok(())
+                })
+            },
+        )
+        .expect("partial setup failure must become manual fallback");
+
+        assert!(partial_observed.get());
+        assert!(outcome.transfer_decision.is_none());
+        assert_automatic_fallback(&storage, &offer.transfer_id, "partial persistence");
+        assert!(
+            fs::read_dir(&directory)
+                .expect("list partial compensation directory")
+                .filter_map(Result::ok)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".weline-localnet"))
+        );
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove partial compensation fixture");
+    }
+
+    #[test]
+    fn automatic_failure_after_acceptance_persistence_reverts_exact_owned_state() {
+        let (directory, storage, preferences) = automatic_fixture("after-persistence-failure");
+        let offer = v2_offer();
+
+        let outcome = persist_incoming_offer_with_preflight_and_accept(
+            &storage,
+            "automatic-preflight-peer",
+            &offer,
+            &preferences,
+            &|_, _, _| Ok(()),
+            &|storage, accepted| {
+                assert!(
+                    storage
+                        .try_accept_incoming_transfer(accepted)
+                        .expect("persist injected accepted state")
+                );
+                Err(AppError::Storage(
+                    "injected decision construction failure".to_string(),
+                ))
+            },
+        )
+        .expect("post-persistence failure must compensate exact accepted state");
+
+        assert!(outcome.transfer_decision.is_none());
+        assert_automatic_fallback(&storage, &offer.transfer_id, "decision construction");
+        assert!(
+            fs::read_dir(&directory)
+                .expect("list post-persistence compensation directory")
+                .filter_map(Result::ok)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".weline-localnet"))
+        );
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove post-persistence fixture");
+    }
+
+    #[test]
+    fn manual_command_offline_submission_reverts_v2_without_a_transferring_event() {
+        let (directory, storage, preferences) = automatic_fixture("manual-command-offline");
+        let offer = v2_offer();
+        let prepared = persist_incoming_offer_with_preflight(
+            &storage,
+            "automatic-preflight-peer",
+            &offer,
+            &preferences,
+            &|_, _, _| Ok(()),
+        )
+        .expect("prepare accepted transfer before runtime submission");
+        assert_eq!(prepared.transfer.status, TransferStatus::Transferring);
+
+        let outcome = finalize_accepted_transfer_submission(
+            &storage,
+            &offer.transfer_id,
+            Err(AppError::OfflinePeer),
+        )
+        .expect("offline submission must compensate accepted state");
+
+        let AcceptedSubmissionOutcome::Reverted { transfer, error } = outcome else {
+            panic!("offline command must not produce a submitted/transferring outcome");
+        };
+        assert_eq!(transfer.status, TransferStatus::AwaitingAcceptance);
+        assert!(matches!(error, AppError::OfflinePeer));
+        assert_automatic_fallback(&storage, &offer.transfer_id, "不在线");
+        assert!(
+            fs::read_dir(&directory)
+                .expect("list offline compensation directory")
+                .filter_map(Result::ok)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".weline-localnet"))
+        );
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove manual command offline fixture");
+    }
+
+    #[test]
+    fn automatic_send_request_failure_reverts_v1_without_a_transferring_event() {
+        let (directory, storage, preferences) = automatic_fixture("automatic-send-failure");
+        let offer = large_v1_offer();
+        let prepared = persist_incoming_offer_with_preflight(
+            &storage,
+            "automatic-preflight-peer",
+            &offer,
+            &preferences,
+            &|_, _, _| Ok(()),
+        )
+        .expect("prepare automatic legacy acceptance");
+        assert_eq!(prepared.transfer.status, TransferStatus::Transferring);
+
+        let outcome = finalize_accepted_transfer_submission(
+            &storage,
+            &offer.transfer_id,
+            Err(AppError::Network(
+                "injected send_request failure".to_string(),
+            )),
+        )
+        .expect("automatic send failure must compensate accepted state");
+
+        let AcceptedSubmissionOutcome::Reverted { transfer, error } = outcome else {
+            panic!("failed automatic send must not produce a transferring event payload");
+        };
+        assert_eq!(transfer.status, TransferStatus::AwaitingAcceptance);
+        assert!(error.to_string().contains("send_request"));
+        assert_automatic_fallback(&storage, &offer.transfer_id, "send_request");
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove automatic send failure fixture");
     }
 
     #[test]

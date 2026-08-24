@@ -53,3 +53,40 @@ Required target directory: `G:\codex-localnet-target`
 - No known Task 6 blocker.
 - Task 7 still owns reconnect resume query/response messages, scheduling, and v2 acceptor registration. Task 6 only gates the already-exposed live paused receive entry and provides the reusable claim/preflight boundary.
 - The Windows implementation compiled and used the production probe for real missing-directory coverage, but this host did not mount a physical FAT32 volume; Task 2's production alias mapping and pure policy tests remain the evidence for FAT32 behavior. macOS runtime probing remains native-CI/device evidence.
+
+## Review fix round 1 — 2026-08-25
+
+This section supersedes the earlier compatibility statement that v1 skipped preflight. Review round 1 requires the same acceptance destination gate for both protocols while retaining v1's legacy size ceiling and stream format.
+
+### Implementation and files
+
+- `src-tauri/src/commands.rs`: manual v1 and v2 acceptance now both preflight an existing selected parent before reservation; v1 no longer recreates a missing selected directory. Accepted manual commands carry a runtime completion channel and return `Transferring` only after `send_request` has been submitted. Queue/runtime failure returns the exact unclaimed acceptance to `AwaitingAcceptance` with its actionable error.
+- `src-tauri/src/network/runtime.rs`: automatic offers first persist a durable `AwaitingAcceptance` base row, then treat reservation, partial setup, acceptance CAS, decision construction, and submission as one compensated operation. `TransferUpdated(Transferring)` is emitted only after the request is submitted. `ResolveTransfer` is no longer ignored by `handle_command_failure`.
+- `src-tauri/src/storage.rs`: failed pre-decision acceptance rollback claims the exact zero-byte row, journals proven reservation/partial ownership, atomically clears ownership and returns it to `AwaitingAcceptance`, then performs retryable identity-checked filesystem cleanup. Partial/CAS failures clean unpersisted owned partials.
+- `src-tauri/src/network/resumable_transfer.rs` and `src-tauri/src/network/transfer.rs`: the production receive body boundary now claims, reloads, validates both the authoritative committed boundary and incoming header offset, and preflights before body/file access. A stale header is atomically paused with its claim cleared; only the reloaded committed offset can reach `open_owned_resumable_partial`.
+- `src-tauri/src/network/mod.rs`: exposes only the crate-private rollback primitive needed by manual command compensation.
+
+### Genuine RED → GREEN evidence
+
+1. V1 RED: `cargo test --manifest-path src-tauri/Cargo.toml --lib manual_v1_acceptance -- --nocapture` failed both new tests: insufficient space was accepted and the exact-margin probe count was `0` instead of `1`. The first automatic RED also caught an invalid 5 GiB legacy fixture; it was corrected to the existing 1 GiB v1 policy range before implementation. GREEN: manual and automatic v1 focused suites each pass 2 tests for insufficient space, missing directory/no creation/no decision/no reservation, and the exact 64 MiB margin.
+2. Authoritative-offset RED: `cargo test --manifest-path src-tauri/Cargo.toml --lib production_receive_boundary -- --nocapture` ran the real owned-partial/SQLite boundary; the stale stream reached its body and failed at `stale stream must lose ...: ()`. GREEN: 2 tests pass; a competing stream advances and pauses, the stale header loses without truncation, the fresh offset later reaches the body, and shrink/restore probes observe persisted committed bytes.
+3. Decision-dispatch RED: `cargo test --manifest-path src-tauri/Cargo.toml --lib submission_reverts -- --nocapture` failed to compile with unresolved `AcceptedSubmissionOutcome` and `finalize_accepted_transfer_submission`. GREEN: production submission completion tests pass for manual offline v2 and automatic `send_request` failure v1, returning only corrected `AwaitingAcceptance` payloads.
+4. Green/refactor coverage additionally injects failure after reservation, after partial SQL persistence before commit, and after a successful acceptance CAS/decision construction; every case retains an actionable `AwaitingAcceptance` row, produces no decision, and removes only token/identity-owned artifacts. A focused run exposed a lock-lifetime deadlock in journal cleanup; dropping the committed SQLite guard before retryable cleanup fixed it, and both focused compensation tests then passed.
+
+### Exact final verification
+
+- Nine locked focused commands covering v1 manual/automatic, production receive boundary, manual enqueue failure, three automatic setup/CAS compensation phases, manual offline submission, and automatic send failure — PASS, 12 tests total.
+- `cargo test --manifest-path src-tauri/Cargo.toml --locked` with `CARGO_TARGET_DIR=G:\codex-localnet-target` — PASS, 152 library tests, 0 binary tests, 0 doc tests; only the existing informational Windows linker import-library message.
+- `cargo check --manifest-path src-tauri/Cargo.toml --locked` — PASS, debug profile without compiler warnings.
+- `cargo check --manifest-path src-tauri/Cargo.toml --release --locked` — PASS, optimized profile.
+- `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check` — PASS.
+- `git diff --check` — PASS.
+- `pnpm release:check` with `npm_config_script_shell=powershell.exe` — PASS, synchronized `0.1.7`.
+
+### Review conclusions and concerns
+
+- TOCTOU compensation: probes precede all ownership. Directory changes after a successful probe fail in create-new reservation/partial setup, and automatic failures compensate through the durable awaiting row. Decision rollback uses a receive-claim CAS plus durable ownership journal, so a missing disk cannot leave the UI in `Transferring` and cleanup retries without deleting unrelated files.
+- Error/event visibility: manual callers await runtime submission; automatic code does not emit active state before submission; outbound rejection/failure/start timeout uses the same exact rollback and corrected event. Successful/declined behavior remains single-decision, and Task 5 claim/finalization predicates are unchanged.
+- Resume safety: the test partial length matches committed SQLite chunks. Space failure and stale-offset failure both stop before body access, preserve bytes/chunks, persist an actionable paused error, and release the claim atomically; restored space uses receiver-authoritative subtraction.
+- Settings safety: disabling auto-receive and nickname updates with an unchanged unavailable directory still do not probe it. Validation occurs only when enabling or accepting.
+- No known Task 6 blocker. Task 7 still owns reconnect query/response scheduling and v2 acceptor registration; none was added here.

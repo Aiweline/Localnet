@@ -1,5 +1,6 @@
 use std::{
     cmp,
+    future::Future,
     path::PathBuf,
     time::{Duration, Instant},
 };
@@ -12,9 +13,8 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use super::{
     resumable_transfer::{
-        claim_paused_incoming, is_recoverable_receive_error, is_recoverable_send_error,
-        open_owned_resumable_partial, receive_acknowledged_chunks, send_acknowledged_chunks,
-        verify_committed_manifest,
+        is_recoverable_receive_error, is_recoverable_send_error, open_owned_resumable_partial,
+        receive_acknowledged_chunks, send_acknowledged_chunks, verify_committed_manifest,
     },
     runtime::{NetworkEvent, emit_event},
 };
@@ -27,7 +27,8 @@ use crate::{
     protocol::{FILE_PROTOCOL, FILE_PROTOCOL_V2, TransferStreamHeader},
     receive_paths::{
         commit_without_overwrite, finalize_reserved_receive,
-        finalize_reserved_receive_durable_with_hooks, remove_owned_reservation,
+        finalize_reserved_receive_durable_with_hooks, preflight_receive_directory,
+        remove_owned_reservation,
     },
     storage::Storage,
     transfer_policy::{TRANSFER_CHUNK_BYTES, TransferProtocol},
@@ -147,74 +148,51 @@ pub fn fail_pending_incoming_decision(
     app_handle: &AppHandle,
     message: String,
 ) -> Result<(), AppError> {
+    if let Some(updated) =
+        return_pending_incoming_decision_to_manual(transfer_id, storage, message.clone())?
+    {
+        emit_event(
+            app_handle,
+            &NetworkEvent::TransferUpdated { transfer: updated },
+        );
+        emit_event(
+            app_handle,
+            &NetworkEvent::NetworkError {
+                code: "transfer.receive_not_started".to_string(),
+                message,
+            },
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn return_pending_incoming_decision_to_manual(
+    transfer_id: &str,
+    storage: &Storage,
+    message: String,
+) -> Result<Option<TransferRecord>, AppError> {
     let Some(candidate) = storage.get_transfer(transfer_id)? else {
-        return Ok(());
+        return Ok(None);
     };
     if candidate.direction != Direction::Incoming
         || candidate.status != TransferStatus::Transferring
+        || candidate.transferred_bytes != 0
         || !storage.try_claim_incoming_transfer(transfer_id, &candidate.peer_id)?
     {
-        return Ok(());
+        return Ok(None);
     }
-    if candidate.transfer_protocol == TransferProtocol::ResumableV2 as u8 {
-        if storage.try_pause_claimed_incoming_transfer(transfer_id, &candidate.peer_id, &message)? {
-            if let Some(updated) = storage.get_transfer(transfer_id)? {
-                emit_event(
-                    app_handle,
-                    &NetworkEvent::TransferUpdated { transfer: updated },
-                );
-            }
-            emit_event(
-                app_handle,
-                &NetworkEvent::NetworkError {
-                    code: "transfer.receive_not_started".to_string(),
-                    message,
-                },
-            );
-        }
-        return Ok(());
-    }
-    let result = storage
+    let claimed = storage
         .get_transfer(transfer_id)?
-        .ok_or_else(|| AppError::Storage("接收文件记录在清理期间消失".to_string()))
-        .and_then(|transfer| return_incoming_to_manual(storage, app_handle, transfer, message));
-    if result.is_ok() {
-        storage.release_incoming_transfer_claim(transfer_id)?;
+        .ok_or_else(|| AppError::Storage("接收文件记录在清理期间消失".to_string()))?;
+    if !storage.try_return_claimed_incoming_to_awaiting(&claimed, &message)? {
+        return Err(AppError::Storage(
+            "接收确认清理期间状态已变化，请刷新后重试".to_string(),
+        ));
     }
-    result
-}
-
-fn return_incoming_to_manual(
-    storage: &Storage,
-    app_handle: &AppHandle,
-    mut transfer: TransferRecord,
-    message: String,
-) -> Result<(), AppError> {
-    let reservation_released = cleanup_reservation(&mut transfer);
-    transfer.status = if reservation_released {
-        transfer.local_path = None;
-        TransferStatus::AwaitingAcceptance
-    } else {
-        TransferStatus::Failed
-    };
-    transfer.transferred_bytes = 0;
-    transfer.error = Some(message.clone());
-    transfer.updated_at = now_rfc3339();
-    storage.upsert_transfer(&transfer)?;
-    emit_event(
-        app_handle,
-        &NetworkEvent::TransferUpdated {
-            transfer: transfer.clone(),
-        },
-    );
-    emit_event(
-        app_handle,
-        &NetworkEvent::NetworkError {
-            code: "transfer.receive_not_started".to_string(),
-            message,
-        },
-    );
-    Ok(())
+    storage
+        .get_transfer(transfer_id)?
+        .map(Some)
+        .ok_or_else(|| AppError::Storage("接收文件记录在回退后消失".to_string()))
 }
 
 async fn send_transfer(
@@ -585,76 +563,91 @@ async fn receive_resumable_transfer(
             "该可恢复文件传输未获授权或恢复几何信息无效".to_string(),
         ));
     }
-    let transfer = if transfer.status == TransferStatus::Paused {
-        match claim_paused_incoming(&storage, &transfer) {
-            Ok(Some(claimed)) => claimed,
-            Ok(None) => {
-                return Err(AppError::Permission(
-                    "该文件传输已有接收连接，重复连接已拒绝".to_string(),
-                ));
-            }
-            Err(error) => {
-                if let Some(updated) = storage.get_transfer(&transfer.transfer_id)? {
-                    emit_event(
-                        &app_handle,
-                        &NetworkEvent::TransferUpdated { transfer: updated },
-                    );
-                }
-                emit_event(
-                    &app_handle,
-                    &NetworkEvent::NetworkError {
-                        code: "transfer.resume_destination_unavailable".to_string(),
-                        message: error.to_string(),
-                    },
-                );
-                let _ = stream.close().await;
-                return Err(error);
-            }
+    let transfer_id = transfer.transfer_id.clone();
+    let storage_for_body = storage.clone();
+    let app_for_body = app_handle.clone();
+    let result = run_resumable_receive_body_with(
+        &storage,
+        &transfer,
+        header.start_offset,
+        &preflight_receive_directory,
+        move |claimed, authoritative_offset| async move {
+            let result = receive_resumable_body(
+                &mut stream,
+                &storage_for_body,
+                &app_for_body,
+                &claimed,
+                authoritative_offset,
+            )
+            .await;
+            let close_result = stream.close().await.map_err(AppError::from);
+            result.and(close_result)
+        },
+    )
+    .await;
+    if let Err(error) = &result {
+        if let Some(updated) = storage.get_transfer(&transfer_id)? {
+            emit_event(
+                &app_handle,
+                &NetworkEvent::TransferUpdated { transfer: updated },
+            );
         }
-    } else {
-        if !storage.try_claim_incoming_transfer(&transfer.transfer_id, &transfer.peer_id)? {
+        emit_event(
+            &app_handle,
+            &NetworkEvent::NetworkError {
+                code: "transfer.resume_destination_unavailable".to_string(),
+                message: error.to_string(),
+            },
+        );
+        return result;
+    }
+    Ok(())
+}
+
+async fn run_resumable_receive_body_with<P, B, F>(
+    storage: &Storage,
+    candidate: &TransferRecord,
+    incoming_start_offset: u64,
+    preflight: &P,
+    body: B,
+) -> Result<(), AppError>
+where
+    P: Fn(&std::path::Path, u64, u64) -> Result<(), AppError>,
+    B: FnOnce(TransferRecord, u64) -> F,
+    F: Future<Output = Result<(), AppError>>,
+{
+    let claimed = match super::resumable_transfer::claim_incoming_at_offset_with_preflight(
+        storage,
+        candidate,
+        incoming_start_offset,
+        preflight,
+    )? {
+        Some(claimed) => claimed,
+        None => {
             return Err(AppError::Permission(
                 "该文件传输已有接收连接，重复连接已拒绝".to_string(),
             ));
         }
-        transfer
     };
 
-    let result = receive_resumable_body(
-        &mut stream,
-        &storage,
-        &app_handle,
-        &transfer,
-        header.start_offset,
-    )
-    .await;
+    let authoritative_offset = claimed.transferred_bytes;
+    let result = body(claimed.clone(), authoritative_offset).await;
     if let Err(error) = &result {
-        let changed = if is_recoverable_receive_error(error) {
+        if is_recoverable_receive_error(error) {
             storage.try_pause_claimed_incoming_transfer(
-                &transfer.transfer_id,
-                &transfer.peer_id,
+                &claimed.transfer_id,
+                &claimed.peer_id,
                 &error.to_string(),
-            )?
+            )?;
         } else {
             storage.try_fail_claimed_incoming_transfer(
-                &transfer.transfer_id,
-                &transfer.peer_id,
+                &claimed.transfer_id,
+                &claimed.peer_id,
                 &error.to_string(),
-            )?
-        };
-        if changed {
-            if let Some(updated) = storage.get_transfer(&transfer.transfer_id)? {
-                emit_event(
-                    &app_handle,
-                    &NetworkEvent::TransferUpdated { transfer: updated },
-                );
-            }
+            )?;
         }
-        let _ = stream.close().await;
-        return result;
     }
-    stream.close().await?;
-    Ok(())
+    result
 }
 
 async fn receive_resumable_body(
@@ -1029,6 +1022,10 @@ mod tests {
     use std::{
         fs, io,
         pin::Pin,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
         task::{Context, Poll},
     };
 
@@ -1036,15 +1033,20 @@ mod tests {
 
     use super::{
         ResumableStreamOpener, claim_resumable_outgoing, persist_claimed_outgoing_error,
-        send_resumable_transfer,
+        run_resumable_receive_body_with, send_resumable_transfer,
     };
     use crate::{
         domain::{Direction, TransferKind, TransferRecord, TransferStatus},
         error::AppError,
+        receive_paths::reserve_receive_path,
         storage::Storage,
-        transfer_manifest::build_manifest,
+        transfer_manifest::{TransferChunk, build_manifest, manifest_root},
         transfer_policy::{TRANSFER_CHUNK_BYTES, TransferProtocol},
+        volume_preflight::{VolumeSnapshot, validate_volume},
     };
+
+    const MIB: u64 = 1024 * 1024;
+    const DESTINATION_RESERVE_BYTES: u64 = 64 * MIB;
 
     struct DisconnectingStream;
 
@@ -1163,6 +1165,362 @@ mod tests {
             created_at: "2026-08-24T00:00:00.000Z".to_string(),
             updated_at: "2026-08-24T00:00:00.000Z".to_string(),
         }
+    }
+
+    fn paused_receive_with_real_partial(
+        name: &str,
+    ) -> (std::path::PathBuf, Storage, TransferRecord) {
+        let directory = std::env::temp_dir().join(format!(
+            "weline-localnet-production-receive-{name}-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&directory).expect("create production receive fixture");
+        let storage = Storage::open(&directory.join("localnet.sqlite3")).expect("open storage");
+        let chunks = [
+            TransferChunk {
+                index: 0,
+                length: TRANSFER_CHUNK_BYTES,
+                sha256: [1; 32],
+            },
+            TransferChunk {
+                index: 1,
+                length: TRANSFER_CHUNK_BYTES,
+                sha256: [2; 32],
+            },
+            TransferChunk {
+                index: 2,
+                length: TRANSFER_CHUNK_BYTES,
+                sha256: [3; 32],
+            },
+        ];
+        let destination = directory.join("payload.bin");
+        let token = uuid::Uuid::now_v7().to_string();
+        let now = "2026-08-25T00:00:00.000Z".to_string();
+        let mut transfer = TransferRecord {
+            transfer_id: uuid::Uuid::now_v7().to_string(),
+            peer_id: "peer-one".to_string(),
+            direction: Direction::Incoming,
+            kind: TransferKind::File,
+            file_name: "payload.bin".to_string(),
+            file_size: 3 * u64::from(TRANSFER_CHUNK_BYTES),
+            mime_type: "application/octet-stream".to_string(),
+            sha256: "0".repeat(64),
+            local_path: None,
+            destination_reserved: false,
+            reservation_token: None,
+            transfer_protocol: TransferProtocol::ResumableV2 as u8,
+            chunk_size: TRANSFER_CHUNK_BYTES,
+            chunk_count: 3,
+            manifest_sha256: Some(hex::encode(manifest_root(&chunks))),
+            partial_path: None,
+            source_modified_ns: None,
+            send_claimed: false,
+            transferred_bytes: 0,
+            status: TransferStatus::AwaitingAcceptance,
+            error: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        storage
+            .upsert_transfer(&transfer)
+            .expect("persist awaiting receive");
+        reserve_receive_path(&destination, &transfer.transfer_id, &token)
+            .expect("reserve receive destination");
+        transfer.local_path = Some(destination.to_string_lossy().into_owned());
+        transfer.destination_reserved = true;
+        transfer.reservation_token = Some(token);
+        transfer.status = TransferStatus::Transferring;
+        assert!(
+            storage
+                .try_accept_incoming_transfer(&transfer)
+                .expect("accept incoming fixture")
+        );
+        assert!(
+            storage
+                .try_claim_incoming_transfer(&transfer.transfer_id, &transfer.peer_id)
+                .expect("claim incoming fixture")
+        );
+        let accepted = storage
+            .get_transfer(&transfer.transfer_id)
+            .expect("reload accepted fixture")
+            .expect("accepted fixture exists");
+        let partial = accepted.partial_path.as_deref().expect("partial path");
+        fs::OpenOptions::new()
+            .write(true)
+            .open(partial)
+            .expect("open owned partial")
+            .set_len(u64::from(TRANSFER_CHUNK_BYTES))
+            .expect("materialize first committed chunk");
+        assert!(
+            storage
+                .commit_received_chunk(
+                    &transfer.transfer_id,
+                    &transfer.peer_id,
+                    &chunks[0],
+                    u64::from(TRANSFER_CHUNK_BYTES),
+                )
+                .expect("commit first receive chunk")
+        );
+        assert!(
+            storage
+                .try_pause_claimed_incoming_transfer(
+                    &transfer.transfer_id,
+                    &transfer.peer_id,
+                    "network interrupted",
+                )
+                .expect("pause receive fixture")
+        );
+        let paused = storage
+            .get_transfer(&transfer.transfer_id)
+            .expect("reload paused receive")
+            .expect("paused receive exists");
+        (directory, storage, paused)
+    }
+
+    fn advance_paused_receive(storage: &Storage, paused: &TransferRecord) -> TransferRecord {
+        assert!(
+            storage
+                .try_claim_incoming_transfer(&paused.transfer_id, &paused.peer_id)
+                .expect("claim competing receive")
+        );
+        let partial = paused.partial_path.as_deref().expect("partial path");
+        fs::OpenOptions::new()
+            .write(true)
+            .open(partial)
+            .expect("open competing partial")
+            .set_len(2 * u64::from(TRANSFER_CHUNK_BYTES))
+            .expect("materialize second committed chunk");
+        let second = TransferChunk {
+            index: 1,
+            length: TRANSFER_CHUNK_BYTES,
+            sha256: [2; 32],
+        };
+        assert!(
+            storage
+                .commit_received_chunk(
+                    &paused.transfer_id,
+                    &paused.peer_id,
+                    &second,
+                    2 * u64::from(TRANSFER_CHUNK_BYTES),
+                )
+                .expect("commit competing receive progress")
+        );
+        assert!(
+            storage
+                .try_pause_claimed_incoming_transfer(
+                    &paused.transfer_id,
+                    &paused.peer_id,
+                    "newer stream paused",
+                )
+                .expect("pause competing receive")
+        );
+        storage
+            .get_transfer(&paused.transfer_id)
+            .expect("reload advanced receive")
+            .expect("advanced receive exists")
+    }
+
+    #[tokio::test]
+    async fn production_receive_boundary_rejects_stale_header_without_truncating_and_fresh_offset_succeeds()
+     {
+        let (directory, storage, stale_snapshot) = paused_receive_with_real_partial("stale-offset");
+        let advanced = advance_paused_receive(&storage, &stale_snapshot);
+        let partial = std::path::PathBuf::from(
+            advanced
+                .partial_path
+                .as_deref()
+                .expect("advanced partial path"),
+        );
+        let stale_body_started = Arc::new(AtomicBool::new(false));
+        let stale_body_flag = stale_body_started.clone();
+
+        let error = run_resumable_receive_body_with(
+            &storage,
+            &stale_snapshot,
+            stale_snapshot.transferred_bytes,
+            &|_, _, _| Ok(()),
+            move |claimed, offset| {
+                let started = stale_body_flag.clone();
+                let partial = std::path::PathBuf::from(
+                    claimed.partial_path.as_deref().expect("claimed partial"),
+                );
+                let destination = std::path::PathBuf::from(
+                    claimed.local_path.as_deref().expect("claimed destination"),
+                );
+                let transfer_id = claimed.transfer_id.clone();
+                let token = claimed
+                    .reservation_token
+                    .as_deref()
+                    .expect("claimed token")
+                    .to_string();
+                Box::pin(async move {
+                    started.store(true, Ordering::SeqCst);
+                    let file = super::open_owned_resumable_partial(
+                        &partial,
+                        &destination,
+                        &transfer_id,
+                        &token,
+                        offset,
+                    )
+                    .await?;
+                    drop(file);
+                    Ok(())
+                })
+            },
+        )
+        .await
+        .expect_err("stale stream must lose after the authoritative claim reload");
+
+        assert!(error.to_string().contains("恢复偏移"));
+        assert!(!stale_body_started.load(Ordering::SeqCst));
+        assert_eq!(
+            fs::metadata(&partial)
+                .expect("inspect preserved partial")
+                .len(),
+            advanced.transferred_bytes
+        );
+        let paused = storage
+            .get_transfer(&advanced.transfer_id)
+            .expect("reload stale loser")
+            .expect("stale loser remains");
+        assert_eq!(paused.status, TransferStatus::Paused);
+        assert_eq!(paused.transferred_bytes, advanced.transferred_bytes);
+
+        let fresh_body_started = Arc::new(AtomicBool::new(false));
+        let fresh_flag = fresh_body_started.clone();
+        run_resumable_receive_body_with(
+            &storage,
+            &paused,
+            paused.transferred_bytes,
+            &|_, _, _| Ok(()),
+            move |_, offset| {
+                let started = fresh_flag.clone();
+                let expected = paused.transferred_bytes;
+                Box::pin(async move {
+                    assert_eq!(offset, expected);
+                    started.store(true, Ordering::SeqCst);
+                    Ok(())
+                })
+            },
+        )
+        .await
+        .expect("fresh authoritative offset must reach the body boundary");
+        assert!(fresh_body_started.load(Ordering::SeqCst));
+        assert!(
+            storage
+                .try_pause_claimed_incoming_transfer(
+                    &advanced.transfer_id,
+                    &advanced.peer_id,
+                    "test cleanup",
+                )
+                .expect("release fresh receive claim")
+        );
+        assert!(
+            storage
+                .try_cancel_unclaimed_incoming_transfer(
+                    &advanced.transfer_id,
+                    &advanced.peer_id,
+                    advanced.transfer_protocol,
+                    "test cleanup",
+                )
+                .expect("clean stale receive fixture")
+        );
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove stale receive fixture");
+    }
+
+    #[tokio::test]
+    async fn production_receive_boundary_retries_preflight_with_committed_bytes_before_body() {
+        let (directory, storage, paused) = paused_receive_with_real_partial("space-retry");
+        let partial = std::path::PathBuf::from(paused.partial_path.as_deref().expect("partial"));
+        let remaining = paused.file_size - paused.transferred_bytes;
+        let insufficient =
+            VolumeSnapshot::known("NTFS", remaining + DESTINATION_RESERVE_BYTES - 1, None);
+        let blocked_body = Arc::new(AtomicBool::new(false));
+        let blocked_flag = blocked_body.clone();
+
+        let error = run_resumable_receive_body_with(
+            &storage,
+            &paused,
+            paused.transferred_bytes,
+            &|_, size, committed| validate_volume(&insufficient, size, committed),
+            move |_, _| {
+                let started = blocked_flag.clone();
+                Box::pin(async move {
+                    started.store(true, Ordering::SeqCst);
+                    Ok(())
+                })
+            },
+        )
+        .await
+        .expect_err("insufficient resume space must block production body entry");
+        assert!(error.to_string().contains("可用空间不足"));
+        assert!(!blocked_body.load(Ordering::SeqCst));
+        assert_eq!(
+            fs::metadata(&partial)
+                .expect("inspect blocked partial")
+                .len(),
+            paused.transferred_bytes
+        );
+
+        let retried = storage
+            .get_transfer(&paused.transfer_id)
+            .expect("reload retryable receive")
+            .expect("retryable receive exists");
+        let exact = VolumeSnapshot::known("NTFS", remaining + DESTINATION_RESERVE_BYTES, None);
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let probe_values = observed.clone();
+        let body_started = Arc::new(AtomicBool::new(false));
+        let body_flag = body_started.clone();
+        run_resumable_receive_body_with(
+            &storage,
+            &retried,
+            retried.transferred_bytes,
+            &move |_, size, committed| {
+                probe_values
+                    .lock()
+                    .expect("lock probe values")
+                    .push((size, committed));
+                validate_volume(&exact, size, committed)
+            },
+            move |_, offset| {
+                let started = body_flag.clone();
+                let expected = retried.transferred_bytes;
+                Box::pin(async move {
+                    assert_eq!(offset, expected);
+                    started.store(true, Ordering::SeqCst);
+                    Ok(())
+                })
+            },
+        )
+        .await
+        .expect("restored exact space must permit production body entry");
+        assert_eq!(
+            observed.lock().expect("lock probe values").as_slice(),
+            &[(paused.file_size, paused.transferred_bytes)]
+        );
+        assert!(body_started.load(Ordering::SeqCst));
+        assert!(
+            storage
+                .try_pause_claimed_incoming_transfer(
+                    &paused.transfer_id,
+                    &paused.peer_id,
+                    "test cleanup",
+                )
+                .expect("release restored receive claim")
+        );
+        assert!(
+            storage
+                .try_cancel_unclaimed_incoming_transfer(
+                    &paused.transfer_id,
+                    &paused.peer_id,
+                    paused.transfer_protocol,
+                    "test cleanup",
+                )
+                .expect("clean preflight receive fixture")
+        );
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove preflight receive fixture");
     }
 
     #[test]

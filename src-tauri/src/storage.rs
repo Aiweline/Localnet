@@ -35,6 +35,21 @@ pub struct Storage {
     connection: Arc<Mutex<Connection>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IncomingAcceptanceHookPhase {
+    AfterPartialSetup,
+    BeforePersistence,
+    AfterPersistence,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IncomingAcceptancePhase {
+    AfterPartialSetup,
+    BeforePersistence,
+    AfterPersistence,
+}
+
 impl Storage {
     pub fn open(path: &Path) -> Result<Self, AppError> {
         if let Some(parent) = path.parent() {
@@ -963,6 +978,17 @@ impl Storage {
         &self,
         transfer: &TransferRecord,
     ) -> Result<bool, AppError> {
+        self.try_accept_incoming_transfer_with_hook_inner(transfer, &mut |_| Ok(()))
+    }
+
+    fn try_accept_incoming_transfer_with_hook_inner<H>(
+        &self,
+        transfer: &TransferRecord,
+        hook: &mut H,
+    ) -> Result<bool, AppError>
+    where
+        H: FnMut(IncomingAcceptanceHookPhase) -> Result<(), AppError>,
+    {
         if transfer.direction != Direction::Incoming
             || transfer.status != TransferStatus::Transferring
             || !transfer.destination_reserved
@@ -975,29 +1001,166 @@ impl Storage {
             return Err(AppError::InvalidInput("接收文件协议版本无效".to_string()));
         }
         let mut accepted = transfer.clone();
+        let result = (|| {
+            let mut connection = self.connection()?;
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            Self::reserve_resumable_partial_for_transfer(&mut accepted)?;
+            hook(IncomingAcceptanceHookPhase::AfterPartialSetup)?;
+            hook(IncomingAcceptanceHookPhase::BeforePersistence)?;
+            let changed = transaction.execute(
+                "UPDATE transfers
+                 SET local_path = ?3, destination_reserved = 1, reservation_token = ?4,
+                     partial_path = ?5, transferred_bytes = 0, status = 'transferring',
+                     error = NULL, updated_at = ?6
+                 WHERE transfer_id = ?1 AND peer_id = ?2 AND direction = 'incoming'
+                   AND transfer_protocol = ?7
+                   AND status = 'awaitingAcceptance' AND receive_claimed = 0",
+                params![
+                    transfer.transfer_id,
+                    transfer.peer_id,
+                    transfer.local_path,
+                    transfer.reservation_token,
+                    accepted.partial_path,
+                    transfer.updated_at,
+                    transfer.transfer_protocol,
+                ],
+            )?;
+            hook(IncomingAcceptanceHookPhase::AfterPersistence)?;
+            transaction.commit()?;
+            Ok(changed == 1)
+        })();
+        if !matches!(result, Ok(true)) {
+            Self::cleanup_unpersisted_resumable_partial(&accepted);
+        }
+        result
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_accept_incoming_transfer_with_hook<H>(
+        &self,
+        transfer: &TransferRecord,
+        hook: &mut H,
+    ) -> Result<bool, AppError>
+    where
+        H: FnMut(IncomingAcceptancePhase) -> Result<(), AppError>,
+    {
+        self.try_accept_incoming_transfer_with_hook_inner(transfer, &mut |phase| {
+            let phase = match phase {
+                IncomingAcceptanceHookPhase::AfterPartialSetup => {
+                    IncomingAcceptancePhase::AfterPartialSetup
+                }
+                IncomingAcceptanceHookPhase::BeforePersistence => {
+                    IncomingAcceptancePhase::BeforePersistence
+                }
+                IncomingAcceptanceHookPhase::AfterPersistence => {
+                    IncomingAcceptancePhase::AfterPersistence
+                }
+            };
+            hook(phase)
+        })
+    }
+
+    fn cleanup_unpersisted_resumable_partial(transfer: &TransferRecord) {
+        let (Some(partial), Some(destination), Some(token)) = (
+            transfer.partial_path.as_deref(),
+            transfer.local_path.as_deref(),
+            transfer.reservation_token.as_deref(),
+        ) else {
+            return;
+        };
+        if let Err(error) = remove_owned_partial(
+            Path::new(partial),
+            Path::new(destination),
+            &transfer.transfer_id,
+            token,
+        ) {
+            tracing::warn!(
+                transfer_id = %transfer.transfer_id,
+                %error,
+                "failed to clean unpersisted resumable partial"
+            );
+        }
+    }
+
+    pub fn try_return_claimed_incoming_to_awaiting(
+        &self,
+        transfer: &TransferRecord,
+        error: &str,
+    ) -> Result<bool, AppError> {
+        if transfer.direction != Direction::Incoming
+            || transfer.status != TransferStatus::Transferring
+            || !matches!(transfer.transfer_protocol, 1 | 2)
+            || transfer.transferred_bytes != 0
+        {
+            return Err(AppError::InvalidInput(
+                "已开始接收的文件不能退回手动确认".to_string(),
+            ));
+        }
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        Self::reserve_resumable_partial_for_transfer(&mut accepted)?;
-        let changed = transaction.execute(
-            "UPDATE transfers
-             SET local_path = ?3, destination_reserved = 1, reservation_token = ?4,
-                 partial_path = ?5, transferred_bytes = 0, status = 'transferring',
-                 error = NULL, updated_at = ?6
-             WHERE transfer_id = ?1 AND peer_id = ?2 AND direction = 'incoming'
-               AND transfer_protocol = ?7
-               AND status = 'awaitingAcceptance' AND receive_claimed = 0",
+        let staged = transaction.execute(
+            "INSERT INTO transfer_cleanup
+               (transfer_id, destination, partial_path, reservation_token,
+                destination_reserved, transfer_protocol, status)
+             VALUES (?1, ?4, ?7, ?6, ?5, ?3, 'awaitingAcceptance')
+             ON CONFLICT(transfer_id) DO NOTHING",
             params![
                 transfer.transfer_id,
                 transfer.peer_id,
-                transfer.local_path,
-                transfer.reservation_token,
-                accepted.partial_path,
-                transfer.updated_at,
                 transfer.transfer_protocol,
+                transfer.local_path,
+                transfer.destination_reserved,
+                transfer.reservation_token,
+                transfer.partial_path,
             ],
         )?;
+        if staged != 1 {
+            return Err(AppError::Storage(
+                "接收确认已有待处理的所有权清理记录".to_string(),
+            ));
+        }
+        let changed = transaction.execute(
+            "UPDATE transfers
+             SET local_path = NULL, destination_reserved = 0, reservation_token = NULL,
+                 partial_path = NULL, transferred_bytes = 0, status = 'awaitingAcceptance',
+                 error = ?8, receive_claimed = 0,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE transfer_id = ?1 AND peer_id = ?2 AND direction = 'incoming'
+               AND transfer_protocol = ?3 AND status = 'transferring' AND receive_claimed = 1
+               AND transferred_bytes = 0 AND local_path IS ?4
+               AND destination_reserved = ?5 AND reservation_token IS ?6
+               AND partial_path IS ?7",
+            params![
+                transfer.transfer_id,
+                transfer.peer_id,
+                transfer.transfer_protocol,
+                transfer.local_path,
+                transfer.destination_reserved,
+                transfer.reservation_token,
+                transfer.partial_path,
+                error,
+            ],
+        )?;
+        if changed != 1 {
+            return Ok(false);
+        }
+        transaction.execute(
+            "DELETE FROM transfer_chunks WHERE transfer_id = ?1",
+            [&transfer.transfer_id],
+        )?;
         transaction.commit()?;
-        Ok(changed == 1)
+        drop(connection);
+        if let Some(record) = self.pending_terminal_cleanup(&transfer.transfer_id)? {
+            if let Err(cleanup_error) = self.cleanup_pending_terminal_artifact(&record) {
+                tracing::warn!(
+                    transfer_id = %transfer.transfer_id,
+                    %cleanup_error,
+                    "deferring reverted acceptance artifact cleanup for a later retry"
+                );
+            }
+        }
+        Ok(true)
     }
 
     pub fn try_cancel_unclaimed_incoming_transfer(

@@ -7,7 +7,7 @@ use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
 use crate::{
     domain::{Direction, TransferRecord, TransferStatus},
     error::AppError,
-    receive_paths::{open_owned_resumable_partial_file, preflight_receive_directory},
+    receive_paths::open_owned_resumable_partial_file,
     storage::Storage,
     transfer_manifest::{
         TransferChunk, capture_source_snapshot, decode_sha256, expected_chunk_count,
@@ -18,14 +18,8 @@ use crate::{
 
 const CHUNK_FRAME_HEADER_BYTES: usize = 40;
 
-pub(crate) fn claim_paused_incoming(
-    storage: &Storage,
-    candidate: &TransferRecord,
-) -> Result<Option<TransferRecord>, AppError> {
-    claim_paused_incoming_with_preflight(storage, candidate, &preflight_receive_directory)
-}
-
-fn claim_paused_incoming_with_preflight<P>(
+#[cfg(test)]
+pub(super) fn claim_paused_incoming_with_preflight<P>(
     storage: &Storage,
     candidate: &TransferRecord,
     preflight: &P,
@@ -33,14 +27,35 @@ fn claim_paused_incoming_with_preflight<P>(
 where
     P: Fn(&Path, u64, u64) -> Result<(), AppError>,
 {
+    claim_incoming_at_offset_with_preflight(
+        storage,
+        candidate,
+        candidate.transferred_bytes,
+        preflight,
+    )
+}
+
+pub(super) fn claim_incoming_at_offset_with_preflight<P>(
+    storage: &Storage,
+    candidate: &TransferRecord,
+    incoming_start_offset: u64,
+    preflight: &P,
+) -> Result<Option<TransferRecord>, AppError>
+where
+    P: Fn(&Path, u64, u64) -> Result<(), AppError>,
+{
     if candidate.direction != Direction::Incoming
         || candidate.transfer_protocol != TransferProtocol::ResumableV2 as u8
-        || candidate.status != TransferStatus::Paused
+        || !matches!(
+            candidate.status,
+            TransferStatus::Paused | TransferStatus::Transferring
+        )
     {
         return Err(AppError::InvalidInput(
-            "只有暂停的可恢复接收可以执行恢复预检".to_string(),
+            "只有已接受或暂停的可恢复接收可以进入接收流".to_string(),
         ));
     }
+    let resuming = candidate.status == TransferStatus::Paused;
     if !storage.try_claim_incoming_transfer(&candidate.transfer_id, &candidate.peer_id)? {
         return Ok(None);
     }
@@ -55,6 +70,21 @@ where
                 return Err(AppError::Storage(
                     "可恢复接收占用状态与持久化记录不一致".to_string(),
                 ));
+            }
+            validate_resume_offset(
+                claimed.file_size,
+                claimed.chunk_size,
+                claimed.transferred_bytes,
+            )?;
+            validate_resume_offset(claimed.file_size, claimed.chunk_size, incoming_start_offset)?;
+            if incoming_start_offset != claimed.transferred_bytes {
+                return Err(AppError::InvalidInput(format!(
+                    "发送方恢复偏移已过期（发送方 {incoming_start_offset} 字节，本机已提交 {} 字节），请重新连接后重试",
+                    claimed.transferred_bytes
+                )));
+            }
+            if !resuming {
+                return Ok(claimed);
             }
             let destination = claimed
                 .local_path
@@ -96,7 +126,7 @@ where
                 &error.to_string(),
             )? {
                 return Err(AppError::Storage(
-                    "恢复预检失败后无法原子释放接收占用，请刷新传输状态".to_string(),
+                    "接收流校验失败后无法原子释放接收占用，请刷新传输状态".to_string(),
                 ));
             }
             Err(error)
