@@ -76,6 +76,57 @@ test("keeps persisted network and unknown paused errors on the resumable waiting
   }
 });
 
+test("does not expose source, sender, peer, network, or connection storage failures", () => {
+  for (const error of [
+    "cannot access source directory",
+    "source drive access denied",
+    "cannot write source filesystem",
+    "source file on FAT32 exceeds size limit",
+    "cannot access sender directory",
+    "sender filesystem permission denied",
+    "unable to write sender volume",
+    "sender file on MSDOS exceeds maximum file size",
+    "cannot access peer directory",
+    "peer disk permission denied",
+    "unable to write peer volume",
+    "peer FAT32 file size limit exceeded",
+    "cannot access network drive",
+    "network filesystem permission denied",
+    "unable to write network volume",
+    "network drive uses FAT32 and the file is too large",
+    "cannot access connection drive",
+    "connection filesystem permission denied",
+    "unable to write connection volume",
+    "connection drive uses MSDOS and the file exceeds its size limit",
+    "无法访问源目录",
+    "源磁盘权限不足",
+    "无法写入源文件系统",
+    "源文件位于 FAT32，大小超过限制",
+    "无法访问发送方磁盘",
+    "发送端文件系统权限不足",
+    "无法写入对端卷",
+    "对方磁盘为 FAT32，文件过大",
+    "无法访问网络驱动器",
+    "网络文件系统写入失败",
+    "连接卷为 MSDOS，文件大小超过限制",
+    "cannot access working directory",
+    "unable to write temporary filesystem",
+    "internal drive access denied by backend policy",
+    "cache subsystem: filesystem permission denied while reopening database",
+    "opaque backend: FAT32 volume file size limit exceeded",
+  ]) {
+    const presentation = present({
+      direction: "outgoing",
+      fileSize: 1_000,
+      transferredBytes: 420,
+      status: "paused",
+      error,
+    });
+
+    assert.equal(presentation.label, "网络中断，等待自动恢复", error);
+  }
+});
+
 test("keeps only volume and destination paused errors actionable", () => {
   for (const error of [
     "接收目录位于 NTFS 文件系统，可用空间不足：请选择可用空间更多的目录后重试",
