@@ -4,6 +4,7 @@ mod error;
 mod identity;
 mod network;
 mod protocol;
+mod receive_paths;
 mod state;
 mod storage;
 
@@ -19,6 +20,7 @@ pub fn run() {
     let allow_multiple = cfg!(debug_assertions) && std::env::var_os("LOCALNET_DATA_DIR").is_some();
     let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init());
 
     if !allow_multiple {
@@ -36,6 +38,7 @@ pub fn run() {
             commands::bootstrap,
             commands::complete_onboarding,
             commands::update_nickname,
+            commands::update_settings,
             commands::send_friend_request,
             commands::resolve_friend_request,
             commands::send_text,
@@ -44,6 +47,7 @@ pub fn run() {
             commands::resolve_transfer,
             commands::cancel_transfer,
             commands::image_preview,
+            commands::update_transfer_preferences,
         ])
         .setup(|app| {
             initialize_logging();
@@ -56,7 +60,7 @@ pub fn run() {
                 Err(error) => {
                     app.dialog()
                         .message(error.to_string())
-                        .title("Weline Chat 无法启动")
+                        .title("Weline Localnet 无法启动")
                         .kind(MessageDialogKind::Error)
                         .blocking_show();
                     Err(Box::new(error))
@@ -65,11 +69,11 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             if matches!(event, WindowEvent::CloseRequested { .. }) {
-                tracing::info!(window = window.label(), "Weline Chat window closing");
+                tracing::info!(window = window.label(), "Weline Localnet window closing");
             }
         })
         .run(tauri::generate_context!())
-        .expect("failed to run Weline Chat");
+        .expect("failed to run Weline Localnet");
 }
 
 fn initialize_state<R: tauri::Runtime>(
@@ -80,7 +84,13 @@ fn initialize_state<R: tauri::Runtime>(
     let use_keyring = !(cfg!(debug_assertions) && std::env::var_os("LOCALNET_DATA_DIR").is_some());
     let identity = identity::LocalIdentity::load_or_create(&app_data_dir, use_keyring)?;
     let storage = storage::Storage::open(&app_data_dir.join("localnet.sqlite3"))?;
-    Ok(AppState::new(storage, identity, app_data_dir))
+    let default_receive_directory = app
+        .path()
+        .download_dir()
+        .unwrap_or_else(|_| app_data_dir.join("received"))
+        .join("Weline Localnet");
+    storage.load_transfer_preferences(&default_receive_directory)?;
+    Ok(AppState::new(storage, identity, default_receive_directory))
 }
 
 fn resolve_app_data_dir<R: tauri::Runtime>(
@@ -92,7 +102,7 @@ fn resolve_app_data_dir<R: tauri::Runtime>(
     }
 
     app.path().app_data_dir().map_err(|error| {
-        error::AppError::Storage(format!("无法定位 Weline Chat 应用数据目录：{error}"))
+        error::AppError::Storage(format!("无法定位 Weline Localnet 应用数据目录：{error}"))
     })
 }
 

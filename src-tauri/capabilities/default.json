@@ -1,11 +1,12 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Permissions for the Weline Chat main window",
+  "description": "Permissions for the Weline Localnet main window",
   "windows": ["main"],
   "permissions": [
     "core:default",
     "dialog:default",
+    "notification:default",
     "opener:default"
   ]
 }

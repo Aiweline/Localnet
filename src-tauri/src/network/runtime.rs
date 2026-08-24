@@ -16,7 +16,7 @@ use libp2p::{
     tcp, yamux,
 };
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager, UserAttentionType};
 use tokio::sync::{mpsc, watch};
 
 use super::{
@@ -27,13 +27,16 @@ use super::{
 use crate::{
     domain::{
         ChatMessage, Direction, Friend, FriendRequest, FriendRequestStatus, LocalProfile,
-        MAX_AUTO_IMAGE_BYTES, MAX_FILE_BYTES, MessageKind, MessageStatus, PROTOCOL_VERSION,
-        PeerSummary, Platform, TransferKind, TransferRecord, TransferStatus, now_rfc3339,
-        validate_nickname, validate_text,
+        MAX_FILE_BYTES, MessageKind, MessageStatus, PROTOCOL_VERSION, PeerSummary, Platform,
+        TransferPreferences, TransferRecord, TransferStatus, now_rfc3339, validate_nickname,
+        validate_text,
     },
     error::AppError,
     identity::LocalIdentity,
     protocol::{ControlRequest, ControlResponse, FILE_PROTOCOL, HelloPayload, TransferOffer},
+    receive_paths::{
+        ensure_writable_directory, remove_owned_reservation, reserve_available_receive_path,
+    },
     storage::Storage,
 };
 
@@ -76,6 +79,9 @@ pub enum NetworkEvent {
     FriendRequestReceived {
         request: FriendRequest,
     },
+    FriendRequestDelivered {
+        request_id: String,
+    },
     FriendRequestResolved {
         request: FriendRequest,
         friend: Option<Friend>,
@@ -115,7 +121,7 @@ pub fn spawn_network(
     profile: LocalProfile,
     storage: Storage,
     app_handle: AppHandle,
-    app_data_dir: PathBuf,
+    default_receive_directory: PathBuf,
 ) -> NetworkHandle {
     let (sender, receiver) = mpsc::channel(128);
     tauri::async_runtime::spawn(async move {
@@ -124,7 +130,7 @@ pub fn spawn_network(
             profile,
             storage,
             app_handle.clone(),
-            app_data_dir,
+            default_receive_directory,
             receiver,
         )
         .await
@@ -136,7 +142,7 @@ pub fn spawn_network(
                     message: error.to_string(),
                 },
             );
-            tracing::error!(error = %error, "Weline Chat network runtime stopped");
+            tracing::error!(error = %error, "Weline Localnet network runtime stopped");
         }
     });
     NetworkHandle { sender }
@@ -149,7 +155,7 @@ enum PendingAction {
     FriendDecision,
     Text { message_id: String },
     TransferOffer { transfer_id: String },
-    TransferDecision,
+    TransferDecision { transfer_id: String, accepted: bool },
     TransferCancel,
 }
 
@@ -157,7 +163,7 @@ struct NetworkRuntime {
     local_profile: LocalProfile,
     storage: Storage,
     app_handle: AppHandle,
-    app_data_dir: PathBuf,
+    default_receive_directory: PathBuf,
     swarm: Swarm<LocalnetBehaviour>,
     stream_control: libp2p_stream::Control,
     receiver: mpsc::Receiver<NetworkCommand>,
@@ -177,7 +183,7 @@ impl NetworkRuntime {
         profile: LocalProfile,
         storage: Storage,
         app_handle: AppHandle,
-        app_data_dir: PathBuf,
+        default_receive_directory: PathBuf,
         receiver: mpsc::Receiver<NetworkCommand>,
     ) -> Result<(), AppError> {
         let keypair = identity.keypair();
@@ -210,12 +216,12 @@ impl NetworkRuntime {
         let mdns_enabled =
             !(cfg!(debug_assertions) && std::env::var_os("LOCALNET_DISABLE_MDNS").is_some());
 
-        tracing::info!(peer_id = %peer_id, mdns_enabled, "Weline Chat network runtime started");
+        tracing::info!(peer_id = %peer_id, mdns_enabled, "Weline Localnet network runtime started");
         let mut runtime = Self {
             local_profile: profile,
             storage,
             app_handle,
-            app_data_dir,
+            default_receive_directory,
             swarm,
             stream_control,
             receiver,
@@ -343,12 +349,17 @@ impl NetworkRuntime {
                 let outbound_id = self.swarm.behaviour_mut().control.send_request(
                     &peer_id,
                     ControlRequest::TransferDecision {
-                        transfer_id,
+                        transfer_id: transfer_id.clone(),
                         accepted,
                     },
                 );
-                self.pending
-                    .insert(outbound_id, PendingAction::TransferDecision);
+                self.pending.insert(
+                    outbound_id,
+                    PendingAction::TransferDecision {
+                        transfer_id: transfer_id.clone(),
+                        accepted,
+                    },
+                );
             }
             NetworkCommand::CancelTransfer {
                 peer_id,
@@ -454,7 +465,7 @@ impl NetworkRuntime {
                 self.mark_offline_if_unreachable(peer_id)?;
             }
             SwarmEvent::NewListenAddr { address, .. } => {
-                tracing::info!(%address, "Weline Chat listening");
+                tracing::info!(%address, "Weline Localnet listening");
                 if let Some(port) = address.iter().find_map(|protocol| match protocol {
                     Protocol::Tcp(port) => Some(port),
                     _ => None,
@@ -711,13 +722,24 @@ impl NetworkRuntime {
                     }
                     return Ok(ControlResponse::Accepted);
                 }
-                let auto_accept =
-                    offer.kind == TransferKind::Image && offer.file_size <= MAX_AUTO_IMAGE_BYTES;
-                let local_path = auto_accept.then(|| {
-                    automatic_receive_path(&self.app_data_dir, &offer.transfer_id, &offer.file_name)
-                        .to_string_lossy()
-                        .into_owned()
-                });
+                let preferences = self
+                    .storage
+                    .load_transfer_preferences(&self.default_receive_directory)?;
+                let (local_path, reservation_token, automatic_receive_error) = if preferences
+                    .auto_receive_files
+                {
+                    match automatic_receive_path(&preferences, &offer.file_name, &offer.transfer_id)
+                    {
+                        Ok((path, token)) => {
+                            (Some(path.to_string_lossy().into_owned()), Some(token), None)
+                        }
+                        Err(error) => (None, None, Some(error.to_string())),
+                    }
+                } else {
+                    (None, None, None)
+                };
+                let destination_reserved = reservation_token.is_some();
+                let auto_accept = local_path.is_some();
                 let now = now_rfc3339();
                 let transfer = TransferRecord {
                     transfer_id: offer.transfer_id.clone(),
@@ -729,6 +751,8 @@ impl NetworkRuntime {
                     mime_type: offer.mime_type,
                     sha256: offer.sha256,
                     local_path,
+                    destination_reserved,
+                    reservation_token,
                     transferred_bytes: 0,
                     status: if auto_accept {
                         TransferStatus::Transferring
@@ -739,20 +763,50 @@ impl NetworkRuntime {
                     created_at: now.clone(),
                     updated_at: now,
                 };
-                self.storage.upsert_transfer(&transfer)?;
+                if let Err(error) = self.storage.upsert_transfer(&transfer) {
+                    if transfer.destination_reserved {
+                        if let (Some(path), Some(token)) = (
+                            transfer.local_path.as_deref(),
+                            transfer.reservation_token.as_deref(),
+                        ) {
+                            let _ = remove_owned_reservation(
+                                std::path::Path::new(path),
+                                &transfer.transfer_id,
+                                token,
+                            );
+                        }
+                    }
+                    return Err(error);
+                }
                 self.emit(NetworkEvent::TransferUpdated {
                     transfer: transfer.clone(),
                 });
+                if let Some(message) = automatic_receive_error {
+                    self.emit(NetworkEvent::NetworkError {
+                        code: "transfer.auto_receive_unavailable".to_string(),
+                        message: format!("自动接收目录当前不可用，请手动选择保存位置：{message}"),
+                    });
+                }
                 if auto_accept {
                     let outbound_id = self.swarm.behaviour_mut().control.send_request(
                         &peer_id,
                         ControlRequest::TransferDecision {
-                            transfer_id: transfer.transfer_id,
+                            transfer_id: transfer.transfer_id.clone(),
                             accepted: true,
                         },
                     );
-                    self.pending
-                        .insert(outbound_id, PendingAction::TransferDecision);
+                    self.pending.insert(
+                        outbound_id,
+                        PendingAction::TransferDecision {
+                            transfer_id: transfer.transfer_id.clone(),
+                            accepted: true,
+                        },
+                    );
+                    transfer::spawn_incoming_start_timeout(
+                        transfer.transfer_id,
+                        self.storage.clone(),
+                        self.app_handle.clone(),
+                    );
                 }
                 Ok(ControlResponse::Accepted)
             }
@@ -761,7 +815,7 @@ impl NetworkRuntime {
                 accepted,
             } => {
                 self.ensure_friend(&peer_id)?;
-                let mut transfer = self
+                let transfer = self
                     .storage
                     .get_transfer(&transfer_id)?
                     .ok_or_else(|| AppError::InvalidInput("找不到对应的文件传输".to_string()))?;
@@ -772,11 +826,29 @@ impl NetworkRuntime {
                         "文件传输与发送者不匹配，已拒绝处理".to_string(),
                     ));
                 }
-                transfer.updated_at = now_rfc3339();
+                let next_status = if accepted {
+                    TransferStatus::Transferring
+                } else {
+                    TransferStatus::Cancelled
+                };
+                let transition_error = if accepted {
+                    None
+                } else {
+                    Some("对方拒绝了这次传输")
+                };
+                if !self.storage.try_transition_outgoing_awaiting(
+                    &transfer.transfer_id,
+                    &transfer.peer_id,
+                    next_status,
+                    transition_error,
+                )? {
+                    return Ok(ControlResponse::Accepted);
+                }
+                let transfer = self
+                    .storage
+                    .get_transfer(&transfer_id)?
+                    .ok_or_else(|| AppError::InvalidInput("找不到对应的文件传输".to_string()))?;
                 if accepted {
-                    transfer.status = TransferStatus::Transferring;
-                    transfer.error = None;
-                    self.storage.upsert_transfer(&transfer)?;
                     self.emit(NetworkEvent::TransferUpdated {
                         transfer: transfer.clone(),
                     });
@@ -788,9 +860,6 @@ impl NetworkRuntime {
                         self.app_handle.clone(),
                     );
                 } else {
-                    transfer.status = TransferStatus::Cancelled;
-                    transfer.error = Some("对方拒绝了这次传输".to_string());
-                    self.storage.upsert_transfer(&transfer)?;
                     self.storage.update_message_status(
                         &transfer.transfer_id,
                         MessageStatus::Failed,
@@ -806,14 +875,48 @@ impl NetworkRuntime {
                     .storage
                     .get_transfer(&transfer_id)?
                     .ok_or_else(|| AppError::InvalidInput("找不到对应的文件传输".to_string()))?;
-                if transfer.peer_id != peer_id.to_string() {
+                if transfer.peer_id != peer_id.to_string()
+                    || transfer.direction != Direction::Incoming
+                {
                     return Err(AppError::InvalidInput(
                         "文件传输与发送者不匹配，已拒绝处理".to_string(),
                     ));
                 }
-                transfer.status = TransferStatus::Cancelled;
-                transfer.error = Some("对方取消了传输".to_string());
-                transfer.updated_at = now_rfc3339();
+                if !self.storage.try_cancel_unclaimed_incoming_transfer(
+                    &transfer.transfer_id,
+                    &transfer.peer_id,
+                    "对方取消了传输",
+                )? {
+                    return Ok(ControlResponse::Accepted);
+                }
+                transfer = self
+                    .storage
+                    .get_transfer(&transfer_id)?
+                    .ok_or_else(|| AppError::InvalidInput("找不到对应的文件传输".to_string()))?;
+                if transfer.destination_reserved {
+                    if let (Some(path), Some(token)) = (
+                        transfer.local_path.as_deref(),
+                        transfer.reservation_token.as_deref(),
+                    ) {
+                        match remove_owned_reservation(
+                            std::path::Path::new(path),
+                            &transfer.transfer_id,
+                            token,
+                        ) {
+                            Ok(_) => {
+                                transfer.destination_reserved = false;
+                                transfer.reservation_token = None;
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    transfer_id = %transfer.transfer_id,
+                                    %error,
+                                    "failed to clean cancelled receive reservation"
+                                );
+                            }
+                        }
+                    }
+                }
                 self.storage.upsert_transfer(&transfer)?;
                 self.emit(NetworkEvent::TransferUpdated { transfer });
                 Ok(ControlResponse::Accepted)
@@ -837,6 +940,9 @@ impl NetworkRuntime {
             (PendingAction::Text { message_id }, ControlResponse::Accepted) => {
                 self.set_message_status(&message_id, MessageStatus::Delivered, None)?;
             }
+            (PendingAction::FriendRequest { request_id }, ControlResponse::Accepted) => {
+                self.emit(NetworkEvent::FriendRequestDelivered { request_id });
+            }
             (PendingAction::Text { message_id }, ControlResponse::Rejected { message, .. }) => {
                 self.set_message_status(&message_id, MessageStatus::Failed, Some(message))?;
             }
@@ -850,16 +956,31 @@ impl NetworkRuntime {
                 PendingAction::FriendRequest { request_id },
                 ControlResponse::Rejected { message, .. },
             ) => {
-                self.emit(NetworkEvent::NetworkError {
-                    code: "friend_request_rejected".to_string(),
-                    message: format!("好友申请 {request_id} 未送达：{message}"),
-                });
+                self.fail_friend_request(
+                    &request_id,
+                    "friend_request_rejected",
+                    format!("好友申请未送达：{message}"),
+                )?;
             }
             (PendingAction::Hello, ControlResponse::Rejected { message, .. }) => {
                 self.emit(NetworkEvent::NetworkError {
                     code: "hello_rejected".to_string(),
                     message,
                 });
+            }
+            (
+                PendingAction::TransferDecision {
+                    transfer_id,
+                    accepted: true,
+                },
+                ControlResponse::Rejected { message, .. },
+            ) => {
+                transfer::fail_pending_incoming_decision(
+                    &transfer_id,
+                    &self.storage,
+                    &self.app_handle,
+                    format!("接收确认未送达，请重新确认：{message}"),
+                )?;
             }
             _ => {}
         }
@@ -880,17 +1001,31 @@ impl NetworkRuntime {
                 self.set_message_status(&message_id, MessageStatus::Failed, Some(message))?;
             }
             PendingAction::FriendRequest { request_id } => {
-                self.emit(NetworkEvent::NetworkError {
-                    code: "friend_request_failed".to_string(),
-                    message: format!("好友申请 {request_id} 发送失败，请稍后重试"),
-                });
+                self.fail_friend_request(
+                    &request_id,
+                    "friend_request_failed",
+                    "好友申请发送失败，请确认对方在线后重试".to_string(),
+                )?;
             }
             PendingAction::TransferOffer { transfer_id } => {
                 self.set_transfer_failed(&transfer_id, message)?;
             }
+            PendingAction::TransferDecision {
+                transfer_id,
+                accepted: true,
+            } => {
+                transfer::fail_pending_incoming_decision(
+                    &transfer_id,
+                    &self.storage,
+                    &self.app_handle,
+                    format!("接收确认发送失败，请重新确认：{error}"),
+                )?;
+            }
             PendingAction::Hello
             | PendingAction::FriendDecision
-            | PendingAction::TransferDecision
+            | PendingAction::TransferDecision {
+                accepted: false, ..
+            }
             | PendingAction::TransferCancel => {
                 tracing::debug!(%error, "control request failed");
             }
@@ -1004,7 +1139,30 @@ impl NetworkRuntime {
         Ok(())
     }
 
+    fn fail_friend_request(
+        &self,
+        request_id: &str,
+        code: &str,
+        message: String,
+    ) -> Result<(), AppError> {
+        self.storage
+            .remove_pending_outgoing_friend_request(request_id)?;
+        self.emit(NetworkEvent::NetworkError {
+            code: code.to_string(),
+            message,
+        });
+        Ok(())
+    }
+
     fn emit(&self, event: NetworkEvent) {
+        if matches!(&event, NetworkEvent::FriendRequestReceived { .. }) {
+            if let Some(window) = self.app_handle.get_webview_window("main") {
+                if let Err(error) = window.request_user_attention(Some(UserAttentionType::Critical))
+                {
+                    tracing::debug!(%error, "unable to request attention for incoming friend request");
+                }
+            }
+        }
         emit_event(&self.app_handle, &event);
     }
 }
@@ -1017,7 +1175,7 @@ fn parse_peer_id(value: &str) -> Result<PeerId, AppError> {
 
 pub(super) fn emit_event(app_handle: &AppHandle, event: &NetworkEvent) {
     if let Err(error) = app_handle.emit(EVENT_NAME, event) {
-        tracing::warn!(%error, "failed to emit Weline Chat event");
+        tracing::warn!(%error, "failed to emit Weline Localnet event");
     }
 }
 
@@ -1043,22 +1201,14 @@ fn validate_transfer_offer(offer: &TransferOffer) -> Result<(), AppError> {
 }
 
 fn automatic_receive_path(
-    app_data_dir: &std::path::Path,
-    transfer_id: &str,
+    preferences: &TransferPreferences,
     file_name: &str,
-) -> PathBuf {
-    let safe_name: String = file_name
-        .chars()
-        .map(|character| {
-            if character.is_alphanumeric() || matches!(character, '.' | '-' | '_' | ' ') {
-                character
-            } else {
-                '_'
-            }
-        })
-        .take(120)
-        .collect();
-    app_data_dir
-        .join("received")
-        .join(format!("{transfer_id}-{safe_name}"))
+    transfer_id: &str,
+) -> Result<(PathBuf, String), AppError> {
+    let directory =
+        ensure_writable_directory(std::path::Path::new(&preferences.receive_directory))?;
+    let reservation_token = uuid::Uuid::new_v4().to_string();
+    let path =
+        reserve_available_receive_path(&directory, file_name, transfer_id, &reservation_token)?;
+    Ok((path, reservation_token))
 }

@@ -7,7 +7,6 @@ use crate::error::AppError;
 
 pub const MAX_NICKNAME_CHARS: usize = 32;
 pub const MAX_TEXT_BYTES: usize = 16 * 1024;
-pub const MAX_AUTO_IMAGE_BYTES: u64 = 25 * 1024 * 1024;
 pub const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const PROTOCOL_VERSION: u16 = 1;
 
@@ -171,6 +170,10 @@ pub struct TransferRecord {
     pub mime_type: String,
     pub sha256: String,
     pub local_path: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub destination_reserved: bool,
+    #[serde(default, skip_serializing)]
+    pub reservation_token: Option<String>,
     pub transferred_bytes: u64,
     pub status: TransferStatus,
     pub error: Option<String>,
@@ -178,10 +181,18 @@ pub struct TransferRecord {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferPreferences {
+    pub auto_receive_files: bool,
+    pub receive_directory: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BootstrapSnapshot {
     pub local_profile: Option<LocalProfile>,
+    pub transfer_preferences: TransferPreferences,
     pub peers: Vec<PeerSummary>,
     pub friend_requests: Vec<FriendRequest>,
     pub friends: Vec<Friend>,

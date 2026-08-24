@@ -1,8 +1,10 @@
 [package]
 name = "localnet"
-version = "0.1.2"
-description = "Weline Chat private local network messenger for Windows and macOS"
-authors = ["Aiweline"]
+version = "0.1.5"
+description = "Weline Localnet private peer-to-peer LAN messenger and file transfer app for Windows and macOS"
+authors = ["成都阿玛云科技有限公司 <contact@amayum.com>"]
+homepage = "https://github.com/Aiweline/Localnet"
+repository = "https://github.com/Aiweline/Localnet.git"
 edition = "2024"
 rust-version = "1.85"
 
@@ -36,6 +38,7 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures = "0.3"
+tauri-plugin-notification = "2"
 
 [profile.dev]
 incremental = true

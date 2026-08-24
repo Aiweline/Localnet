@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     io,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     str,
@@ -15,11 +15,18 @@ use tokio::{
     time,
 };
 
+#[cfg(target_os = "windows")]
+mod mdns_compat;
+
 const DISCOVERY_MAGIC: &str = "LOCALNET";
 const DISCOVERY_VERSION: u8 = 1;
+const DISCOVERY_PROBE_VERSION: u8 = 2;
 const DISCOVERY_PORT: u16 = 43_821;
 const MAX_BEACON_BYTES: usize = 512;
 const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(3);
+const PROBE_INTERVAL: Duration = Duration::from_secs(12);
+const PROBE_RESPONSE_WINDOW: Duration = Duration::from_millis(900);
+const PROBE_RESPONSE_RATE_LIMIT: Duration = Duration::from_millis(500);
 pub(super) const BEACON_LEASE: Duration = Duration::from_secs(12);
 
 #[derive(Debug)]
@@ -36,6 +43,13 @@ struct LanInterface {
     name: String,
     ip: Ipv4Addr,
     broadcast: Ipv4Addr,
+    prefixlen: u8,
+}
+
+#[derive(Debug)]
+enum DiscoveryPacket {
+    Beacon { peer_id: PeerId, listen_port: u16 },
+    Probe { peer_id: PeerId, listen_port: u16 },
 }
 
 pub(super) struct DiscoveryService;
@@ -47,14 +61,26 @@ impl DiscoveryService {
     ) -> mpsc::Receiver<DiscoveryEvent> {
         let (event_sender, event_receiver) = mpsc::channel(128);
 
-        tauri::async_runtime::spawn(receive_beacons(peer_id, event_sender));
-        tauri::async_runtime::spawn(announce_beacons(peer_id, listen_port));
+        tauri::async_runtime::spawn(receive_beacons(
+            peer_id,
+            listen_port.clone(),
+            event_sender.clone(),
+        ));
+        tauri::async_runtime::spawn(announce_beacons(peer_id, listen_port.clone()));
+        tauri::async_runtime::spawn(probe_peers(peer_id, listen_port, event_sender.clone()));
+
+        #[cfg(target_os = "windows")]
+        mdns_compat::spawn(peer_id, event_sender.clone());
 
         event_receiver
     }
 }
 
-async fn receive_beacons(peer_id: PeerId, sender: mpsc::Sender<DiscoveryEvent>) {
+async fn receive_beacons(
+    peer_id: PeerId,
+    listen_port: watch::Receiver<Option<u16>>,
+    sender: mpsc::Sender<DiscoveryEvent>,
+) {
     let socket = loop {
         match bind_receiver() {
             Ok(socket) => break socket,
@@ -65,6 +91,7 @@ async fn receive_beacons(peer_id: PeerId, sender: mpsc::Sender<DiscoveryEvent>) 
         }
     };
     let mut buffer = [0_u8; MAX_BEACON_BYTES + 1];
+    let mut probe_responses = HashMap::<Ipv4Addr, Instant>::new();
 
     loop {
         let (length, source) = match socket.recv_from(&mut buffer).await {
@@ -86,28 +113,47 @@ async fn receive_beacons(peer_id: PeerId, sender: mpsc::Sender<DiscoveryEvent>) 
             tracing::trace!(address = %source.ip(), "non-private LAN beacon ignored");
             continue;
         }
-        let Some((remote_peer, listen_port)) = decode_beacon(&buffer[..length]) else {
+        let Some(packet) = decode_packet(&buffer[..length]) else {
             tracing::trace!(address = %source.ip(), "malformed LAN beacon ignored");
             continue;
         };
-        if remote_peer == peer_id {
-            continue;
-        }
-        let address = Multiaddr::empty()
-            .with(Protocol::Ip4(*source.ip()))
-            .with(Protocol::Tcp(listen_port))
-            .with(Protocol::P2p(remote_peer));
-        if sender
-            .send(DiscoveryEvent::PeerHint {
-                peer_id: remote_peer,
-                address,
-                expires_at: Instant::now() + BEACON_LEASE,
-            })
-            .await
-            .is_err()
+        let (remote_peer, remote_port, should_respond) = match packet {
+            DiscoveryPacket::Beacon {
+                peer_id,
+                listen_port,
+            } => (peer_id, listen_port, false),
+            DiscoveryPacket::Probe {
+                peer_id,
+                listen_port,
+            } => (peer_id, listen_port, true),
+        };
+        if remote_peer != peer_id
+            && emit_peer_hint(&sender, remote_peer, *source.ip(), remote_port)
+                .await
+                .is_err()
         {
             return;
         }
+        if should_respond && remote_peer != peer_id {
+            let now = Instant::now();
+            let allowed = probe_responses
+                .get(source.ip())
+                .is_none_or(|last_response| {
+                    now.duration_since(*last_response) >= PROBE_RESPONSE_RATE_LIMIT
+                });
+            if allowed {
+                probe_responses.insert(*source.ip(), now);
+                let local_port = *listen_port.borrow();
+                if let Some(local_port) = local_port {
+                    let response = encode_beacon(peer_id, local_port);
+                    if let Err(error) = socket.send_to(&response, source).await {
+                        tracing::debug!(%error, address = %source, "LAN probe response failed");
+                    }
+                }
+            }
+        }
+        probe_responses
+            .retain(|_, responded_at| Instant::now().duration_since(*responded_at) < BEACON_LEASE);
     }
 }
 
@@ -143,6 +189,35 @@ async fn announce_beacons(peer_id: PeerId, listen_port: watch::Receiver<Option<u
                 );
             }
         }
+    }
+}
+
+async fn probe_peers(
+    peer_id: PeerId,
+    listen_port: watch::Receiver<Option<u16>>,
+    sender: mpsc::Sender<DiscoveryEvent>,
+) {
+    time::sleep(startup_jitter(peer_id) + Duration::from_millis(250)).await;
+    let mut interval = time::interval(PROBE_INTERVAL);
+    interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+
+    loop {
+        interval.tick().await;
+        let Some(port) = *listen_port.borrow() else {
+            continue;
+        };
+        let interfaces = match eligible_interfaces() {
+            Ok(interfaces) => interfaces,
+            Err(error) => {
+                tracing::debug!(%error, "unable to enumerate LAN interfaces for active probe");
+                continue;
+            }
+        };
+        let payload = encode_probe(peer_id, port);
+        let probes = interfaces
+            .iter()
+            .map(|interface| probe_on_interface(interface, &payload, peer_id, sender.clone()));
+        futures::future::join_all(probes).await;
     }
 }
 
@@ -182,6 +257,73 @@ async fn announce_on_interface(interface: &LanInterface, payload: &[u8]) -> io::
     }
 }
 
+async fn probe_on_interface(
+    interface: &LanInterface,
+    payload: &[u8],
+    local_peer: PeerId,
+    sender: mpsc::Sender<DiscoveryEvent>,
+) {
+    let socket = match UdpSocket::bind(SocketAddrV4::new(interface.ip, 0)).await {
+        Ok(socket) => socket,
+        Err(error) => {
+            tracing::debug!(
+                interface = %interface.name,
+                address = %interface.ip,
+                %error,
+                "LAN active probe socket unavailable"
+            );
+            return;
+        }
+    };
+    let targets = unicast_probe_targets(interface);
+    tracing::trace!(
+        interface = %interface.name,
+        address = %interface.ip,
+        targets = targets.len(),
+        "LAN active probe started"
+    );
+    for target in targets {
+        if let Err(error) = socket
+            .send_to(payload, SocketAddrV4::new(target, DISCOVERY_PORT))
+            .await
+        {
+            tracing::trace!(%error, %target, "LAN active probe send failed");
+        }
+        tokio::task::yield_now().await;
+    }
+
+    let deadline = Instant::now() + PROBE_RESPONSE_WINDOW;
+    let mut buffer = [0_u8; MAX_BEACON_BYTES + 1];
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        let received = time::timeout(remaining, socket.recv_from(&mut buffer)).await;
+        let Ok(Ok((length, SocketAddr::V4(source)))) = received else {
+            break;
+        };
+        if length > MAX_BEACON_BYTES || !is_private_lan_ip(*source.ip()) {
+            continue;
+        }
+        let Some(DiscoveryPacket::Beacon {
+            peer_id,
+            listen_port,
+        }) = decode_packet(&buffer[..length])
+        else {
+            continue;
+        };
+        if peer_id == local_peer {
+            continue;
+        }
+        if emit_peer_hint(&sender, peer_id, *source.ip(), listen_port)
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
 fn eligible_interfaces() -> io::Result<Vec<LanInterface>> {
     let mut interfaces = HashSet::new();
     for interface in get_if_addrs()? {
@@ -208,11 +350,23 @@ fn eligible_interfaces() -> io::Result<Vec<LanInterface>> {
             name: interface.name,
             ip: address.ip,
             broadcast,
+            prefixlen: address.prefixlen,
         });
     }
     let mut interfaces: Vec<_> = interfaces.into_iter().collect();
     interfaces.sort_by_key(|interface| (interface.ip, interface.name.clone()));
     Ok(interfaces)
+}
+
+fn unicast_probe_targets(interface: &LanInterface) -> Vec<Ipv4Addr> {
+    let prefixlen = interface.prefixlen.max(24);
+    let mask = u32::MAX << (32 - u32::from(prefixlen));
+    let network = u32::from(interface.ip) & mask;
+    let broadcast = network | !mask;
+    ((network + 1)..broadcast)
+        .map(Ipv4Addr::from)
+        .filter(|candidate| *candidate != interface.ip && is_private_lan_ip(*candidate))
+        .collect()
 }
 
 fn is_private_lan_ip(ip: Ipv4Addr) -> bool {
@@ -231,20 +385,54 @@ fn encode_beacon(peer_id: PeerId, listen_port: u16) -> Vec<u8> {
     format!("{DISCOVERY_MAGIC}|{DISCOVERY_VERSION}|{peer_id}|{listen_port}").into_bytes()
 }
 
-fn decode_beacon(payload: &[u8]) -> Option<(PeerId, u16)> {
+fn encode_probe(peer_id: PeerId, listen_port: u16) -> Vec<u8> {
+    format!("{DISCOVERY_MAGIC}|{DISCOVERY_PROBE_VERSION}|{peer_id}|{listen_port}").into_bytes()
+}
+
+fn decode_packet(payload: &[u8]) -> Option<DiscoveryPacket> {
     if payload.is_empty() || payload.len() > MAX_BEACON_BYTES {
         return None;
     }
     let mut parts = str::from_utf8(payload).ok()?.split('|');
-    if parts.next()? != DISCOVERY_MAGIC || parts.next()?.parse::<u8>().ok()? != DISCOVERY_VERSION {
+    if parts.next()? != DISCOVERY_MAGIC {
         return None;
     }
+    let version = parts.next()?.parse::<u8>().ok()?;
     let peer_id = parts.next()?.parse().ok()?;
     let listen_port = parts.next()?.parse::<u16>().ok()?;
     if listen_port == 0 || parts.next().is_some() {
         return None;
     }
-    Some((peer_id, listen_port))
+    match version {
+        DISCOVERY_VERSION => Some(DiscoveryPacket::Beacon {
+            peer_id,
+            listen_port,
+        }),
+        DISCOVERY_PROBE_VERSION => Some(DiscoveryPacket::Probe {
+            peer_id,
+            listen_port,
+        }),
+        _ => None,
+    }
+}
+
+async fn emit_peer_hint(
+    sender: &mpsc::Sender<DiscoveryEvent>,
+    peer_id: PeerId,
+    ip: Ipv4Addr,
+    listen_port: u16,
+) -> Result<(), mpsc::error::SendError<DiscoveryEvent>> {
+    let address = Multiaddr::empty()
+        .with(Protocol::Ip4(ip))
+        .with(Protocol::Tcp(listen_port))
+        .with(Protocol::P2p(peer_id));
+    sender
+        .send(DiscoveryEvent::PeerHint {
+            peer_id,
+            address,
+            expires_at: Instant::now() + BEACON_LEASE,
+        })
+        .await
 }
 
 fn startup_jitter(peer_id: PeerId) -> Duration {

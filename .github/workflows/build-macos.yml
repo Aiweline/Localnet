@@ -35,20 +35,51 @@ jobs:
       - name: Build universal DMG
         run: pnpm tauri build --target universal-apple-darwin --bundles dmg
 
+      - name: Verify macOS bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          dmg_path="$(find src-tauri/target/universal-apple-darwin/release/bundle/dmg -maxdepth 1 -name '*.dmg' -print -quit)"
+          test -n "$dmg_path"
+          mount_dir="$(mktemp -d)"
+          hdiutil attach "$dmg_path" -readonly -nobrowse -mountpoint "$mount_dir"
+          trap 'hdiutil detach "$mount_dir" >/dev/null 2>&1 || true; rmdir "$mount_dir" >/dev/null 2>&1 || true' EXIT
+          app_path="$(find "$mount_dir" -maxdepth 2 -name '*.app' -print -quit)"
+          test -n "$app_path"
+          bundle_version="$(plutil -extract CFBundleShortVersionString raw "$app_path/Contents/Info.plist")"
+          local_network_description="$(plutil -extract NSLocalNetworkUsageDescription raw "$app_path/Contents/Info.plist")"
+          bonjour_service="$(plutil -extract NSBonjourServices.0 raw "$app_path/Contents/Info.plist")"
+          binary_path="$(find "$app_path/Contents/MacOS" -maxdepth 1 -type f -perm -111 -print -quit)"
+          test -n "$binary_path"
+          archs="$(lipo -archs "$binary_path")"
+          echo "Verified DMG: $dmg_path"
+          echo "Bundle version: $bundle_version"
+          echo "Local Network description: $local_network_description"
+          echo "Bonjour service: $bonjour_service"
+          echo "Executable architectures: $archs"
+          test "$bundle_version" = "$version"
+          test -n "$local_network_description"
+          test "$bonjour_service" = "_p2p._udp"
+          [[ "$archs" == *arm64* ]]
+          [[ "$archs" == *x86_64* ]]
+
       - name: Collect package and checksum
         shell: bash
         run: |
           set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
           mkdir -p release/macos
           dmg_path="$(find src-tauri/target/universal-apple-darwin/release/bundle/dmg -maxdepth 1 -name '*.dmg' -print -quit)"
           test -n "$dmg_path"
-          cp "$dmg_path" release/macos/Localnet_0.1.0_universal.dmg
-          shasum -a 256 release/macos/Localnet_0.1.0_universal.dmg > release/macos/Localnet_0.1.0_universal.dmg.sha256
+          output="release/macos/Weline_Localnet_${version}_universal.dmg"
+          cp "$dmg_path" "$output"
+          shasum -a 256 "$output" > "$output.sha256"
 
       - name: Upload macOS package
         uses: actions/upload-artifact@v4
         with:
-          name: localnet-macos-universal
+          name: weline-localnet-macos-universal
           path: release/macos/*
           if-no-files-found: error
           retention-days: 14
