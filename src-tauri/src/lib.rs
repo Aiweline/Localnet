@@ -7,6 +7,7 @@ mod protocol;
 mod receive_paths;
 mod state;
 mod storage;
+mod transfer_manifest;
 pub mod transfer_policy;
 pub mod volume_preflight;
 

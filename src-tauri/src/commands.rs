@@ -13,14 +13,16 @@ use tauri::{AppHandle, State};
 use crate::{
     domain::{
         BootstrapSnapshot, ChatMessage, Direction, Friend, FriendRequest, FriendRequestStatus,
-        LocalProfile, MAX_FILE_BYTES, MessageKind, MessageStatus, PROTOCOL_VERSION, Platform,
-        PresenceSnapshot, TransferKind, TransferPreferences, TransferRecord, TransferStatus,
-        now_rfc3339, validate_nickname, validate_text,
+        LocalProfile, MessageKind, MessageStatus, PROTOCOL_VERSION, Platform, PresenceSnapshot,
+        TransferKind, TransferPreferences, TransferRecord, TransferStatus, now_rfc3339,
+        validate_nickname, validate_text,
     },
     error::AppError,
     network::NetworkCommand,
     receive_paths::{ensure_writable_directory, remove_owned_reservation, reserve_receive_path},
     state::AppState,
+    transfer_manifest::{TransferChunk, build_manifest},
+    transfer_policy::{TRANSFER_CHUNK_BYTES, TransferProtocol, select_transfer_protocol},
 };
 
 #[tauri::command]
@@ -283,14 +285,17 @@ pub async fn send_file(
     state: State<'_, AppState>,
 ) -> Result<TransferRecord, AppError> {
     validate_peer_id(&peer_id, state.identity.peer_id_string().as_str())?;
-    require_online_peer(&peer_id, &state)?;
+    let peer = require_online_peer(&peer_id, &state)?;
     if !state.storage.is_friend(&peer_id)? {
         return Err(AppError::NotFriend);
     }
     let kind = TransferKind::from_str(&kind)?;
-    let source = tauri::async_runtime::spawn_blocking(move || prepare_source(&path, kind))
-        .await
-        .map_err(|error| AppError::Io(std::io::Error::other(error.to_string())))??;
+    let capabilities = peer.capabilities;
+    let source = tauri::async_runtime::spawn_blocking(move || {
+        prepare_source(&path, kind, capabilities.as_slice())
+    })
+    .await
+    .map_err(|error| AppError::Io(std::io::Error::other(error.to_string())))??;
     let now = now_rfc3339();
     let transfer_id = uuid::Uuid::now_v7().to_string();
     let transfer = TransferRecord {
@@ -305,6 +310,13 @@ pub async fn send_file(
         local_path: Some(source.path.to_string_lossy().into_owned()),
         destination_reserved: false,
         reservation_token: None,
+        transfer_protocol: source.transfer_protocol,
+        chunk_size: source.chunk_size,
+        chunk_count: source.chunk_count,
+        manifest_sha256: source.manifest_sha256,
+        partial_path: None,
+        source_modified_ns: source.source_modified_ns,
+        send_claimed: false,
         transferred_bytes: 0,
         status: TransferStatus::AwaitingAcceptance,
         error: None,
@@ -328,6 +340,11 @@ pub async fn send_file(
         created_at: now,
     };
     state.storage.upsert_transfer(&transfer)?;
+    if transfer.transfer_protocol == TransferProtocol::ResumableV2 as u8 {
+        state
+            .storage
+            .replace_outgoing_chunks(&transfer.transfer_id, &source.chunks)?;
+    }
     state.storage.insert_message(&message)?;
     if let Err(error) = state
         .network()?
@@ -673,17 +690,25 @@ struct PreparedSource {
     file_size: u64,
     mime_type: String,
     sha256: String,
+    transfer_protocol: u8,
+    chunk_size: u32,
+    chunk_count: u32,
+    manifest_sha256: Option<String>,
+    source_modified_ns: Option<u64>,
+    chunks: Vec<TransferChunk>,
 }
 
-fn prepare_source(path: &str, kind: TransferKind) -> Result<PreparedSource, AppError> {
+fn prepare_source(
+    path: &str,
+    kind: TransferKind,
+    capabilities: &[String],
+) -> Result<PreparedSource, AppError> {
     let path = std::fs::canonicalize(path)?;
     let metadata = std::fs::metadata(&path)?;
     if !metadata.is_file() {
         return Err(AppError::InvalidInput("请选择一个普通文件".to_string()));
     }
-    if metadata.len() > MAX_FILE_BYTES {
-        return Err(AppError::InvalidInput("单个文件不能超过 2 GiB".to_string()));
-    }
+    let transfer_protocol = select_transfer_protocol(capabilities, metadata.len())?;
     let file_name = path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -695,7 +720,49 @@ fn prepare_source(path: &str, kind: TransferKind) -> Result<PreparedSource, AppE
             "所选文件不是支持的图片格式".to_string(),
         ));
     }
-    let mut reader = BufReader::new(File::open(&path)?);
+    let (file_size, sha256, chunk_size, chunk_count, manifest_sha256, source_modified_ns, chunks) =
+        match transfer_protocol {
+            TransferProtocol::LegacyV1 => (
+                metadata.len(),
+                hash_file(&path)?,
+                0,
+                0,
+                None,
+                None,
+                Vec::new(),
+            ),
+            TransferProtocol::ResumableV2 => {
+                let manifest = build_manifest(&path, TRANSFER_CHUNK_BYTES)?;
+                let chunk_count = u32::try_from(manifest.chunks.len())
+                    .map_err(|_| AppError::InvalidInput("分块数量超出协议限制".to_string()))?;
+                (
+                    manifest.file_size,
+                    hex::encode(manifest.file_sha256),
+                    TRANSFER_CHUNK_BYTES,
+                    chunk_count,
+                    Some(hex::encode(manifest.manifest_sha256)),
+                    Some(manifest.source_modified_ns),
+                    manifest.chunks,
+                )
+            }
+        };
+    Ok(PreparedSource {
+        path,
+        file_name,
+        file_size,
+        mime_type,
+        sha256,
+        transfer_protocol: transfer_protocol as u8,
+        chunk_size,
+        chunk_count,
+        manifest_sha256,
+        source_modified_ns,
+        chunks,
+    })
+}
+
+fn hash_file(path: &Path) -> Result<String, AppError> {
+    let mut reader = BufReader::new(File::open(path)?);
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 128 * 1024];
     loop {
@@ -705,13 +772,7 @@ fn prepare_source(path: &str, kind: TransferKind) -> Result<PreparedSource, AppE
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(PreparedSource {
-        path,
-        file_name,
-        file_size: metadata.len(),
-        mime_type,
-        sha256: hex::encode(hasher.finalize()),
-    })
+    Ok(hex::encode(hasher.finalize()))
 }
 
 fn detect_mime_type(path: &Path) -> String {
@@ -743,8 +804,40 @@ fn detect_mime_type(path: &Path) -> String {
 mod tests {
     use std::fs;
 
-    use super::{prepare_receive_directory, prepare_transfer_preferences};
-    use crate::domain::TransferPreferences;
+    use super::{prepare_receive_directory, prepare_source, prepare_transfer_preferences};
+    use crate::{
+        domain::{TransferKind, TransferPreferences},
+        transfer_policy::{FILE_RESUME_V2_CAPABILITY, TRANSFER_CHUNK_BYTES, TransferProtocol},
+    };
+
+    #[test]
+    fn upgraded_peer_prepares_a_v2_manifest_before_offering_a_source() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-v2-source-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::write(&fixture, b"abc").expect("write source fixture");
+        let capabilities = vec![FILE_RESUME_V2_CAPABILITY.to_string()];
+
+        let source = prepare_source(
+            &fixture.to_string_lossy(),
+            TransferKind::File,
+            &capabilities,
+        )
+        .expect("prepare v2 source");
+
+        assert_eq!(
+            source.transfer_protocol,
+            TransferProtocol::ResumableV2 as u8
+        );
+        assert_eq!(source.chunk_size, TRANSFER_CHUNK_BYTES);
+        assert_eq!(source.chunk_count, 1);
+        assert_eq!(source.manifest_sha256.as_deref().map(str::len), Some(64));
+        assert!(source.source_modified_ns.is_some());
+        assert_eq!(source.chunks.len(), 1);
+
+        fs::remove_file(fixture).expect("remove source fixture");
+    }
 
     #[test]
     fn disabling_auto_receive_accepts_an_unavailable_absolute_directory() {

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::domain::{Platform, TransferKind};
+use crate::domain::{Platform, TransferKind, default_transfer_protocol};
 
 pub const CONTROL_PROTOCOL: &str = "/localnet/control/1";
 pub const FILE_PROTOCOL: &str = "/localnet/file/1";
@@ -24,6 +24,14 @@ pub struct TransferOffer {
     pub file_size: u64,
     pub mime_type: String,
     pub sha256: String,
+    #[serde(default = "default_transfer_protocol")]
+    pub transfer_protocol: u8,
+    #[serde(default)]
+    pub chunk_size: u32,
+    #[serde(default)]
+    pub chunk_count: u32,
+    #[serde(default)]
+    pub manifest_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

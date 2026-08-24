@@ -334,6 +334,10 @@ impl NetworkRuntime {
                             file_size: transfer.file_size,
                             mime_type: transfer.mime_type,
                             sha256: transfer.sha256,
+                            transfer_protocol: transfer.transfer_protocol,
+                            chunk_size: transfer.chunk_size,
+                            chunk_count: transfer.chunk_count,
+                            manifest_sha256: transfer.manifest_sha256,
                         },
                     },
                 );
@@ -757,6 +761,13 @@ impl NetworkRuntime {
                     local_path,
                     destination_reserved,
                     reservation_token,
+                    transfer_protocol: offer.transfer_protocol,
+                    chunk_size: offer.chunk_size,
+                    chunk_count: offer.chunk_count,
+                    manifest_sha256: offer.manifest_sha256,
+                    partial_path: None,
+                    source_modified_ns: None,
+                    send_claimed: false,
                     transferred_bytes: 0,
                     status: if auto_accept {
                         TransferStatus::Transferring
