@@ -5,11 +5,12 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
-import { openPath } from "@tauri-apps/plugin-opener";
+import { openPath, openUrl } from "@tauri-apps/plugin-opener";
 import {
-  AlertCircle, BellRing, Check, CheckCheck, ChevronRight, CircleUserRound, File, FileDown,
-  Image as ImageIcon, LoaderCircle, MessageCircleMore, Monitor, Paperclip, RefreshCw,
-  Search, Send, Settings2, ShieldCheck, UserPlus, UsersRound, Wifi, WifiOff, X,
+  AlertCircle, BellRing, Building2, Check, CheckCheck, ChevronRight, CircleUserRound,
+  File, FileDown, FolderOpen, Image as ImageIcon, LoaderCircle, Mail, MessageCircleMore,
+  Monitor, Paperclip, RefreshCw, Search, Send, Settings2, ShieldCheck, UserPlus,
+  UsersRound, Wifi, WifiOff, X,
 } from "lucide-react";
 import "./styles.css";
 
@@ -27,7 +28,8 @@ interface FriendRequest { requestId: string; peerId: string; nickname: string; d
 interface Friend { peerId: string; nickname: string; platform: Platform; online: boolean; addedAt: string; lastSeen: string }
 interface ChatMessage { messageId: string; peerId: string; direction: Direction; kind: MessageKind; body?: string; localPath?: string; fileName?: string; fileSize?: number; status: MessageStatus; error?: string; createdAt: string }
 interface TransferRecord { transferId: string; peerId: string; direction: Direction; kind: TransferKind; fileName: string; fileSize: number; mimeType: string; sha256: string; localPath?: string; transferredBytes: number; status: TransferStatus; error?: string; createdAt: string; updatedAt: string }
-interface BootstrapSnapshot { localProfile: LocalProfile | null; peers: PeerSummary[]; friendRequests: FriendRequest[]; friends: Friend[]; messages: ChatMessage[]; transfers: TransferRecord[] }
+interface TransferPreferences { autoReceiveFiles: boolean; receiveDirectory: string }
+interface BootstrapSnapshot { localProfile: LocalProfile | null; transferPreferences: TransferPreferences; peers: PeerSummary[]; friendRequests: FriendRequest[]; friends: Friend[]; messages: ChatMessage[]; transfers: TransferRecord[] }
 interface ToastState { tone: "success" | "error" | "info"; message: string }
 type NetworkEvent =
   | { type: "peerDiscovered"; peer: PeerSummary }
@@ -40,7 +42,7 @@ type NetworkEvent =
   | { type: "transferUpdated"; transfer: TransferRecord }
   | { type: "networkError"; code: string; message: string };
 
-const EMPTY_SNAPSHOT: BootstrapSnapshot = { localProfile: null, peers: [], friendRequests: [], friends: [], messages: [], transfers: [] };
+const EMPTY_SNAPSHOT: BootstrapSnapshot = { localProfile: null, transferPreferences: { autoReceiveFiles: false, receiveDirectory: "" }, peers: [], friendRequests: [], friends: [], messages: [], transfers: [] };
 
 function App() {
   const [snapshot, setSnapshot] = useState<BootstrapSnapshot>(EMPTY_SNAPSHOT);
@@ -88,6 +90,12 @@ function App() {
         break;
       case "friendRequestResolved":
         if (event.friend) setSelectedPeerId(event.friend.peerId);
+        break;
+      case "transferUpdated":
+        if (event.transfer.direction === "incoming" && event.transfer.status === "completed") {
+          setAnnouncement(`文件 ${event.transfer.fileName} 已接收完成`);
+          void notifyIncomingTransfer(event.transfer);
+        }
         break;
       case "networkError":
         setToast({ tone: "error", message: event.message });
@@ -231,7 +239,7 @@ function App() {
         <header className="brand-row">
           <span className="brand-mark"><MessageCircleMore size={22} /></span>
           <span><strong>Weline Localnet</strong><small>局域网私密传输</small></span>
-          <button className="icon-button" title="设置昵称" onClick={() => setEditingProfile(true)}><Settings2 size={18} /></button>
+          <button className="icon-button" title="设置" onClick={() => setEditingProfile(true)}><Settings2 size={18} /></button>
         </header>
         <button className="profile-card" onClick={() => setEditingProfile(true)}>
           <Avatar name={profile.nickname} online />
@@ -314,8 +322,19 @@ function App() {
       </section>
 
       {editingProfile && (
-        <ProfileDialog profile={profile} busy={busyKey === "profile"} notificationBusy={busyKey === "notifications"} notificationPermission={notificationPermission} onEnableNotifications={enableSystemNotifications} onClose={() => setEditingProfile(false)} onSave={async (nickname) => {
-          const result = await act("profile", () => invoke("update_nickname", { nickname }), "昵称已更新");
+        <ProfileDialog profile={profile} transferPreferences={snapshot.transferPreferences} busy={busyKey === "profile"} directoryBusy={busyKey === "open-receive-directory"} notificationBusy={busyKey === "notifications"} notificationPermission={notificationPermission} onEnableNotifications={enableSystemNotifications} onChooseDirectory={async (currentDirectory) => {
+          const selected = await open({ multiple: false, directory: true, defaultPath: currentDirectory || undefined });
+          return typeof selected === "string" ? selected : null;
+        }} onOpenDirectory={async (path) => {
+          await act("open-receive-directory", () => openPath(path));
+        }} onClose={() => setEditingProfile(false)} onSave={async (nickname, transferPreferences) => {
+          const result = await act("profile", async () => {
+            return invoke("update_settings", {
+              nickname,
+              autoReceiveFiles: transferPreferences.autoReceiveFiles,
+              receiveDirectory: transferPreferences.receiveDirectory,
+            });
+          }, "设置已保存");
           if (result) setEditingProfile(false);
         }} />
       )}
@@ -464,35 +483,62 @@ function Onboarding({ busy, onSubmit }: { busy: boolean; onSubmit: (nickname: st
   return <main className="onboarding-screen"><section className="onboarding-card"><div className="onboarding-copy"><span className="brand-mark large"><MessageCircleMore size={30} /></span><p className="eyebrow">欢迎使用 WELINE LOCALNET</p><h1>无需服务器，直接和内网用户连接。</h1><p>设置一个昵称，其他 Weline Localnet 用户就能在附近列表中发现你。</p><ul><li><Wifi size={17} /> 自动发现同一局域网用户</li><li><ShieldCheck size={17} /> 设备身份保存在本机</li><li><Paperclip size={17} /> 文字、图片和文件直传</li></ul></div><form className="nickname-form" onSubmit={(event) => { event.preventDefault(); if (nickname.trim()) void onSubmit(nickname); }}><span className="form-icon"><CircleUserRound size={25} /></span><h2>你希望别人怎么称呼你？</h2><p>昵称只会显示给同一内网中的 Weline Localnet 用户。</p><label>昵称<input autoFocus maxLength={32} value={nickname} onChange={(event) => setNickname(event.target.value)} placeholder="例如：小林" /></label><button className="primary-button" disabled={busy || !nickname.trim()}>{busy ? <LoaderCircle size={18} className="spin" /> : <Wifi size={18} />}{busy ? "正在启动…" : "进入 Weline Localnet"}</button><small><ShieldCheck size={13} /> 不需要账号、手机号或互联网连接</small></form></section></main>;
 }
 
-function ProfileDialog({ profile, busy, notificationBusy, notificationPermission, onEnableNotifications, onClose, onSave }: {
+function ProfileDialog({ profile, transferPreferences, busy, directoryBusy, notificationBusy, notificationPermission, onEnableNotifications, onChooseDirectory, onOpenDirectory, onClose, onSave }: {
   profile: LocalProfile;
+  transferPreferences: TransferPreferences;
   busy: boolean;
+  directoryBusy: boolean;
   notificationBusy: boolean;
   notificationPermission: NotificationPermission;
   onEnableNotifications: () => Promise<void>;
+  onChooseDirectory: (currentDirectory: string) => Promise<string | null>;
+  onOpenDirectory: (path: string) => Promise<void>;
   onClose: () => void;
-  onSave: (nickname: string) => Promise<void>;
+  onSave: (nickname: string, transferPreferences: TransferPreferences) => Promise<void>;
 }) {
   const [nickname, setNickname] = useState(profile.nickname);
+  const [autoReceiveFiles, setAutoReceiveFiles] = useState(transferPreferences.autoReceiveFiles);
+  const [receiveDirectory, setReceiveDirectory] = useState(transferPreferences.receiveDirectory);
   const notificationEnabled = notificationPermission === "granted";
+  const chooseDirectory = async () => {
+    const selected = await onChooseDirectory(receiveDirectory);
+    if (selected) setReceiveDirectory(selected);
+  };
   return (
     <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      <form className="dialog-card" role="dialog" aria-modal="true" aria-labelledby="profile-title" onSubmit={(event) => { event.preventDefault(); if (nickname.trim()) void onSave(nickname); }}>
+      <form className="dialog-card settings-dialog" role="dialog" aria-modal="true" aria-labelledby="profile-title" onSubmit={(event) => { event.preventDefault(); if (nickname.trim() && (!autoReceiveFiles || receiveDirectory.trim())) void onSave(nickname, { autoReceiveFiles, receiveDirectory }); }}>
         <button type="button" className="dialog-close" onClick={onClose}><X size={18} /></button>
         <Avatar name={nickname || profile.nickname} online large />
-        <h2 id="profile-title">本机资料</h2>
-        <p>修改后，附近用户会看到新的昵称。</p>
+        <h2 id="profile-title">本机设置</h2>
+        <p>管理附近用户看到的昵称，以及文件接收方式。</p>
         <label>昵称<input autoFocus maxLength={32} value={nickname} onChange={(event) => setNickname(event.target.value)} /></label>
         <div className="device-id"><Monitor size={15} /><span><small>设备身份</small><code>{shortPeerId(profile.peerId)}</code></span></div>
+        <div className="auto-receive-setting">
+          <FileDown size={17} />
+          <span><strong>自动接收好友文件</strong><small>仅自动接收已添加好友发送的图片和文件。</small></span>
+          <button type="button" className={autoReceiveFiles ? "enabled" : ""} role="switch" aria-checked={autoReceiveFiles} aria-label="自动接收好友文件" onClick={() => setAutoReceiveFiles((enabled) => !enabled)}><i /></button>
+        </div>
+        <div className="receive-directory-setting">
+          <FolderOpen size={17} />
+          <span><strong>文件接收位置</strong><code title={receiveDirectory}>{receiveDirectory}</code></span>
+          <div>
+            <button type="button" disabled={!receiveDirectory || directoryBusy} onClick={() => void onOpenDirectory(receiveDirectory)} title="打开接收文件夹">{directoryBusy ? "打开中…" : "打开"}</button>
+            <button type="button" onClick={() => void chooseDirectory()}>更改</button>
+          </div>
+        </div>
         <div className="notification-setting">
           <BellRing size={17} />
-          <span><strong>系统好友申请通知</strong><small>只显示请求者昵称；拒绝授权不影响应用内确认。</small></span>
+          <span><strong>系统通知</strong><small>显示好友申请和文件接收完成提醒；拒绝授权不影响应用内提示。</small></span>
           <button type="button" disabled={notificationBusy || notificationEnabled} onClick={() => void onEnableNotifications()}>
             {notificationBusy ? <LoaderCircle size={13} className="spin" /> : notificationEnabled ? <Check size={13} /> : null}
             {notificationEnabled ? "已开启" : notificationPermission === "denied" ? "重新授权" : "开启"}
           </button>
         </div>
-        <button className="primary-button" disabled={busy || !nickname.trim()}>{busy && <LoaderCircle size={16} className="spin" />} 保存修改</button>
+        <div className="about-setting">
+          <Building2 size={17} />
+          <span><strong>成都阿玛云科技有限公司</strong><button type="button" onClick={() => void openUrl("mailto:contact@amayum.com")}><Mail size={12} /> contact@amayum.com</button></span>
+        </div>
+        <button className="primary-button" disabled={busy || !nickname.trim() || (autoReceiveFiles && !receiveDirectory.trim())}>{busy && <LoaderCircle size={16} className="spin" />} 保存设置</button>
       </form>
     </div>
   );
@@ -519,6 +565,17 @@ async function notifyIncomingFriendRequest(request: FriendRequest): Promise<void
     });
   } catch (error) {
     console.debug("Native friend-request notification unavailable", error);
+  }
+}
+async function notifyIncomingTransfer(transfer: TransferRecord): Promise<void> {
+  try {
+    if (await getCurrentWindow().isFocused() || !(await isPermissionGranted())) return;
+    sendNotification({
+      title: "Weline Localnet",
+      body: `${transfer.fileName} 已接收完成。`,
+    });
+  } catch (error) {
+    console.debug("Native file-received notification unavailable", error);
   }
 }
 function platformLabel(platform: Platform): string { return platform === "windows" ? "Windows" : platform === "macos" ? "macOS" : "桌面设备"; }

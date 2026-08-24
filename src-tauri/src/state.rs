@@ -13,16 +13,20 @@ use crate::{
 pub struct AppState {
     pub storage: Storage,
     pub identity: LocalIdentity,
-    pub app_data_dir: PathBuf,
+    pub default_receive_directory: PathBuf,
     network: Mutex<Option<NetworkHandle>>,
 }
 
 impl AppState {
-    pub fn new(storage: Storage, identity: LocalIdentity, app_data_dir: PathBuf) -> Self {
+    pub fn new(
+        storage: Storage,
+        identity: LocalIdentity,
+        default_receive_directory: PathBuf,
+    ) -> Self {
         Self {
             storage,
             identity,
-            app_data_dir,
+            default_receive_directory,
             network: Mutex::new(None),
         }
     }
@@ -51,7 +55,7 @@ impl AppState {
                 profile,
                 self.storage.clone(),
                 app_handle,
-                self.app_data_dir.clone(),
+                self.default_receive_directory.clone(),
             ));
         }
         Ok(())

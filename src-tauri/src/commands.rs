@@ -14,17 +14,21 @@ use crate::{
     domain::{
         BootstrapSnapshot, ChatMessage, Direction, Friend, FriendRequest, FriendRequestStatus,
         LocalProfile, MAX_FILE_BYTES, MessageKind, MessageStatus, PROTOCOL_VERSION, Platform,
-        TransferKind, TransferRecord, TransferStatus, now_rfc3339, validate_nickname,
-        validate_text,
+        TransferKind, TransferPreferences, TransferRecord, TransferStatus, now_rfc3339,
+        validate_nickname, validate_text,
     },
     error::AppError,
     network::NetworkCommand,
+    receive_paths::{ensure_writable_directory, remove_owned_reservation, reserve_receive_path},
     state::AppState,
 };
 
 #[tauri::command]
 pub fn bootstrap(state: State<'_, AppState>) -> Result<BootstrapSnapshot, AppError> {
-    state.storage.snapshot(state.local_profile()?)
+    state.storage.snapshot(
+        state.local_profile()?,
+        state.default_receive_directory.as_path(),
+    )
 }
 
 #[tauri::command]
@@ -43,6 +47,73 @@ pub fn update_nickname(
     state: State<'_, AppState>,
 ) -> Result<LocalProfile, AppError> {
     save_nickname(&nickname, &app_handle, &state)
+}
+
+#[tauri::command]
+pub fn update_settings(
+    nickname: String,
+    auto_receive_files: bool,
+    receive_directory: String,
+    app_handle: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<LocalProfile, AppError> {
+    let previous_nickname = state
+        .storage
+        .load_nickname()?
+        .ok_or_else(|| AppError::InvalidInput("请先完成昵称设置".to_string()))?;
+    let previous_preferences = state
+        .storage
+        .load_transfer_preferences(state.default_receive_directory.as_path())?;
+    let profile = LocalProfile {
+        peer_id: state.identity.peer_id_string(),
+        nickname: validate_nickname(&nickname)?,
+        platform: Platform::current(),
+        protocol_version: PROTOCOL_VERSION,
+    };
+    let preferences = prepare_transfer_preferences(
+        auto_receive_files,
+        &receive_directory,
+        &previous_preferences,
+        state.default_receive_directory.as_path(),
+    )?;
+    state
+        .storage
+        .save_profile_and_transfer_preferences(&profile, &preferences)?;
+    if let Err(error) = state.start_network_if_ready(app_handle) {
+        let previous_profile = LocalProfile {
+            peer_id: state.identity.peer_id_string(),
+            nickname: previous_nickname,
+            platform: Platform::current(),
+            protocol_version: PROTOCOL_VERSION,
+        };
+        if let Err(rollback_error) = state
+            .storage
+            .save_profile_and_transfer_preferences(&previous_profile, &previous_preferences)
+        {
+            tracing::error!(%rollback_error, "failed to roll back application settings");
+        }
+        return Err(error);
+    }
+    Ok(profile)
+}
+
+#[tauri::command]
+pub fn update_transfer_preferences(
+    auto_receive_files: bool,
+    receive_directory: String,
+    state: State<'_, AppState>,
+) -> Result<TransferPreferences, AppError> {
+    let directory = prepare_receive_directory(
+        &receive_directory,
+        auto_receive_files,
+        state.default_receive_directory.as_path(),
+    )?;
+    let preferences = TransferPreferences {
+        auto_receive_files,
+        receive_directory: directory.to_string_lossy().into_owned(),
+    };
+    state.storage.save_transfer_preferences(&preferences)?;
+    Ok(preferences)
 }
 
 #[tauri::command]
@@ -227,6 +298,8 @@ pub async fn send_file(
         mime_type: source.mime_type,
         sha256: source.sha256,
         local_path: Some(source.path.to_string_lossy().into_owned()),
+        destination_reserved: false,
+        reservation_token: None,
         transferred_bytes: 0,
         status: TransferStatus::AwaitingAcceptance,
         error: None,
@@ -275,6 +348,7 @@ pub fn resolve_transfer(
     transfer_id: String,
     accepted: bool,
     save_path: Option<String>,
+    app_handle: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<TransferRecord, AppError> {
     uuid::Uuid::parse_str(&transfer_id)
@@ -301,20 +375,131 @@ pub fn resolve_transfer(
                 "文件保存位置必须是绝对路径".to_string(),
             ));
         }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let reservation_token = uuid::Uuid::new_v4().to_string();
+        reserve_receive_path(&path, &transfer.transfer_id, &reservation_token).map_err(
+            |error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    AppError::InvalidInput("保存位置已经存在同名文件，请重新选择".to_string())
+                } else {
+                    AppError::Permission(format!("无法占用文件保存位置，请重新选择：{error}"))
+                }
+            },
+        )?;
         transfer.local_path = Some(path.to_string_lossy().into_owned());
+        transfer.destination_reserved = true;
+        transfer.reservation_token = Some(reservation_token);
         transfer.status = TransferStatus::Transferring;
         transfer.error = None;
+        transfer.updated_at = now_rfc3339();
+        match state.storage.try_accept_incoming_transfer(&transfer) {
+            Ok(true) => {}
+            Ok(false) => {
+                if let (Some(path), Some(token)) = (
+                    transfer.local_path.as_deref(),
+                    transfer.reservation_token.as_deref(),
+                ) {
+                    let _ = remove_owned_reservation(Path::new(path), &transfer.transfer_id, token);
+                }
+                return Err(AppError::InvalidInput(
+                    "这次文件传输已经处理，请刷新后查看".to_string(),
+                ));
+            }
+            Err(error) => {
+                if let (Some(path), Some(token)) = (
+                    transfer.local_path.as_deref(),
+                    transfer.reservation_token.as_deref(),
+                ) {
+                    let _ = remove_owned_reservation(Path::new(path), &transfer.transfer_id, token);
+                }
+                return Err(error);
+            }
+        }
     } else {
-        transfer.status = TransferStatus::Cancelled;
-        transfer.error = Some("你拒绝了这次传输".to_string());
+        if !state.storage.try_cancel_unclaimed_incoming_transfer(
+            &transfer.transfer_id,
+            &transfer.peer_id,
+            "你拒绝了这次传输",
+        )? {
+            return Err(AppError::InvalidInput(
+                "这次文件传输已经处理，请刷新后查看".to_string(),
+            ));
+        }
+        transfer = state
+            .storage
+            .get_transfer(&transfer.transfer_id)?
+            .ok_or_else(|| AppError::InvalidInput("找不到这次文件传输".to_string()))?;
     }
-    transfer.updated_at = now_rfc3339();
-    state.storage.upsert_transfer(&transfer)?;
-    state.network()?.try_send(NetworkCommand::ResolveTransfer {
+    let network = match state.network() {
+        Ok(network) => network,
+        Err(error) => {
+            if transfer.destination_reserved {
+                if let (Some(path), Some(token)) = (
+                    transfer.local_path.as_deref(),
+                    transfer.reservation_token.as_deref(),
+                ) {
+                    match remove_owned_reservation(Path::new(path), &transfer.transfer_id, token) {
+                        Ok(_) => {
+                            transfer.destination_reserved = false;
+                            transfer.reservation_token = None;
+                        }
+                        Err(cleanup_error) => {
+                            tracing::warn!(
+                                transfer_id = %transfer.transfer_id,
+                                %cleanup_error,
+                                "failed to clean receive reservation after network failure"
+                            );
+                        }
+                    }
+                }
+            }
+            transfer.status = TransferStatus::Failed;
+            transfer.error = Some(error.to_string());
+            transfer.updated_at = now_rfc3339();
+            state.storage.upsert_transfer(&transfer)?;
+            return Err(error);
+        }
+    };
+    if let Err(error) = network.try_send(NetworkCommand::ResolveTransfer {
         peer_id: transfer.peer_id.clone(),
-        transfer_id,
+        transfer_id: transfer_id.clone(),
         accepted,
-    })?;
+    }) {
+        if transfer.destination_reserved {
+            if let (Some(path), Some(token)) = (
+                transfer.local_path.as_deref(),
+                transfer.reservation_token.as_deref(),
+            ) {
+                match remove_owned_reservation(Path::new(path), &transfer.transfer_id, token) {
+                    Ok(_) => {
+                        transfer.destination_reserved = false;
+                        transfer.reservation_token = None;
+                    }
+                    Err(cleanup_error) => {
+                        tracing::warn!(
+                            transfer_id = %transfer.transfer_id,
+                            %cleanup_error,
+                            "failed to clean receive reservation after decision failure"
+                        );
+                    }
+                }
+            }
+        }
+        transfer.status = TransferStatus::Failed;
+        transfer.error = Some(error.to_string());
+        transfer.updated_at = now_rfc3339();
+        state.storage.upsert_transfer(&transfer)?;
+        return Err(error);
+    }
+    if accepted {
+        crate::network::spawn_incoming_start_timeout(
+            transfer.transfer_id.clone(),
+            state.storage.clone(),
+            app_handle,
+        );
+    }
     Ok(transfer)
 }
 
@@ -332,10 +517,18 @@ pub fn cancel_transfer(
     {
         return Err(AppError::InvalidInput("当前传输不能取消".to_string()));
     }
-    transfer.status = TransferStatus::Cancelled;
-    transfer.error = Some("你取消了传输".to_string());
-    transfer.updated_at = now_rfc3339();
-    state.storage.upsert_transfer(&transfer)?;
+    if !state.storage.try_transition_outgoing_awaiting(
+        &transfer.transfer_id,
+        &transfer.peer_id,
+        TransferStatus::Cancelled,
+        Some("你取消了传输"),
+    )? {
+        return Err(AppError::InvalidInput("当前传输不能取消".to_string()));
+    }
+    transfer = state
+        .storage
+        .get_transfer(&transfer.transfer_id)?
+        .ok_or_else(|| AppError::InvalidInput("找不到这次文件传输".to_string()))?;
     state.storage.update_message_status(
         &transfer.transfer_id,
         MessageStatus::Failed,
@@ -397,6 +590,49 @@ fn save_nickname(
     state.storage.save_profile(&profile)?;
     state.start_network_if_ready(app_handle.clone())?;
     Ok(profile)
+}
+
+fn prepare_receive_directory(
+    value: &str,
+    auto_receive_files: bool,
+    default_directory: &Path,
+) -> Result<PathBuf, AppError> {
+    let value = value.trim();
+    let path = if value.is_empty() {
+        default_directory.to_path_buf()
+    } else {
+        PathBuf::from(value)
+    };
+    if !auto_receive_files {
+        return Ok(path);
+    }
+    if !path.is_absolute() {
+        return Err(AppError::InvalidInput(
+            "文件接收目录必须是绝对路径".to_string(),
+        ));
+    }
+    ensure_writable_directory(&path)
+        .map_err(|error| AppError::Permission(format!("文件接收目录不可写，请重新选择：{error}")))
+}
+
+fn prepare_transfer_preferences(
+    auto_receive_files: bool,
+    receive_directory: &str,
+    previous: &TransferPreferences,
+    default_directory: &Path,
+) -> Result<TransferPreferences, AppError> {
+    let receive_directory = receive_directory.trim();
+    if auto_receive_files == previous.auto_receive_files
+        && receive_directory == previous.receive_directory
+    {
+        return Ok(previous.clone());
+    }
+    let directory =
+        prepare_receive_directory(receive_directory, auto_receive_files, default_directory)?;
+    Ok(TransferPreferences {
+        auto_receive_files,
+        receive_directory: directory.to_string_lossy().into_owned(),
+    })
 }
 
 fn validate_peer_id(peer_id: &str, local_peer_id: &str) -> Result<(), AppError> {
@@ -496,4 +732,60 @@ fn detect_mime_type(path: &Path) -> String {
         _ => "application/octet-stream",
     }
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::{prepare_receive_directory, prepare_transfer_preferences};
+    use crate::domain::TransferPreferences;
+
+    #[test]
+    fn disabling_auto_receive_accepts_an_unavailable_absolute_directory() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-disabled-directory-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let default_directory = fixture.join("default");
+        let unavailable = fixture.join("unplugged-drive");
+
+        let prepared = prepare_receive_directory(
+            unavailable.to_string_lossy().as_ref(),
+            false,
+            &default_directory,
+        )
+        .expect("disabling must not probe the unavailable directory");
+
+        assert_eq!(prepared, unavailable);
+        assert!(!prepared.exists());
+        let _ = fs::remove_dir_all(fixture);
+    }
+
+    #[test]
+    fn unchanged_enabled_preferences_do_not_probe_an_unavailable_directory() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-unchanged-directory-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let default_directory = fixture.join("default");
+        let unavailable = fixture.join("unplugged-drive");
+        let previous = TransferPreferences {
+            auto_receive_files: true,
+            receive_directory: unavailable.to_string_lossy().into_owned(),
+        };
+
+        let prepared = prepare_transfer_preferences(
+            true,
+            unavailable.to_string_lossy().as_ref(),
+            &previous,
+            &default_directory,
+        )
+        .expect("unchanged preferences must not block nickname updates");
+
+        assert_eq!(prepared.receive_directory, previous.receive_directory);
+        assert!(prepared.auto_receive_files);
+        assert!(!unavailable.exists());
+        let _ = fs::remove_dir_all(fixture);
+    }
 }

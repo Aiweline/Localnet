@@ -4,6 +4,7 @@ mod error;
 mod identity;
 mod network;
 mod protocol;
+mod receive_paths;
 mod state;
 mod storage;
 
@@ -37,6 +38,7 @@ pub fn run() {
             commands::bootstrap,
             commands::complete_onboarding,
             commands::update_nickname,
+            commands::update_settings,
             commands::send_friend_request,
             commands::resolve_friend_request,
             commands::send_text,
@@ -45,6 +47,7 @@ pub fn run() {
             commands::resolve_transfer,
             commands::cancel_transfer,
             commands::image_preview,
+            commands::update_transfer_preferences,
         ])
         .setup(|app| {
             initialize_logging();
@@ -81,7 +84,13 @@ fn initialize_state<R: tauri::Runtime>(
     let use_keyring = !(cfg!(debug_assertions) && std::env::var_os("LOCALNET_DATA_DIR").is_some());
     let identity = identity::LocalIdentity::load_or_create(&app_data_dir, use_keyring)?;
     let storage = storage::Storage::open(&app_data_dir.join("localnet.sqlite3"))?;
-    Ok(AppState::new(storage, identity, app_data_dir))
+    let default_receive_directory = app
+        .path()
+        .download_dir()
+        .unwrap_or_else(|_| app_data_dir.join("received"))
+        .join("Weline Localnet");
+    storage.load_transfer_preferences(&default_receive_directory)?;
+    Ok(AppState::new(storage, identity, default_receive_directory))
 }
 
 fn resolve_app_data_dir<R: tauri::Runtime>(
