@@ -4,7 +4,6 @@ use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
-pub use crate::transfer_policy::LEGACY_MAX_FILE_BYTES as MAX_FILE_BYTES;
 
 pub const MAX_NICKNAME_CHARS: usize = 32;
 pub const MAX_TEXT_BYTES: usize = 16 * 1024;

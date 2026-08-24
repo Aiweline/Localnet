@@ -21,7 +21,7 @@ use crate::{
     network::NetworkCommand,
     receive_paths::{ensure_writable_directory, remove_owned_reservation, reserve_receive_path},
     state::AppState,
-    transfer_manifest::{TransferChunk, build_manifest},
+    transfer_manifest::{TransferChunk, build_manifest_from_snapshot, capture_source_snapshot},
     transfer_policy::{TRANSFER_CHUNK_BYTES, TransferProtocol, select_transfer_protocol},
 };
 
@@ -339,11 +339,12 @@ pub async fn send_file(
         error: None,
         created_at: now,
     };
-    state.storage.upsert_transfer(&transfer)?;
     if transfer.transfer_protocol == TransferProtocol::ResumableV2 as u8 {
         state
             .storage
-            .replace_outgoing_chunks(&transfer.transfer_id, &source.chunks)?;
+            .create_outgoing_transfer_with_manifest(&transfer, &source.chunks)?;
+    } else {
+        state.storage.upsert_transfer(&transfer)?;
     }
     state.storage.insert_message(&message)?;
     if let Err(error) = state
@@ -704,11 +705,8 @@ fn prepare_source(
     capabilities: &[String],
 ) -> Result<PreparedSource, AppError> {
     let path = std::fs::canonicalize(path)?;
-    let metadata = std::fs::metadata(&path)?;
-    if !metadata.is_file() {
-        return Err(AppError::InvalidInput("请选择一个普通文件".to_string()));
-    }
-    let transfer_protocol = select_transfer_protocol(capabilities, metadata.len())?;
+    let source_snapshot = capture_source_snapshot(&path)?;
+    let transfer_protocol = select_transfer_protocol(capabilities, source_snapshot.file_size)?;
     let file_name = path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -723,7 +721,7 @@ fn prepare_source(
     let (file_size, sha256, chunk_size, chunk_count, manifest_sha256, source_modified_ns, chunks) =
         match transfer_protocol {
             TransferProtocol::LegacyV1 => (
-                metadata.len(),
+                source_snapshot.file_size,
                 hash_file(&path)?,
                 0,
                 0,
@@ -732,7 +730,8 @@ fn prepare_source(
                 Vec::new(),
             ),
             TransferProtocol::ResumableV2 => {
-                let manifest = build_manifest(&path, TRANSFER_CHUNK_BYTES)?;
+                let manifest =
+                    build_manifest_from_snapshot(&path, TRANSFER_CHUNK_BYTES, source_snapshot)?;
                 let chunk_count = u32::try_from(manifest.chunks.len())
                     .map_err(|_| AppError::InvalidInput("分块数量超出协议限制".to_string()))?;
                 (

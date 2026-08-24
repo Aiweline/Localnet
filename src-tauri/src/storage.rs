@@ -14,7 +14,10 @@ use crate::{
     },
     error::AppError,
     receive_paths::remove_owned_reservation,
-    transfer_manifest::TransferChunk,
+    transfer_manifest::{
+        TransferChunk, decode_sha256, expected_chunk_count, expected_chunk_length, manifest_root,
+        validate_transfer_metadata,
+    },
 };
 
 #[derive(Clone)]
@@ -358,19 +361,35 @@ impl Storage {
     }
 
     pub fn upsert_transfer(&self, transfer: &TransferRecord) -> Result<(), AppError> {
-        if !matches!(transfer.transfer_protocol, 1 | 2) {
-            return Err(AppError::Storage("传输协议版本无效".to_string()));
-        }
-        validate_optional_sha256(transfer.manifest_sha256.as_deref())?;
-        let source_modified_ns = transfer
-            .source_modified_ns
-            .map(|value| {
-                i64::try_from(value)
-                    .map_err(|_| AppError::Storage("源文件修改时间超出存储范围".to_string()))
-            })
-            .transpose()?;
-        let connection = self.connection()?;
-        connection.execute(
+        let source_modified_ns = validate_transfer_for_storage(transfer)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        Self::upsert_transfer_in_transaction(&transaction, transfer, source_modified_ns)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn create_outgoing_transfer_with_manifest(
+        &self,
+        transfer: &TransferRecord,
+        chunks: &[TransferChunk],
+    ) -> Result<(), AppError> {
+        let source_modified_ns = validate_transfer_for_storage(transfer)?;
+        validate_outgoing_manifest(transfer, chunks)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        Self::upsert_transfer_in_transaction(&transaction, transfer, source_modified_ns)?;
+        replace_chunks_in_transaction(&transaction, &transfer.transfer_id, chunks)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn upsert_transfer_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        transfer: &TransferRecord,
+        source_modified_ns: Option<i64>,
+    ) -> Result<(), AppError> {
+        transaction.execute(
             "INSERT INTO transfers
                (transfer_id, peer_id, direction, kind, file_name, file_size, mime_type, sha256,
                 local_path, destination_reserved, reservation_token, transfer_protocol, chunk_size,
@@ -422,47 +441,25 @@ impl Storage {
         Ok(())
     }
 
+    #[allow(dead_code)] // Public crate API for manifest replacement after later source updates.
     pub fn replace_outgoing_chunks(
         &self,
         transfer_id: &str,
         chunks: &[TransferChunk],
     ) -> Result<(), AppError> {
-        for (expected_index, chunk) in chunks.iter().enumerate() {
-            let expected_index = u32::try_from(expected_index)
-                .map_err(|_| AppError::Storage("分块数量超出协议限制".to_string()))?;
-            if chunk.index != expected_index || chunk.length == 0 {
-                return Err(AppError::Storage("分块索引必须连续且有序".to_string()));
-            }
-        }
-        let chunk_count = i64::try_from(chunks.len())
-            .map_err(|_| AppError::Storage("分块数量超出存储范围".to_string()))?;
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
-        transaction.execute(
-            "DELETE FROM transfer_chunks WHERE transfer_id = ?1",
-            [transfer_id],
+        let metadata = load_manifest_metadata(&transaction, transfer_id)?
+            .ok_or_else(|| AppError::Storage("找不到需要保存分块的传输记录".to_string()))?;
+        validate_stored_manifest_metadata(&metadata, Direction::Outgoing)?;
+        validate_chunk_geometry(
+            metadata.file_size,
+            metadata.chunk_size,
+            metadata.chunk_count,
+            metadata.manifest_sha256.as_deref(),
+            chunks,
         )?;
-        for chunk in chunks {
-            transaction.execute(
-                "INSERT INTO transfer_chunks (transfer_id, chunk_index, chunk_length, sha256)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    transfer_id,
-                    i64::from(chunk.index),
-                    i64::from(chunk.length),
-                    chunk.sha256.as_slice(),
-                ],
-            )?;
-        }
-        if transaction.execute(
-            "UPDATE transfers SET chunk_count = ?2 WHERE transfer_id = ?1",
-            params![transfer_id, chunk_count],
-        )? != 1
-        {
-            return Err(AppError::Storage(
-                "找不到需要保存分块的传输记录".to_string(),
-            ));
-        }
+        replace_chunks_in_transaction(&transaction, transfer_id, chunks)?;
         transaction.commit()?;
         Ok(())
     }
@@ -512,16 +509,16 @@ impl Storage {
             .map_err(|_| AppError::Storage("已接收字节数超出存储范围".to_string()))?;
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
-        let Some((file_size, transferred_bytes)) = transaction
-            .query_row(
-                "SELECT file_size, transferred_bytes FROM transfers WHERE transfer_id = ?1",
-                [transfer_id],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-            )
-            .optional()?
-        else {
+        let Some(metadata) = load_manifest_metadata(&transaction, transfer_id)? else {
             return Ok(false);
         };
+        if metadata.transfer_protocol != 2
+            || validate_stored_manifest_metadata(&metadata, Direction::Incoming).is_err()
+        {
+            return Ok(false);
+        }
+        let file_size = metadata.file_size;
+        let transferred_bytes = metadata.transferred_bytes;
         let (chunk_rows, last_index): (i64, Option<i64>) = transaction.query_row(
             "SELECT COUNT(*), MAX(chunk_index) FROM transfer_chunks WHERE transfer_id = ?1",
             [transfer_id],
@@ -533,18 +530,31 @@ impl Storage {
                 .ok_or_else(|| AppError::Storage("传输分块索引溢出".to_string()))?,
             None => 0,
         };
+        let expected_index_u32 = u32::try_from(expected_index).ok();
         if expected_index != chunk_rows
+            || expected_index_u32.is_none()
             || i64::from(chunk.index) != expected_index
-            || chunk.length == 0
             || file_size < 0
             || transferred_bytes < 0
         {
             return Ok(false);
         }
-        let expected_bytes = transferred_bytes
-            .checked_add(i64::from(chunk.length))
+        let expected_index_u32 = expected_index_u32.expect("checked above");
+        let file_size_u64 = u64::try_from(file_size)
+            .map_err(|_| AppError::Storage("传输文件大小无效".to_string()))?;
+        let expected_length =
+            expected_chunk_length(file_size_u64, metadata.chunk_size, expected_index_u32)
+                .map_err(storage_metadata_error)?;
+        let expected_bytes = u64::from(expected_index_u32)
+            .checked_mul(u64::from(metadata.chunk_size))
+            .and_then(|offset| offset.checked_add(u64::from(expected_length)))
             .ok_or_else(|| AppError::Storage("已接收字节数溢出".to_string()))?;
-        if expected_bytes != committed_bytes || committed_bytes > file_size {
+        if chunk.length != expected_length
+            || i64::try_from(expected_bytes).ok() != Some(committed_bytes)
+            || u64::try_from(transferred_bytes).ok()
+                != expected_bytes.checked_sub(u64::from(expected_length))
+            || committed_bytes > file_size
+        {
             return Ok(false);
         }
         transaction.execute(
@@ -563,6 +573,19 @@ impl Storage {
         )? != 1
         {
             return Err(AppError::Storage("无法更新传输进度".to_string()));
+        }
+        if expected_index_u32 + 1 == metadata.chunk_count {
+            let chunks = list_transfer_chunks_in_transaction(&transaction, transfer_id)?;
+            let expected_root = decode_sha256(
+                metadata
+                    .manifest_sha256
+                    .as_deref()
+                    .ok_or_else(|| AppError::Storage("缺少传输清单哈希".to_string()))?,
+            )
+            .map_err(storage_metadata_error)?;
+            if manifest_root(&chunks) != expected_root {
+                return Err(AppError::IntegrityFailure);
+            }
         }
         transaction.commit()?;
         Ok(true)
@@ -1033,7 +1056,7 @@ impl Storage {
                transfer_id TEXT NOT NULL,
                chunk_index INTEGER NOT NULL,
                chunk_length INTEGER NOT NULL,
-               sha256 BLOB NOT NULL CHECK(length(sha256) = 32),
+               sha256 BLOB NOT NULL CHECK(typeof(sha256) = 'blob' AND length(sha256) = 32),
                PRIMARY KEY (transfer_id, chunk_index),
                FOREIGN KEY (transfer_id) REFERENCES transfers(transfer_id) ON DELETE CASCADE
              );",
@@ -1151,6 +1174,39 @@ impl Storage {
                 [],
             )?;
         }
+        let chunk_table_sql: Option<String> = transaction
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'transfer_chunks'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let requires_chunk_table_rebuild = chunk_table_sql.is_some_and(|sql| {
+            let normalized: String = sql
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect::<String>()
+                .to_ascii_lowercase();
+            !normalized.contains("typeof(sha256)='blob'andlength(sha256)=32")
+        });
+        if requires_chunk_table_rebuild {
+            transaction.execute_batch(
+                "ALTER TABLE transfer_chunks RENAME TO transfer_chunks_legacy;
+                 CREATE TABLE transfer_chunks (
+                   transfer_id TEXT NOT NULL,
+                   chunk_index INTEGER NOT NULL,
+                   chunk_length INTEGER NOT NULL,
+                   sha256 BLOB NOT NULL CHECK(typeof(sha256) = 'blob' AND length(sha256) = 32),
+                   PRIMARY KEY (transfer_id, chunk_index),
+                   FOREIGN KEY (transfer_id) REFERENCES transfers(transfer_id) ON DELETE CASCADE
+                 );
+                 INSERT INTO transfer_chunks (transfer_id, chunk_index, chunk_length, sha256)
+                   SELECT transfer_id, chunk_index, chunk_length, sha256
+                   FROM transfer_chunks_legacy
+                   WHERE typeof(sha256) = 'blob' AND length(sha256) = 32;
+                 DROP TABLE transfer_chunks_legacy;",
+            )?;
+        }
         let has_capabilities_json: i64 = transaction.query_row(
             "SELECT COUNT(*) FROM pragma_table_info('peers')
              WHERE name = 'capabilities_json'",
@@ -1229,22 +1285,226 @@ impl Storage {
     }
 }
 
-fn validate_optional_sha256(value: Option<&str>) -> Result<(), AppError> {
-    let Some(value) = value else {
-        return Ok(());
-    };
-    let hash = hex::decode(value)
-        .map_err(|_| AppError::Storage("传输清单哈希不是有效的十六进制值".to_string()))?;
-    if hash.len() != 32 {
+#[derive(Debug)]
+struct ManifestMetadata {
+    direction: Direction,
+    transfer_protocol: u8,
+    file_size: i64,
+    chunk_size: u32,
+    chunk_count: u32,
+    manifest_sha256: Option<String>,
+    transferred_bytes: i64,
+}
+
+fn validate_transfer_for_storage(transfer: &TransferRecord) -> Result<Option<i64>, AppError> {
+    validate_transfer_metadata(
+        transfer.transfer_protocol,
+        transfer.file_size,
+        transfer.chunk_size,
+        transfer.chunk_count,
+        transfer.manifest_sha256.as_deref(),
+    )
+    .map_err(storage_metadata_error)?;
+    transfer
+        .source_modified_ns
+        .map(|value| {
+            i64::try_from(value)
+                .map_err(|_| AppError::Storage("源文件修改时间超出存储范围".to_string()))
+        })
+        .transpose()
+}
+
+fn validate_outgoing_manifest(
+    transfer: &TransferRecord,
+    chunks: &[TransferChunk],
+) -> Result<(), AppError> {
+    if transfer.direction != Direction::Outgoing {
         return Err(AppError::Storage(
-            "传输清单哈希长度无效，必须为 32 字节".to_string(),
+            "只有发送中的 v2 传输可以保存清单".to_string(),
         ));
+    }
+    if transfer.transfer_protocol != 2 {
+        return Err(AppError::Storage("旧版传输不能保存分块清单".to_string()));
+    }
+    validate_chunk_geometry(
+        i64::try_from(transfer.file_size)
+            .map_err(|_| AppError::Storage("传输文件大小超出存储范围".to_string()))?,
+        transfer.chunk_size,
+        transfer.chunk_count,
+        transfer.manifest_sha256.as_deref(),
+        chunks,
+    )
+}
+
+fn validate_stored_manifest_metadata(
+    metadata: &ManifestMetadata,
+    direction: Direction,
+) -> Result<(), AppError> {
+    if metadata.direction != direction {
+        return Err(AppError::Storage("传输方向不允许此分块操作".to_string()));
+    }
+    if metadata.transfer_protocol != 2 {
+        return Err(AppError::Storage("旧版传输不能执行分块操作".to_string()));
+    }
+    if metadata.file_size < 0 {
+        return Err(AppError::Storage("传输文件大小无效".to_string()));
+    }
+    validate_transfer_metadata(
+        metadata.transfer_protocol,
+        u64::try_from(metadata.file_size)
+            .map_err(|_| AppError::Storage("传输文件大小无效".to_string()))?,
+        metadata.chunk_size,
+        metadata.chunk_count,
+        metadata.manifest_sha256.as_deref(),
+    )
+    .map_err(storage_metadata_error)
+}
+
+fn validate_chunk_geometry(
+    file_size: i64,
+    chunk_size: u32,
+    chunk_count: u32,
+    manifest_sha256: Option<&str>,
+    chunks: &[TransferChunk],
+) -> Result<(), AppError> {
+    let file_size =
+        u64::try_from(file_size).map_err(|_| AppError::Storage("传输文件大小无效".to_string()))?;
+    let expected_count =
+        expected_chunk_count(file_size, chunk_size).map_err(storage_metadata_error)?;
+    if chunk_count != expected_count || usize::try_from(chunk_count).ok() != Some(chunks.len()) {
+        return Err(AppError::Storage("分块数量与传输清单不匹配".to_string()));
+    }
+    let mut total = 0_u64;
+    for (expected_index, chunk) in chunks.iter().enumerate() {
+        let expected_index = u32::try_from(expected_index)
+            .map_err(|_| AppError::Storage("分块数量超出协议限制".to_string()))?;
+        let expected_length = expected_chunk_length(file_size, chunk_size, expected_index)
+            .map_err(storage_metadata_error)?;
+        if chunk.index != expected_index || chunk.length != expected_length {
+            return Err(AppError::Storage("分块索引或长度与清单不匹配".to_string()));
+        }
+        total = total
+            .checked_add(u64::from(chunk.length))
+            .ok_or_else(|| AppError::Storage("分块长度总和溢出".to_string()))?;
+    }
+    if total != file_size {
+        return Err(AppError::Storage(
+            "分块长度总和与文件大小不匹配".to_string(),
+        ));
+    }
+    let expected_root = decode_sha256(
+        manifest_sha256.ok_or_else(|| AppError::Storage("缺少传输清单哈希".to_string()))?,
+    )
+    .map_err(storage_metadata_error)?;
+    if manifest_root(chunks) != expected_root {
+        return Err(AppError::Storage("传输清单根哈希不匹配".to_string()));
     }
     Ok(())
 }
 
+fn replace_chunks_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    transfer_id: &str,
+    chunks: &[TransferChunk],
+) -> Result<(), AppError> {
+    transaction.execute(
+        "DELETE FROM transfer_chunks WHERE transfer_id = ?1",
+        [transfer_id],
+    )?;
+    for chunk in chunks {
+        transaction.execute(
+            "INSERT INTO transfer_chunks (transfer_id, chunk_index, chunk_length, sha256)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                transfer_id,
+                i64::from(chunk.index),
+                i64::from(chunk.length),
+                chunk.sha256.as_slice(),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn load_manifest_metadata(
+    transaction: &rusqlite::Transaction<'_>,
+    transfer_id: &str,
+) -> Result<Option<ManifestMetadata>, AppError> {
+    transaction
+        .query_row(
+            "SELECT direction, transfer_protocol, file_size, chunk_size, chunk_count,
+                    manifest_sha256, transferred_bytes
+             FROM transfers WHERE transfer_id = ?1",
+            [transfer_id],
+            |row| {
+                let direction: String = row.get(0)?;
+                let transfer_protocol: i64 = row.get(1)?;
+                let chunk_size: i64 = row.get(3)?;
+                let chunk_count: i64 = row.get(4)?;
+                Ok(ManifestMetadata {
+                    direction: Direction::from_str(&direction).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?,
+                    transfer_protocol: u8::try_from(transfer_protocol).map_err(|_| {
+                        rusqlite::Error::IntegralValueOutOfRange(1, transfer_protocol)
+                    })?,
+                    file_size: row.get(2)?,
+                    chunk_size: u32::try_from(chunk_size)
+                        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(3, chunk_size))?,
+                    chunk_count: u32::try_from(chunk_count)
+                        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(4, chunk_count))?,
+                    manifest_sha256: row.get(5)?,
+                    transferred_bytes: row.get(6)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn list_transfer_chunks_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    transfer_id: &str,
+) -> Result<Vec<TransferChunk>, AppError> {
+    let mut statement = transaction.prepare(
+        "SELECT chunk_index, chunk_length, sha256 FROM transfer_chunks
+         WHERE transfer_id = ?1 ORDER BY chunk_index ASC",
+    )?;
+    let rows = statement.query_map([transfer_id], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, Vec<u8>>(2)?,
+        ))
+    })?;
+    rows.map(|row| {
+        let (index, length, sha256) = row?;
+        let sha256: [u8; 32] = sha256
+            .try_into()
+            .map_err(|_| AppError::Storage("传输分块哈希长度无效，必须为 32 字节".to_string()))?;
+        Ok(TransferChunk {
+            index: u32::try_from(index)
+                .map_err(|_| AppError::Storage("传输分块索引无效".to_string()))?,
+            length: u32::try_from(length)
+                .map_err(|_| AppError::Storage("传输分块长度无效".to_string()))?,
+            sha256,
+        })
+    })
+    .collect()
+}
+
+fn storage_metadata_error(error: AppError) -> AppError {
+    AppError::Storage(format!("传输元数据无效：{error}"))
+}
+
 fn validate_loaded_optional_sha256(value: Option<String>) -> Result<Option<String>, AppError> {
-    validate_optional_sha256(value.as_deref())?;
+    if let Some(value) = value.as_deref() {
+        decode_sha256(value).map_err(storage_metadata_error)?;
+    }
     Ok(value)
 }
 
@@ -1256,8 +1516,12 @@ mod tests {
 
     use super::Storage;
     use crate::{
-        domain::{PeerSummary, Platform, TransferPreferences, TransferStatus},
-        transfer_manifest::TransferChunk,
+        domain::{
+            Direction, PeerSummary, Platform, TransferKind, TransferPreferences, TransferRecord,
+            TransferStatus,
+        },
+        transfer_manifest::{TransferChunk, manifest_root},
+        transfer_policy::TRANSFER_CHUNK_BYTES,
     };
 
     #[test]
@@ -1424,6 +1688,16 @@ mod tests {
                 .is_err(),
             "chunk hashes must be exactly 32-byte blobs"
         );
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO transfer_chunks (transfer_id, chunk_index, chunk_length, sha256)
+                     VALUES ('valid-transfer', 1, 1, ?1)",
+                    ["x".repeat(32)],
+                )
+                .is_err(),
+            "chunk hashes must be BLOB values, not 32-character TEXT"
+        );
         connection
             .execute_batch("PRAGMA ignore_check_constraints = ON")
             .expect("allow corrupted legacy chunk fixture");
@@ -1449,6 +1723,88 @@ mod tests {
     }
 
     #[test]
+    fn migration_rebuilds_old_chunk_table_with_blob_type_enforcement() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-chunk-table-rebuild-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&fixture).expect("create storage fixture");
+        let database = fixture.join("localnet.sqlite3");
+        {
+            let connection = Connection::open(&database).expect("open legacy database");
+            connection
+                .execute_batch(
+                    "CREATE TABLE transfers (
+                       transfer_id TEXT PRIMARY KEY NOT NULL,
+                       peer_id TEXT NOT NULL,
+                       direction TEXT NOT NULL,
+                       kind TEXT NOT NULL,
+                       file_name TEXT NOT NULL,
+                       file_size INTEGER NOT NULL,
+                       mime_type TEXT NOT NULL,
+                       sha256 TEXT NOT NULL,
+                       local_path TEXT,
+                       transferred_bytes INTEGER NOT NULL DEFAULT 0,
+                       status TEXT NOT NULL,
+                       error TEXT,
+                       created_at TEXT NOT NULL,
+                       updated_at TEXT NOT NULL
+                     );
+                     CREATE TABLE transfer_chunks (
+                       transfer_id TEXT NOT NULL,
+                       chunk_index INTEGER NOT NULL,
+                       chunk_length INTEGER NOT NULL,
+                       sha256 BLOB NOT NULL CHECK(length(sha256) = 32),
+                       PRIMARY KEY (transfer_id, chunk_index)
+                     );
+                     INSERT INTO transfers
+                       VALUES ('legacy-transfer', 'peer-one', 'incoming', 'file', 'report.txt', 1,
+                               'text/plain', '0000000000000000000000000000000000000000000000000000000000000000',
+                               NULL, 0, 'transferring', NULL,
+                               '2026-08-24T00:00:00.000Z', '2026-08-24T00:00:00.000Z');",
+                )
+                .expect("create old chunk table");
+            connection
+                .execute(
+                    "INSERT INTO transfer_chunks VALUES ('legacy-transfer', 0, 1, ?1)",
+                    [[8_u8; 32].as_slice()],
+                )
+                .expect("insert valid legacy chunk");
+        }
+
+        let storage = Storage::open(&database).expect("rebuild old chunk table");
+        assert_eq!(
+            storage
+                .list_transfer_chunks("legacy-transfer")
+                .expect("preserve valid legacy chunk")
+                .len(),
+            1
+        );
+        let connection = storage.connection().expect("inspect rebuilt table");
+        let schema: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'transfer_chunks'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read rebuilt schema");
+        assert!(schema.contains("typeof(sha256)"));
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO transfer_chunks VALUES ('legacy-transfer', 1, 1, ?1)",
+                    ["x".repeat(32)],
+                )
+                .is_err(),
+            "rebuilt table must reject 32-character text"
+        );
+
+        drop(connection);
+        drop(storage);
+        fs::remove_dir_all(fixture).expect("remove storage fixture");
+    }
+
+    #[test]
     fn committed_chunk_advances_progress_only_after_matching_chunk_is_persisted() {
         let fixture = std::env::temp_dir().join(format!(
             "weline-localnet-transfer-chunk-commit-{}",
@@ -1456,34 +1812,10 @@ mod tests {
         ));
         fs::create_dir_all(&fixture).expect("create storage fixture");
         let database = fixture.join("localnet.sqlite3");
-        let storage = Storage::open(&database).expect("open storage");
-        {
-            let connection = storage.connection().expect("insert transfer fixture");
-            connection
-                .execute(
-                    "INSERT INTO transfers
-                       (transfer_id, peer_id, direction, kind, file_name, file_size, mime_type,
-                        sha256, transferred_bytes, status, created_at, updated_at)
-                     VALUES ('transfer-one', 'peer-one', 'incoming', 'file', 'report.txt', 5,
-                             'text/plain', ?1, 0, 'transferring', ?2, ?2)",
-                    rusqlite::params!["0".repeat(64), "2026-08-24T00:00:00.000Z"],
-                )
-                .expect("insert transfer fixture");
-            connection
-                .execute(
-                    "INSERT INTO transfers
-                       (transfer_id, peer_id, direction, kind, file_name, file_size, mime_type,
-                        sha256, transferred_bytes, status, created_at, updated_at)
-                     VALUES ('outgoing-one', 'peer-one', 'outgoing', 'file', 'report.txt', 5,
-                             'text/plain', ?1, 0, 'awaitingAcceptance', ?2, ?2)",
-                    rusqlite::params!["0".repeat(64), "2026-08-24T00:00:00.000Z"],
-                )
-                .expect("insert outgoing transfer fixture");
-        }
         let chunks = vec![
             TransferChunk {
                 index: 0,
-                length: 3,
+                length: TRANSFER_CHUNK_BYTES,
                 sha256: [1; 32],
             },
             TransferChunk {
@@ -1492,6 +1824,48 @@ mod tests {
                 sha256: [2; 32],
             },
         ];
+        let manifest_sha256 = hex::encode(manifest_root(&chunks));
+        let storage = Storage::open(&database).expect("open storage");
+        {
+            let connection = storage.connection().expect("insert transfer fixture");
+            connection
+                .execute(
+                    "INSERT INTO transfers
+                       (transfer_id, peer_id, direction, kind, file_name, file_size, mime_type,
+                        sha256, transferred_bytes, status, created_at, updated_at)
+                     VALUES ('transfer-one', 'peer-one', 'incoming', 'file', 'report.txt', ?1,
+                             'text/plain', ?2, 0, 'transferring', ?3, ?3)",
+                    rusqlite::params![
+                        i64::from(TRANSFER_CHUNK_BYTES) + 2,
+                        "0".repeat(64),
+                        "2026-08-24T00:00:00.000Z"
+                    ],
+                )
+                .expect("insert transfer fixture");
+            connection
+                .execute(
+                    "INSERT INTO transfers
+                       (transfer_id, peer_id, direction, kind, file_name, file_size, mime_type,
+                        sha256, transferred_bytes, status, created_at, updated_at)
+                     VALUES ('outgoing-one', 'peer-one', 'outgoing', 'file', 'report.txt', ?1,
+                             'text/plain', ?2, 0, 'awaitingAcceptance', ?3, ?3)",
+                    rusqlite::params![
+                        i64::from(TRANSFER_CHUNK_BYTES) + 2,
+                        "0".repeat(64),
+                        "2026-08-24T00:00:00.000Z"
+                    ],
+                )
+                .expect("insert outgoing transfer fixture");
+            connection
+                .execute(
+                    "UPDATE transfers
+                     SET transfer_protocol = 2, chunk_size = ?1, chunk_count = 2,
+                         manifest_sha256 = ?2
+                     WHERE transfer_id IN ('transfer-one', 'outgoing-one')",
+                    rusqlite::params![TRANSFER_CHUNK_BYTES, manifest_sha256],
+                )
+                .expect("configure v2 transfer fixtures");
+        }
         storage
             .replace_outgoing_chunks("outgoing-one", &chunks)
             .expect("persist chunks");
@@ -1511,13 +1885,13 @@ mod tests {
                         length: 2,
                         sha256: [2; 32],
                     },
-                    5,
+                    u64::from(TRANSFER_CHUNK_BYTES) + 2,
                 )
                 .expect("reject out-of-order chunk")
         );
         assert!(
             storage
-                .commit_received_chunk("transfer-one", &chunks[0], 3)
+                .commit_received_chunk("transfer-one", &chunks[0], u64::from(TRANSFER_CHUNK_BYTES))
                 .expect("commit first chunk")
         );
         assert!(
@@ -1529,7 +1903,7 @@ mod tests {
                         length: 2,
                         sha256: [9; 32],
                     },
-                    4,
+                    u64::from(TRANSFER_CHUNK_BYTES) + 1,
                 )
                 .expect("reject mismatched committed offset")
         );
@@ -1544,9 +1918,151 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .expect("read committed progress");
-        assert_eq!(progress, (3, 1));
+        assert_eq!(progress, (i64::from(TRANSFER_CHUNK_BYTES), 1));
 
         drop(connection);
+        drop(storage);
+        fs::remove_dir_all(fixture).expect("remove storage fixture");
+    }
+
+    #[test]
+    fn v2_chunk_storage_rejects_legacy_direction_and_geometry_mismatches() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-v2-chunk-boundaries-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&fixture).expect("create storage fixture");
+        let database = fixture.join("localnet.sqlite3");
+        let storage = Storage::open(&database).expect("open storage");
+        let connection = storage.connection().expect("insert transfer fixtures");
+        connection
+            .execute_batch(
+                "INSERT INTO transfers
+                   (transfer_id, peer_id, direction, kind, file_name, file_size, mime_type,
+                    sha256, transferred_bytes, status, created_at, updated_at)
+                 VALUES
+                   ('legacy-outgoing', 'peer-one', 'outgoing', 'file', 'legacy.txt', 1,
+                    'text/plain', '0000000000000000000000000000000000000000000000000000000000000000',
+                    0, 'awaitingAcceptance', '2026-08-24T00:00:00.000Z', '2026-08-24T00:00:00.000Z'),
+                   ('legacy-incoming', 'peer-one', 'incoming', 'file', 'legacy.txt', 1,
+                    'text/plain', '0000000000000000000000000000000000000000000000000000000000000000',
+                    0, 'transferring', '2026-08-24T00:00:00.000Z', '2026-08-24T00:00:00.000Z'),
+                   ('v2-outgoing', 'peer-one', 'outgoing', 'file', 'v2.txt', 4194304,
+                    'text/plain', '0000000000000000000000000000000000000000000000000000000000000000',
+                    0, 'awaitingAcceptance', '2026-08-24T00:00:00.000Z', '2026-08-24T00:00:00.000Z');
+                 UPDATE transfers SET transfer_protocol = 2, chunk_size = 4194304, chunk_count = 1,
+                    manifest_sha256 = '0000000000000000000000000000000000000000000000000000000000000000'
+                  WHERE transfer_id = 'v2-outgoing';",
+            )
+            .expect("insert fixtures");
+        drop(connection);
+
+        assert!(
+            storage
+                .replace_outgoing_chunks("legacy-outgoing", &[])
+                .is_err()
+        );
+        assert!(
+            !storage
+                .commit_received_chunk(
+                    "legacy-incoming",
+                    &TransferChunk {
+                        index: 0,
+                        length: 1,
+                        sha256: [1; 32],
+                    },
+                    1,
+                )
+                .expect("legacy commit rejection")
+        );
+        assert!(
+            !storage
+                .commit_received_chunk(
+                    "v2-outgoing",
+                    &TransferChunk {
+                        index: 0,
+                        length: TRANSFER_CHUNK_BYTES,
+                        sha256: [1; 32],
+                    },
+                    u64::from(TRANSFER_CHUNK_BYTES),
+                )
+                .expect("outgoing commit rejection")
+        );
+        assert!(
+            storage
+                .replace_outgoing_chunks(
+                    "v2-outgoing",
+                    &[TransferChunk {
+                        index: 0,
+                        length: 1,
+                        sha256: [1; 32],
+                    }],
+                )
+                .is_err()
+        );
+
+        drop(storage);
+        fs::remove_dir_all(fixture).expect("remove storage fixture");
+    }
+
+    #[test]
+    fn failed_outgoing_manifest_creation_leaves_no_partial_v2_transfer_row() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-v2-manifest-atomicity-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&fixture).expect("create storage fixture");
+        let database = fixture.join("localnet.sqlite3");
+        let storage = Storage::open(&database).expect("open storage");
+        let expected = TransferChunk {
+            index: 0,
+            length: TRANSFER_CHUNK_BYTES,
+            sha256: [3; 32],
+        };
+        let transfer = TransferRecord {
+            transfer_id: "atomic-v2".to_string(),
+            peer_id: "peer-one".to_string(),
+            direction: Direction::Outgoing,
+            kind: TransferKind::File,
+            file_name: "report.txt".to_string(),
+            file_size: u64::from(TRANSFER_CHUNK_BYTES),
+            mime_type: "text/plain".to_string(),
+            sha256: "0".repeat(64),
+            local_path: None,
+            destination_reserved: false,
+            reservation_token: None,
+            transfer_protocol: 2,
+            chunk_size: TRANSFER_CHUNK_BYTES,
+            chunk_count: 1,
+            manifest_sha256: Some(hex::encode(manifest_root(&[expected.clone()]))),
+            partial_path: None,
+            source_modified_ns: Some(1),
+            send_claimed: false,
+            transferred_bytes: 0,
+            status: TransferStatus::AwaitingAcceptance,
+            error: None,
+            created_at: "2026-08-24T00:00:00.000Z".to_string(),
+            updated_at: "2026-08-24T00:00:00.000Z".to_string(),
+        };
+
+        assert!(
+            storage
+                .create_outgoing_transfer_with_manifest(
+                    &transfer,
+                    &[TransferChunk {
+                        length: 1,
+                        ..expected
+                    }],
+                )
+                .is_err()
+        );
+        assert!(
+            storage
+                .get_transfer("atomic-v2")
+                .expect("query transfer")
+                .is_none()
+        );
+
         drop(storage);
         fs::remove_dir_all(fixture).expect("remove storage fixture");
     }

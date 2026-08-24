@@ -7,7 +7,12 @@ use std::{
 
 use sha2::{Digest, Sha256};
 
-use crate::error::AppError;
+use crate::{
+    error::AppError,
+    transfer_policy::{
+        FILE_RESUME_V2_CAPABILITY, TRANSFER_CHUNK_BYTES, TransferProtocol, select_transfer_protocol,
+    },
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransferChunk {
@@ -25,16 +30,46 @@ pub struct TransferManifest {
     pub source_modified_ns: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceSnapshot {
+    pub file_size: u64,
+    pub source_modified_ns: u64,
+}
+
+#[allow(dead_code)] // Public crate API for callers that do not preselect a source snapshot.
 pub fn build_manifest(path: &Path, chunk_size: u32) -> Result<TransferManifest, AppError> {
+    let snapshot = capture_source_snapshot(path)?;
+    build_manifest_from_snapshot(path, chunk_size, snapshot)
+}
+
+pub fn capture_source_snapshot(path: &Path) -> Result<SourceSnapshot, AppError> {
+    let metadata = fs::metadata(path)?;
+    if !metadata.is_file() {
+        return Err(AppError::InvalidInput("请选择一个普通文件".to_string()));
+    }
+    Ok(SourceSnapshot {
+        file_size: metadata.len(),
+        source_modified_ns: source_modified_ns(&metadata)?,
+    })
+}
+
+pub fn build_manifest_from_snapshot(
+    path: &Path,
+    chunk_size: u32,
+    expected: SourceSnapshot,
+) -> Result<TransferManifest, AppError> {
     if chunk_size == 0 {
         return Err(AppError::InvalidInput("分块大小必须大于零".to_string()));
     }
     let initial_metadata = fs::metadata(path)?;
-    if !initial_metadata.is_file() {
-        return Err(AppError::InvalidInput("请选择一个普通文件".to_string()));
+    if !initial_metadata.is_file()
+        || initial_metadata.len() != expected.file_size
+        || source_modified_ns(&initial_metadata)? != expected.source_modified_ns
+    {
+        return Err(source_changed_error());
     }
-    let file_size = initial_metadata.len();
-    let initial_modified_ns = source_modified_ns(&initial_metadata)?;
+    let file_size = expected.file_size;
+    let initial_modified_ns = expected.source_modified_ns;
     let chunk_count = chunk_count(file_size, chunk_size)?;
     let buffer_len = usize::try_from(chunk_size)
         .map_err(|_| AppError::InvalidInput("分块大小超出当前平台限制".to_string()))?;
@@ -73,12 +108,11 @@ pub fn build_manifest(path: &Path, chunk_size: u32) -> Result<TransferManifest, 
     }
 
     let final_metadata = fs::metadata(path)?;
-    if final_metadata.len() != file_size
+    if !final_metadata.is_file()
+        || final_metadata.len() != file_size
         || source_modified_ns(&final_metadata)? != initial_modified_ns
     {
-        return Err(AppError::InvalidInput(
-            "源文件在准备传输时发生了变化，请重试".to_string(),
-        ));
+        return Err(source_changed_error());
     }
     Ok(TransferManifest {
         file_size,
@@ -99,7 +133,10 @@ pub fn manifest_root(chunks: &[TransferChunk]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-fn chunk_count(file_size: u64, chunk_size: u32) -> Result<u32, AppError> {
+pub fn expected_chunk_count(file_size: u64, chunk_size: u32) -> Result<u32, AppError> {
+    if chunk_size == 0 {
+        return Err(AppError::InvalidInput("分块大小必须大于零".to_string()));
+    }
     let chunk_size = u64::from(chunk_size);
     let count = if file_size == 0 {
         0
@@ -111,6 +148,88 @@ fn chunk_count(file_size: u64, chunk_size: u32) -> Result<u32, AppError> {
             .ok_or_else(|| AppError::InvalidInput("分块数量溢出".to_string()))?
     };
     u32::try_from(count).map_err(|_| AppError::InvalidInput("分块数量超出协议限制".to_string()))
+}
+
+pub fn expected_chunk_length(file_size: u64, chunk_size: u32, index: u32) -> Result<u32, AppError> {
+    let count = expected_chunk_count(file_size, chunk_size)?;
+    if index >= count {
+        return Err(AppError::InvalidInput("分块索引超出文件范围".to_string()));
+    }
+    if index + 1 < count {
+        return Ok(chunk_size);
+    }
+    let offset = u64::from(index)
+        .checked_mul(u64::from(chunk_size))
+        .ok_or_else(|| AppError::InvalidInput("分块偏移量溢出".to_string()))?;
+    u32::try_from(
+        file_size
+            .checked_sub(offset)
+            .ok_or_else(|| AppError::InvalidInput("分块偏移量无效".to_string()))?,
+    )
+    .map_err(|_| AppError::InvalidInput("分块长度超出协议限制".to_string()))
+}
+
+pub fn validate_transfer_metadata(
+    transfer_protocol: u8,
+    file_size: u64,
+    chunk_size: u32,
+    chunk_count: u32,
+    manifest_sha256: Option<&str>,
+) -> Result<(), AppError> {
+    let protocol = match transfer_protocol {
+        value if value == TransferProtocol::LegacyV1 as u8 => TransferProtocol::LegacyV1,
+        value if value == TransferProtocol::ResumableV2 as u8 => TransferProtocol::ResumableV2,
+        _ => return Err(AppError::InvalidInput("传输协议版本无效".to_string())),
+    };
+    let capabilities = match protocol {
+        TransferProtocol::LegacyV1 => Vec::new(),
+        TransferProtocol::ResumableV2 => vec![FILE_RESUME_V2_CAPABILITY.to_string()],
+    };
+    if select_transfer_protocol(&capabilities, file_size)? != protocol {
+        return Err(AppError::InvalidInput(
+            "传输协议与文件大小不匹配".to_string(),
+        ));
+    }
+    match protocol {
+        TransferProtocol::LegacyV1 => {
+            if chunk_size != 0 || chunk_count != 0 || manifest_sha256.is_some() {
+                return Err(AppError::InvalidInput(
+                    "旧版传输不能携带分块清单元数据".to_string(),
+                ));
+            }
+        }
+        TransferProtocol::ResumableV2 => {
+            if chunk_size != TRANSFER_CHUNK_BYTES {
+                return Err(AppError::InvalidInput("分块大小与协议不匹配".to_string()));
+            }
+            if chunk_count != expected_chunk_count(file_size, chunk_size)? {
+                return Err(AppError::InvalidInput(
+                    "分块数量与文件大小不匹配".to_string(),
+                ));
+            }
+            decode_sha256(
+                manifest_sha256
+                    .ok_or_else(|| AppError::InvalidInput("缺少传输清单哈希".to_string()))?,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+pub fn decode_sha256(value: &str) -> Result<[u8; 32], AppError> {
+    let bytes = hex::decode(value)
+        .map_err(|_| AppError::InvalidInput("哈希不是有效的十六进制值".to_string()))?;
+    bytes
+        .try_into()
+        .map_err(|_| AppError::InvalidInput("哈希长度无效，必须为 32 字节".to_string()))
+}
+
+fn chunk_count(file_size: u64, chunk_size: u32) -> Result<u32, AppError> {
+    expected_chunk_count(file_size, chunk_size)
+}
+
+fn source_changed_error() -> AppError {
+    AppError::InvalidInput("源文件在准备传输时发生了变化，请重试".to_string())
 }
 
 fn source_modified_ns(metadata: &Metadata) -> Result<u64, AppError> {
@@ -126,7 +245,10 @@ fn source_modified_ns(metadata: &Metadata) -> Result<u64, AppError> {
 mod tests {
     use std::fs;
 
-    use super::{build_manifest, chunk_count, manifest_root};
+    use super::{
+        build_manifest, build_manifest_from_snapshot, capture_source_snapshot, chunk_count,
+        manifest_root,
+    };
 
     fn fixture_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -192,5 +314,19 @@ mod tests {
         let error = chunk_count(u64::from(u32::MAX) + 1, 1).expect_err("must reject overflow");
 
         assert!(error.to_string().contains("分块数量"));
+    }
+
+    #[test]
+    fn rejects_a_source_changed_after_the_selection_snapshot() {
+        let path = fixture_path("changed-after-selection");
+        fs::write(&path, b"before").expect("write initial fixture");
+        let snapshot = capture_source_snapshot(&path).expect("capture selection snapshot");
+        fs::write(&path, b"after-change").expect("mutate fixture before hashing");
+
+        let error = build_manifest_from_snapshot(&path, 3, snapshot)
+            .expect_err("changed source must not be hashed against a stale decision");
+
+        assert!(error.to_string().contains("发生了变化"));
+        fs::remove_file(path).expect("remove fixture");
     }
 }

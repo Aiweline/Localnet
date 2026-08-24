@@ -27,9 +27,8 @@ use super::{
 use crate::{
     domain::{
         ChatMessage, Direction, Friend, FriendRequest, FriendRequestStatus, LocalProfile,
-        MAX_FILE_BYTES, MessageKind, MessageStatus, PROTOCOL_VERSION, PeerSummary, Platform,
-        TransferPreferences, TransferRecord, TransferStatus, now_rfc3339, validate_nickname,
-        validate_text,
+        MessageKind, MessageStatus, PROTOCOL_VERSION, PeerSummary, Platform, TransferPreferences,
+        TransferRecord, TransferStatus, now_rfc3339, validate_nickname, validate_text,
     },
     error::AppError,
     identity::LocalIdentity,
@@ -38,6 +37,7 @@ use crate::{
         ensure_writable_directory, remove_owned_reservation, reserve_available_receive_path,
     },
     storage::Storage,
+    transfer_manifest::validate_transfer_metadata,
     transfer_policy::FILE_RESUME_V2_CAPABILITY,
 };
 
@@ -1205,9 +1205,13 @@ pub(super) fn emit_event(app_handle: &AppHandle, event: &NetworkEvent) {
 fn validate_transfer_offer(offer: &TransferOffer) -> Result<(), AppError> {
     uuid::Uuid::parse_str(&offer.transfer_id)
         .map_err(|_| AppError::InvalidInput("文件传输编号无效".to_string()))?;
-    if offer.file_size > MAX_FILE_BYTES {
-        return Err(AppError::InvalidInput("文件大小超出允许范围".to_string()));
-    }
+    validate_transfer_metadata(
+        offer.transfer_protocol,
+        offer.file_size,
+        offer.chunk_size,
+        offer.chunk_count,
+        offer.manifest_sha256.as_deref(),
+    )?;
     if offer.file_name.trim().is_empty()
         || offer.file_name.chars().count() > 255
         || offer.file_name.chars().any(char::is_control)
@@ -1234,4 +1238,49 @@ fn automatic_receive_path(
     let path =
         reserve_available_receive_path(&directory, file_name, transfer_id, &reservation_token)?;
     Ok((path, reservation_token))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_transfer_offer;
+    use crate::{
+        domain::TransferKind,
+        protocol::TransferOffer,
+        transfer_policy::{TRANSFER_CHUNK_BYTES, TransferProtocol},
+    };
+
+    fn v2_offer() -> TransferOffer {
+        TransferOffer {
+            transfer_id: "018e6d7d-21ff-7cc7-9fdd-110f5b0d0b11".to_string(),
+            kind: TransferKind::File,
+            file_name: "report.txt".to_string(),
+            file_size: u64::from(TRANSFER_CHUNK_BYTES),
+            mime_type: "text/plain".to_string(),
+            sha256: "0".repeat(64),
+            transfer_protocol: TransferProtocol::ResumableV2 as u8,
+            chunk_size: TRANSFER_CHUNK_BYTES,
+            chunk_count: 1,
+            manifest_sha256: Some("1".repeat(64)),
+        }
+    }
+
+    #[test]
+    fn rejects_untrusted_v2_offer_metadata_before_persistence() {
+        let mut offer = v2_offer();
+        offer.chunk_size = 1024;
+
+        assert!(validate_transfer_offer(&offer).is_err());
+
+        offer.chunk_size = TRANSFER_CHUNK_BYTES;
+        offer.manifest_sha256 = None;
+        assert!(validate_transfer_offer(&offer).is_err());
+    }
+
+    #[test]
+    fn rejects_legacy_offers_with_v2_metadata_shape() {
+        let mut offer = v2_offer();
+        offer.transfer_protocol = TransferProtocol::LegacyV1 as u8;
+
+        assert!(validate_transfer_offer(&offer).is_err());
+    }
 }
