@@ -10,18 +10,22 @@ use sha2::{Digest, Sha256};
 use tauri::AppHandle;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-use super::runtime::{NetworkEvent, emit_event};
+use super::{
+    resumable_transfer::{receive_acknowledged_chunks, send_acknowledged_chunks},
+    runtime::{NetworkEvent, emit_event},
+};
 use crate::{
     domain::{
         ChatMessage, Direction, MessageKind, MessageStatus, TransferRecord, TransferStatus,
         now_rfc3339,
     },
     error::AppError,
-    protocol::{FILE_PROTOCOL, TransferStreamHeader},
+    protocol::{FILE_PROTOCOL, FILE_PROTOCOL_V2, TransferStreamHeader},
     receive_paths::{
         commit_without_overwrite, finalize_reserved_receive, remove_owned_reservation,
     },
     storage::Storage,
+    transfer_policy::TransferProtocol,
 };
 
 const BUFFER_SIZE: usize = 64 * 1024;
@@ -42,6 +46,28 @@ pub fn spawn_incoming_transfers(
             tauri::async_runtime::spawn(async move {
                 if let Err(error) = receive_transfer(peer_id, stream, storage, app_handle).await {
                     tracing::warn!(peer_id = %peer_id, %error, "incoming transfer failed");
+                }
+            });
+        }
+    });
+}
+
+// Task 7 registers this entry point on the separately accepted v2 protocol stream.
+#[allow(dead_code)]
+pub fn spawn_incoming_resumable_transfers(
+    mut incoming: libp2p_stream::IncomingStreams,
+    storage: Storage,
+    app_handle: AppHandle,
+) {
+    tauri::async_runtime::spawn(async move {
+        while let Some((peer_id, stream)) = incoming.next().await {
+            let storage = storage.clone();
+            let app_handle = app_handle.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) =
+                    receive_resumable_transfer(peer_id, stream, storage, app_handle).await
+                {
+                    tracing::warn!(peer_id = %peer_id, %error, "incoming resumable transfer failed");
                 }
             });
         }
@@ -147,6 +173,24 @@ async fn send_transfer(
     storage: &Storage,
     app_handle: &AppHandle,
 ) -> Result<(), AppError> {
+    match transfer.transfer_protocol {
+        value if value == TransferProtocol::LegacyV1 as u8 => {
+            send_legacy_transfer(control, peer_id, transfer, storage, app_handle).await
+        }
+        value if value == TransferProtocol::ResumableV2 as u8 => {
+            send_resumable_transfer(control, peer_id, transfer, storage, app_handle).await
+        }
+        _ => Err(AppError::InvalidInput("文件传输协议版本无效".to_string())),
+    }
+}
+
+async fn send_legacy_transfer(
+    control: &mut libp2p_stream::Control,
+    peer_id: PeerId,
+    transfer: &TransferRecord,
+    storage: &Storage,
+    app_handle: &AppHandle,
+) -> Result<(), AppError> {
     let source_path = transfer
         .local_path
         .as_deref()
@@ -159,6 +203,9 @@ async fn send_transfer(
         .map_err(|error| AppError::Network(format!("无法建立文件传输流：{error}")))?;
     let header = serde_json::to_vec(&TransferStreamHeader {
         transfer_id: transfer.transfer_id.clone(),
+        version: 1,
+        start_offset: 0,
+        chunk_size: 0,
     })
     .map_err(|error| AppError::Network(format!("无法编码文件传输头：{error}")))?;
     let header_size =
@@ -204,6 +251,48 @@ async fn send_transfer(
     if acknowledgement[0] != 1 {
         return Err(AppError::IntegrityFailure);
     }
+    stream.close().await?;
+    complete_outgoing(storage, app_handle, transfer.clone())
+}
+
+async fn send_resumable_transfer(
+    control: &mut libp2p_stream::Control,
+    peer_id: PeerId,
+    transfer: &TransferRecord,
+    storage: &Storage,
+    app_handle: &AppHandle,
+) -> Result<(), AppError> {
+    let source_path = transfer
+        .local_path
+        .as_deref()
+        .map(PathBuf::from)
+        .ok_or_else(|| AppError::Io(std::io::Error::other("发送文件路径缺失")))?;
+    let chunks = storage.list_transfer_chunks(&transfer.transfer_id)?;
+    let mut stream = control
+        .open_stream(peer_id, StreamProtocol::new(FILE_PROTOCOL_V2))
+        .await
+        .map_err(|error| AppError::Network(format!("无法建立可恢复文件传输流：{error}")))?;
+    let header = serde_json::to_vec(&TransferStreamHeader {
+        transfer_id: transfer.transfer_id.clone(),
+        version: TransferProtocol::ResumableV2 as u16,
+        start_offset: transfer.transferred_bytes,
+        chunk_size: transfer.chunk_size,
+    })
+    .map_err(|error| AppError::Network(format!("无法编码可恢复文件传输头：{error}")))?;
+    let header_size =
+        u32::try_from(header.len()).map_err(|_| AppError::Network("文件传输头过大".to_string()))?;
+    stream.write_all(&header_size.to_be_bytes()).await?;
+    stream.write_all(&header).await?;
+
+    send_acknowledged_chunks(
+        &mut stream,
+        &source_path,
+        transfer,
+        &chunks,
+        transfer.transferred_bytes,
+        |acknowledged_offset| update_progress(storage, app_handle, transfer, acknowledged_offset),
+    )
+    .await?;
     stream.close().await?;
     complete_outgoing(storage, app_handle, transfer.clone())
 }
@@ -274,6 +363,171 @@ async fn receive_transfer(
     }
     stream.write_all(&[1]).await?;
     stream.close().await?;
+    Ok(())
+}
+
+async fn receive_resumable_transfer(
+    peer_id: PeerId,
+    mut stream: libp2p::swarm::Stream,
+    storage: Storage,
+    app_handle: AppHandle,
+) -> Result<(), AppError> {
+    let mut header_size = [0_u8; 4];
+    tokio::time::timeout(STREAM_IDLE_TIMEOUT, stream.read_exact(&mut header_size))
+        .await
+        .map_err(|_| AppError::Network("可恢复文件传输连接等待超时".to_string()))??;
+    let header_size = usize::try_from(u32::from_be_bytes(header_size))
+        .map_err(|_| AppError::InvalidInput("文件传输头长度超出当前平台限制".to_string()))?;
+    if header_size == 0 || header_size > MAX_HEADER_BYTES {
+        return Err(AppError::InvalidInput("文件传输头无效".to_string()));
+    }
+    let mut header = vec![0_u8; header_size];
+    tokio::time::timeout(STREAM_IDLE_TIMEOUT, stream.read_exact(&mut header))
+        .await
+        .map_err(|_| AppError::Network("可恢复文件传输头等待超时".to_string()))??;
+    let header: TransferStreamHeader = serde_json::from_slice(&header)
+        .map_err(|error| AppError::InvalidInput(format!("无法读取可恢复文件传输头：{error}")))?;
+    if header.version != TransferProtocol::ResumableV2 as u16 {
+        return Err(AppError::InvalidInput(
+            "可恢复文件传输头版本无效".to_string(),
+        ));
+    }
+    let transfer = storage
+        .get_transfer(&header.transfer_id)?
+        .ok_or_else(|| AppError::Permission("未找到已接受的可恢复文件传输".to_string()))?;
+    if transfer.peer_id != peer_id.to_string()
+        || transfer.direction != Direction::Incoming
+        || transfer.status != TransferStatus::Transferring
+        || transfer.transfer_protocol != TransferProtocol::ResumableV2 as u8
+        || header.chunk_size != transfer.chunk_size
+        || header.start_offset != transfer.transferred_bytes
+        || !storage.is_friend(&transfer.peer_id)?
+    {
+        return Err(AppError::Permission(
+            "该可恢复文件传输未获授权或恢复几何信息无效".to_string(),
+        ));
+    }
+    if !storage.try_claim_incoming_transfer(&transfer.transfer_id, &transfer.peer_id)? {
+        return Err(AppError::Permission(
+            "该文件传输已有接收连接，重复连接已拒绝".to_string(),
+        ));
+    }
+
+    let result = receive_resumable_body(
+        &mut stream,
+        &storage,
+        &app_handle,
+        &transfer,
+        header.start_offset,
+    )
+    .await;
+    if let Err(error) = storage.release_incoming_transfer_claim(&transfer.transfer_id) {
+        tracing::warn!(
+            transfer_id = %transfer.transfer_id,
+            %error,
+            "failed to release resumable incoming transfer claim"
+        );
+    }
+    if let Err(error) = result {
+        let _ = stream.close().await;
+        return Err(error);
+    }
+    stream.close().await?;
+    Ok(())
+}
+
+async fn receive_resumable_body(
+    stream: &mut libp2p::swarm::Stream,
+    storage: &Storage,
+    app_handle: &AppHandle,
+    transfer: &TransferRecord,
+    start_offset: u64,
+) -> Result<(), AppError> {
+    let destination = transfer
+        .local_path
+        .as_deref()
+        .map(PathBuf::from)
+        .ok_or_else(|| AppError::Permission("接收文件尚未选择保存位置".to_string()))?;
+    let partial = transfer
+        .partial_path
+        .as_deref()
+        .map(PathBuf::from)
+        .ok_or_else(|| AppError::Permission("可恢复文件缺少部分文件路径".to_string()))?;
+    let partial_parent = partial
+        .parent()
+        .ok_or_else(|| AppError::InvalidInput("部分文件保存位置无效".to_string()))?;
+    tokio::fs::create_dir_all(partial_parent).await?;
+    let file = tokio::fs::OpenOptions::new()
+        .create(start_offset == 0)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&partial)
+        .await?;
+    if file.metadata().await?.len() != start_offset {
+        return Err(AppError::InvalidInput(
+            "部分文件长度与已提交恢复偏移量不一致".to_string(),
+        ));
+    }
+
+    let transfer_id = transfer.transfer_id.clone();
+    let storage_for_finalize = storage.clone();
+    let app_for_finalize = app_handle.clone();
+    let transfer_for_finalize = transfer.clone();
+    let partial_for_finalize = partial.clone();
+    let destination_for_finalize = destination.clone();
+    receive_acknowledged_chunks(
+        stream,
+        file,
+        transfer,
+        start_offset,
+        |chunk, committed_bytes| {
+            storage.commit_received_chunk(&transfer_id, chunk, committed_bytes)
+        },
+        move || async move {
+            let file_name = destination_for_finalize
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or(&transfer_for_finalize.file_name)
+                .to_string();
+            let transfer_id = transfer_for_finalize.transfer_id.clone();
+            let destination_reserved = transfer_for_finalize.destination_reserved;
+            let reservation_token = transfer_for_finalize.reservation_token.clone();
+            let partial_for_commit = partial_for_finalize.clone();
+            let destination_for_commit = destination_for_finalize.clone();
+            let completed_path = tokio::task::spawn_blocking(move || {
+                if destination_reserved {
+                    let token = reservation_token.as_deref().ok_or_else(|| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, "接收文件占位凭据缺失")
+                    })?;
+                    finalize_reserved_receive(
+                        &partial_for_commit,
+                        &destination_for_commit,
+                        &file_name,
+                        &transfer_id,
+                        token,
+                    )
+                } else {
+                    commit_without_overwrite(&partial_for_commit, &destination_for_commit)?;
+                    Ok(crate::receive_paths::FinalizedReceive {
+                        path: destination_for_commit,
+                        reservation_released: true,
+                    })
+                }
+            })
+            .await
+            .map_err(|error| AppError::Io(std::io::Error::other(error.to_string())))??;
+            let mut completed = transfer_for_finalize;
+            completed.local_path = Some(completed_path.path.to_string_lossy().into_owned());
+            completed.partial_path = None;
+            completed.destination_reserved = !completed_path.reservation_released;
+            if completed_path.reservation_released {
+                completed.reservation_token = None;
+            }
+            complete_incoming(&storage_for_finalize, &app_for_finalize, completed)
+        },
+    )
+    .await?;
     Ok(())
 }
 
