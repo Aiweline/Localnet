@@ -19,6 +19,7 @@ pub fn run() {
     let allow_multiple = cfg!(debug_assertions) && std::env::var_os("LOCALNET_DATA_DIR").is_some();
     let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init());
 
     if !allow_multiple {

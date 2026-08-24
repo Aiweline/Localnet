@@ -2,10 +2,12 @@ import { StrictMode, useCallback, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open, save } from "@tauri-apps/plugin-dialog";
+import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { openPath } from "@tauri-apps/plugin-opener";
 import {
-  AlertCircle, Check, CheckCheck, ChevronRight, CircleUserRound, File, FileDown,
+  AlertCircle, BellRing, Check, CheckCheck, ChevronRight, CircleUserRound, File, FileDown,
   Image as ImageIcon, LoaderCircle, MessageCircleMore, Monitor, Paperclip, RefreshCw,
   Search, Send, Settings2, ShieldCheck, UserPlus, UsersRound, Wifi, WifiOff, X,
 } from "lucide-react";
@@ -27,6 +29,16 @@ interface ChatMessage { messageId: string; peerId: string; direction: Direction;
 interface TransferRecord { transferId: string; peerId: string; direction: Direction; kind: TransferKind; fileName: string; fileSize: number; mimeType: string; sha256: string; localPath?: string; transferredBytes: number; status: TransferStatus; error?: string; createdAt: string; updatedAt: string }
 interface BootstrapSnapshot { localProfile: LocalProfile | null; peers: PeerSummary[]; friendRequests: FriendRequest[]; friends: Friend[]; messages: ChatMessage[]; transfers: TransferRecord[] }
 interface ToastState { tone: "success" | "error" | "info"; message: string }
+type NetworkEvent =
+  | { type: "peerDiscovered"; peer: PeerSummary }
+  | { type: "peerOffline"; peerId: string; lastSeen: string }
+  | { type: "friendRequestReceived"; request: FriendRequest }
+  | { type: "friendRequestDelivered"; requestId: string }
+  | { type: "friendRequestResolved"; request: FriendRequest; friend: Friend | null }
+  | { type: "messageReceived"; message: ChatMessage }
+  | { type: "messageStatusChanged"; messageId: string; status: MessageStatus; error: string | null }
+  | { type: "transferUpdated"; transfer: TransferRecord }
+  | { type: "networkError"; code: string; message: string };
 
 const EMPTY_SNAPSHOT: BootstrapSnapshot = { localProfile: null, peers: [], friendRequests: [], friends: [], messages: [], transfers: [] };
 
@@ -41,6 +53,8 @@ function App() {
   const [toast, setToast] = useState<ToastState | null>(null);
   const [editingProfile, setEditingProfile] = useState(false);
   const [discoverySlow, setDiscoverySlow] = useState(false);
+  const [announcement, setAnnouncement] = useState("");
+  const [notificationPermission, setNotificationPermission] = useState<NotificationPermission>("default");
   const refreshTimer = useRef<number | null>(null);
   const hasOnlinePeer = snapshot.peers.some((peer) => peer.online);
 
@@ -62,11 +76,32 @@ function App() {
     refreshTimer.current = window.setTimeout(() => void refresh(), 80);
   }, [refresh]);
 
+  const handleNetworkEvent = useCallback((event: NetworkEvent) => {
+    scheduleRefresh();
+    switch (event.type) {
+      case "friendRequestReceived":
+        setAnnouncement(`${event.request.nickname} 发来了好友申请`);
+        void notifyIncomingFriendRequest(event.request);
+        break;
+      case "friendRequestDelivered":
+        setToast({ tone: "success", message: "好友申请已送达，正在等待对方处理" });
+        break;
+      case "friendRequestResolved":
+        if (event.friend) setSelectedPeerId(event.friend.peerId);
+        break;
+      case "networkError":
+        setToast({ tone: "error", message: event.message });
+        break;
+      default:
+        break;
+    }
+  }, [scheduleRefresh]);
+
   useEffect(() => {
     void refresh(true);
     let disposed = false;
     let unlisten: (() => void) | undefined;
-    void listen("localnet://event", scheduleRefresh).then((cleanup) => {
+    void listen<NetworkEvent>("localnet://event", ({ payload }) => handleNetworkEvent(payload)).then((cleanup) => {
       if (disposed) cleanup(); else unlisten = cleanup;
     });
     return () => {
@@ -74,7 +109,15 @@ function App() {
       unlisten?.();
       if (refreshTimer.current !== null) window.clearTimeout(refreshTimer.current);
     };
-  }, [refresh, scheduleRefresh]);
+  }, [handleNetworkEvent, refresh]);
+
+  useEffect(() => {
+    let active = true;
+    void isPermissionGranted()
+      .then((granted) => active && setNotificationPermission(granted ? "granted" : "default"))
+      .catch(() => active && setNotificationPermission("default"));
+    return () => { active = false; };
+  }, []);
 
   useEffect(() => {
     if (!toast) return;
@@ -111,6 +154,22 @@ function App() {
     }
   }, [refresh]);
 
+  const enableSystemNotifications = async () => {
+    setBusyKey("notifications");
+    try {
+      const granted = await isPermissionGranted();
+      const permission = granted ? "granted" : await requestPermission();
+      setNotificationPermission(permission);
+      setToast(permission === "granted"
+        ? { tone: "success", message: "系统通知已开启" }
+        : { tone: "info", message: "系统通知未开启；应用内好友申请提醒仍然有效" });
+    } catch (error) {
+      setToast({ tone: "error", message: errorMessage(error) });
+    } finally {
+      setBusyKey("");
+    }
+  };
+
   if (loading) return <BootScreen />;
   if (fatalError && !snapshot.localProfile) return <FatalScreen message={fatalError} onRetry={() => void refresh(true)} />;
   if (!snapshot.localProfile) {
@@ -125,6 +184,7 @@ function App() {
   const pendingOutgoingPeerIds = new Set(snapshot.friendRequests.filter((request) => request.direction === "outgoing" && request.status === "pending").map((request) => request.peerId));
   const nearbyPeers = snapshot.peers.filter((peer) => peer.online && !friendIds.has(peer.peerId) && peer.peerId !== profile.peerId);
   const incomingRequests = snapshot.friendRequests.filter((request) => request.direction === "incoming" && request.status === "pending");
+  const primaryIncomingRequest = incomingRequests[0] ?? null;
   const normalizedSearch = searchText.trim().toLocaleLowerCase();
   const visibleFriends = snapshot.friends.filter((friend) => friend.nickname.toLocaleLowerCase().includes(normalizedSearch));
   const visibleNearby = nearbyPeers.filter((peer) => peer.nickname.toLocaleLowerCase().includes(normalizedSearch));
@@ -205,7 +265,7 @@ function App() {
               <div className="person-row" key={peer.peerId}>
                 <Avatar name={peer.nickname} online />
                 <span><strong>{peer.nickname}</strong><small>{platformLabel(peer.platform)} · 在线</small></span>
-                <button className="add-button" disabled={busyKey === `add:${peer.peerId}` || peer.protocolVersion !== 1 || pendingOutgoingPeerIds.has(peer.peerId)} title={pendingOutgoingPeerIds.has(peer.peerId) ? "好友申请已发送" : peer.protocolVersion === 1 ? "添加好友" : "版本不兼容"} onClick={() => void act(`add:${peer.peerId}`, () => invoke("send_friend_request", { peerId: peer.peerId }), "好友申请已发送")}>
+                <button className="add-button" disabled={busyKey === `add:${peer.peerId}` || peer.protocolVersion !== 1 || pendingOutgoingPeerIds.has(peer.peerId)} title={pendingOutgoingPeerIds.has(peer.peerId) ? "好友申请正在等待对方处理" : peer.protocolVersion === 1 ? "添加好友" : "版本不兼容"} onClick={() => void act(`add:${peer.peerId}`, () => invoke("send_friend_request", { peerId: peer.peerId }))}>
                   {busyKey === `add:${peer.peerId}` ? <LoaderCircle size={15} className="spin" /> : pendingOutgoingPeerIds.has(peer.peerId) ? <Check size={15} /> : <UserPlus size={15} />}
                 </button>
               </div>
@@ -225,31 +285,69 @@ function App() {
         </div>
       </aside>
 
-      {selectedFriend ? (
-        <Conversation
-          friend={selectedFriend}
-          messages={snapshot.messages.filter((message) => message.peerId === selectedFriend.peerId)}
-          transfers={snapshot.transfers.filter((transfer) => transfer.peerId === selectedFriend.peerId)}
-          messageText={messageText}
-          setMessageText={setMessageText}
-          busyKey={busyKey}
-          onSendText={sendText}
-          onSendImage={() => void chooseAndSend("image")}
-          onSendFile={() => void chooseAndSend("file")}
-          onRetry={(messageId) => void act(`retry:${messageId}`, () => invoke("retry_text", { messageId }))}
-          onResolveTransfer={resolveTransfer}
-          onCancelTransfer={(transferId) => void act(`transfer:${transferId}`, () => invoke("cancel_transfer", { transferId }), "已取消文件传输")}
-        />
-      ) : <WelcomePanel nearbyCount={nearbyPeers.length} friendCount={snapshot.friends.length} />}
+      <section className="content-shell">
+        {primaryIncomingRequest && (
+          <IncomingRequestBanner
+            request={primaryIncomingRequest}
+            platform={snapshot.peers.find((peer) => peer.peerId === primaryIncomingRequest.peerId)?.platform ?? "unknown"}
+            count={incomingRequests.length}
+            busy={busyKey === `request:${primaryIncomingRequest.requestId}`}
+            onResolve={(accepted) => void resolveFriend(primaryIncomingRequest.requestId, accepted)}
+          />
+        )}
+        {selectedFriend ? (
+          <Conversation
+            friend={selectedFriend}
+            messages={snapshot.messages.filter((message) => message.peerId === selectedFriend.peerId)}
+            transfers={snapshot.transfers.filter((transfer) => transfer.peerId === selectedFriend.peerId)}
+            messageText={messageText}
+            setMessageText={setMessageText}
+            busyKey={busyKey}
+            onSendText={sendText}
+            onSendImage={() => void chooseAndSend("image")}
+            onSendFile={() => void chooseAndSend("file")}
+            onRetry={(messageId) => void act(`retry:${messageId}`, () => invoke("retry_text", { messageId }))}
+            onResolveTransfer={resolveTransfer}
+            onCancelTransfer={(transferId) => void act(`transfer:${transferId}`, () => invoke("cancel_transfer", { transferId }), "已取消文件传输")}
+          />
+        ) : <WelcomePanel nearbyCount={nearbyPeers.length} friendCount={snapshot.friends.length} />}
+      </section>
 
       {editingProfile && (
-        <ProfileDialog profile={profile} busy={busyKey === "profile"} onClose={() => setEditingProfile(false)} onSave={async (nickname) => {
+        <ProfileDialog profile={profile} busy={busyKey === "profile"} notificationBusy={busyKey === "notifications"} notificationPermission={notificationPermission} onEnableNotifications={enableSystemNotifications} onClose={() => setEditingProfile(false)} onSave={async (nickname) => {
           const result = await act("profile", () => invoke("update_nickname", { nickname }), "昵称已更新");
           if (result) setEditingProfile(false);
         }} />
       )}
+      <span className="sr-only" aria-live="polite">{announcement}</span>
       {toast && <Toast toast={toast} onClose={() => setToast(null)} />}
     </main>
+  );
+}
+
+function IncomingRequestBanner({ request, platform, count, busy, onResolve }: {
+  request: FriendRequest;
+  platform: Platform;
+  count: number;
+  busy: boolean;
+  onResolve: (accepted: boolean) => void;
+}) {
+  return (
+    <section className="incoming-request-banner" role="region" aria-label="新的好友申请">
+      <span className="request-banner-icon"><BellRing size={21} /></span>
+      <span className="request-banner-copy">
+        <small>新的好友申请 · {platformLabel(platform)}</small>
+        <strong>{request.nickname} 想添加你为好友</strong>
+        <span>确认后即可互发文字、图片和文件。</span>
+      </span>
+      {count > 1 && <span className="request-banner-count">另有 {count - 1} 条</span>}
+      <div className="request-banner-actions">
+        <button className="request-banner-reject" disabled={busy} onClick={() => onResolve(false)}>拒绝</button>
+        <button className="request-banner-accept" disabled={busy} onClick={() => onResolve(true)}>
+          {busy ? <LoaderCircle size={15} className="spin" /> : <Check size={15} />} 接受
+        </button>
+      </div>
+    </section>
   );
 }
 
@@ -366,9 +464,38 @@ function Onboarding({ busy, onSubmit }: { busy: boolean; onSubmit: (nickname: st
   return <main className="onboarding-screen"><section className="onboarding-card"><div className="onboarding-copy"><span className="brand-mark large"><MessageCircleMore size={30} /></span><p className="eyebrow">欢迎使用 WELINE CHAT</p><h1>无需服务器，直接和内网用户连接。</h1><p>设置一个昵称，其他 Weline Chat 用户就能在附近列表中发现你。</p><ul><li><Wifi size={17} /> 自动发现同一局域网用户</li><li><ShieldCheck size={17} /> 设备身份保存在本机</li><li><Paperclip size={17} /> 文字、图片和文件直传</li></ul></div><form className="nickname-form" onSubmit={(event) => { event.preventDefault(); if (nickname.trim()) void onSubmit(nickname); }}><span className="form-icon"><CircleUserRound size={25} /></span><h2>你希望别人怎么称呼你？</h2><p>昵称只会显示给同一内网中的 Weline Chat 用户。</p><label>昵称<input autoFocus maxLength={32} value={nickname} onChange={(event) => setNickname(event.target.value)} placeholder="例如：小林" /></label><button className="primary-button" disabled={busy || !nickname.trim()}>{busy ? <LoaderCircle size={18} className="spin" /> : <Wifi size={18} />}{busy ? "正在启动…" : "进入 Weline Chat"}</button><small><ShieldCheck size={13} /> 不需要账号、手机号或互联网连接</small></form></section></main>;
 }
 
-function ProfileDialog({ profile, busy, onClose, onSave }: { profile: LocalProfile; busy: boolean; onClose: () => void; onSave: (nickname: string) => Promise<void> }) {
+function ProfileDialog({ profile, busy, notificationBusy, notificationPermission, onEnableNotifications, onClose, onSave }: {
+  profile: LocalProfile;
+  busy: boolean;
+  notificationBusy: boolean;
+  notificationPermission: NotificationPermission;
+  onEnableNotifications: () => Promise<void>;
+  onClose: () => void;
+  onSave: (nickname: string) => Promise<void>;
+}) {
   const [nickname, setNickname] = useState(profile.nickname);
-  return <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}><form className="dialog-card" role="dialog" aria-modal="true" aria-labelledby="profile-title" onSubmit={(event) => { event.preventDefault(); if (nickname.trim()) void onSave(nickname); }}><button type="button" className="dialog-close" onClick={onClose}><X size={18} /></button><Avatar name={nickname || profile.nickname} online large /><h2 id="profile-title">本机资料</h2><p>修改后，附近用户会看到新的昵称。</p><label>昵称<input autoFocus maxLength={32} value={nickname} onChange={(event) => setNickname(event.target.value)} /></label><div className="device-id"><Monitor size={15} /><span><small>设备身份</small><code>{shortPeerId(profile.peerId)}</code></span></div><button className="primary-button" disabled={busy || !nickname.trim()}>{busy && <LoaderCircle size={16} className="spin" />} 保存修改</button></form></div>;
+  const notificationEnabled = notificationPermission === "granted";
+  return (
+    <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+      <form className="dialog-card" role="dialog" aria-modal="true" aria-labelledby="profile-title" onSubmit={(event) => { event.preventDefault(); if (nickname.trim()) void onSave(nickname); }}>
+        <button type="button" className="dialog-close" onClick={onClose}><X size={18} /></button>
+        <Avatar name={nickname || profile.nickname} online large />
+        <h2 id="profile-title">本机资料</h2>
+        <p>修改后，附近用户会看到新的昵称。</p>
+        <label>昵称<input autoFocus maxLength={32} value={nickname} onChange={(event) => setNickname(event.target.value)} /></label>
+        <div className="device-id"><Monitor size={15} /><span><small>设备身份</small><code>{shortPeerId(profile.peerId)}</code></span></div>
+        <div className="notification-setting">
+          <BellRing size={17} />
+          <span><strong>系统好友申请通知</strong><small>只显示请求者昵称；拒绝授权不影响应用内确认。</small></span>
+          <button type="button" disabled={notificationBusy || notificationEnabled} onClick={() => void onEnableNotifications()}>
+            {notificationBusy ? <LoaderCircle size={13} className="spin" /> : notificationEnabled ? <Check size={13} /> : null}
+            {notificationEnabled ? "已开启" : notificationPermission === "denied" ? "重新授权" : "开启"}
+          </button>
+        </div>
+        <button className="primary-button" disabled={busy || !nickname.trim()}>{busy && <LoaderCircle size={16} className="spin" />} 保存修改</button>
+      </form>
+    </div>
+  );
 }
 
 function BootScreen() { return <main className="boot-screen"><section className="boot-card"><div className="boot-mark"><MessageCircleMore size={34} /></div><p className="eyebrow">LOCAL · PRIVATE · FAST</p><h1>Weline Chat</h1><p>正在准备你的局域网通信空间…</p><div className="loading-track"><span /></div></section></main>; }
@@ -382,6 +509,17 @@ function errorMessage(error: unknown): string {
     try { return JSON.stringify(error); } catch { return "操作失败，请稍后重试"; }
   }
   return "操作失败，请稍后重试";
+}
+async function notifyIncomingFriendRequest(request: FriendRequest): Promise<void> {
+  try {
+    if (await getCurrentWindow().isFocused() || !(await isPermissionGranted())) return;
+    sendNotification({
+      title: "Weline Localnet",
+      body: `${request.nickname} 想添加你为好友。打开 Weline Localnet 接受或拒绝。`,
+    });
+  } catch (error) {
+    console.debug("Native friend-request notification unavailable", error);
+  }
 }
 function platformLabel(platform: Platform): string { return platform === "windows" ? "Windows" : platform === "macos" ? "macOS" : "桌面设备"; }
 function shortPeerId(peerId: string): string { return peerId.length > 20 ? `${peerId.slice(0, 9)}…${peerId.slice(-7)}` : peerId; }

@@ -16,7 +16,7 @@ use libp2p::{
     tcp, yamux,
 };
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager, UserAttentionType};
 use tokio::sync::{mpsc, watch};
 
 use super::{
@@ -1028,6 +1028,14 @@ impl NetworkRuntime {
     }
 
     fn emit(&self, event: NetworkEvent) {
+        if matches!(&event, NetworkEvent::FriendRequestReceived { .. }) {
+            if let Some(window) = self.app_handle.get_webview_window("main") {
+                if let Err(error) = window.request_user_attention(Some(UserAttentionType::Critical))
+                {
+                    tracing::debug!(%error, "unable to request attention for incoming friend request");
+                }
+            }
+        }
         emit_event(&self.app_handle, &event);
     }
 }
