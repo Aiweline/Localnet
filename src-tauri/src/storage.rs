@@ -35,6 +35,12 @@ pub struct Storage {
     connection: Arc<Mutex<Connection>>,
 }
 
+#[derive(Debug)]
+pub(crate) struct PreparedIncomingDecision {
+    pub transfer: TransferRecord,
+    pub decision_token: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IncomingAcceptanceHookPhase {
     AfterPartialSetup,
@@ -671,8 +677,9 @@ impl Storage {
         transfer_id: &str,
         peer_id: &str,
     ) -> Result<bool, AppError> {
-        let connection = self.connection()?;
-        let changed = connection.execute(
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
             "UPDATE transfers
              SET receive_claimed = 1,
                  status = CASE WHEN transfer_protocol = 2 THEN 'transferring' ELSE status END,
@@ -680,11 +687,199 @@ impl Storage {
                  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
              WHERE transfer_id = ?1 AND peer_id = ?2 AND direction = 'incoming'
                AND receive_claimed = 0
+               AND NOT EXISTS (
+                   SELECT 1 FROM transfer_cleanup WHERE transfer_id = ?1
+               )
                AND ((transfer_protocol = 2 AND status IN ('paused', 'transferring'))
                     OR (transfer_protocol = 1 AND status = 'transferring'))",
             params![transfer_id, peer_id],
         )?;
+        if changed == 1 {
+            transaction.execute(
+                "DELETE FROM incoming_transfer_decisions
+                 WHERE transfer_id = ?1 AND peer_id = ?2",
+                params![transfer_id, peer_id],
+            )?;
+        }
+        transaction.commit()?;
         Ok(changed == 1)
+    }
+
+    pub(crate) fn prepare_incoming_acceptance_decision(
+        &self,
+        transfer_id: &str,
+        peer_id: &str,
+    ) -> Result<PreparedIncomingDecision, AppError> {
+        let transfer = self
+            .get_transfer(transfer_id)?
+            .ok_or_else(|| AppError::Storage("接收确认记录不存在，请刷新后重试".to_string()))?;
+        if transfer.peer_id != peer_id
+            || transfer.direction != Direction::Incoming
+            || transfer.status != TransferStatus::Transferring
+            || transfer.transferred_bytes != 0
+            || !matches!(transfer.transfer_protocol, 1 | 2)
+            || !transfer.destination_reserved
+            || transfer.local_path.is_none()
+            || transfer.reservation_token.is_none()
+            || (transfer.transfer_protocol == 2 && transfer.partial_path.is_none())
+        {
+            return Err(AppError::Storage(
+                "接收确认尚未完成本地持久化，未向对方发送决定".to_string(),
+            ));
+        }
+        let decision_token = uuid::Uuid::now_v7().to_string();
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "INSERT INTO incoming_transfer_decisions
+               (transfer_id, peer_id, decision_token, accepted, state, created_at, updated_at)
+             SELECT transfer_id, peer_id, ?3, 1, 'submissionPending',
+                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             FROM transfers
+             WHERE transfer_id = ?1 AND peer_id = ?2 AND direction = 'incoming'
+               AND status = 'transferring' AND receive_claimed = 0 AND transferred_bytes = 0
+               AND transfer_protocol = ?4 AND local_path IS ?5
+               AND destination_reserved = 1 AND reservation_token IS ?6
+               AND partial_path IS ?7
+               AND NOT EXISTS (
+                   SELECT 1 FROM transfer_cleanup WHERE transfer_id = ?1
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM incoming_transfer_decisions WHERE transfer_id = ?1
+               )",
+            params![
+                transfer_id,
+                peer_id,
+                decision_token,
+                transfer.transfer_protocol,
+                transfer.local_path,
+                transfer.reservation_token,
+                transfer.partial_path,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(AppError::Storage(
+                "接收确认本地状态已变化或清理仍在等待，未重复发送决定".to_string(),
+            ));
+        }
+        transaction.commit()?;
+        Ok(PreparedIncomingDecision {
+            transfer,
+            decision_token,
+        })
+    }
+
+    pub(crate) fn rollback_pending_incoming_decision(
+        &self,
+        transfer_id: &str,
+        peer_id: &str,
+        decision_token: &str,
+        error: &str,
+    ) -> Result<Option<TransferRecord>, AppError> {
+        let Some(transfer) = self.get_transfer(transfer_id)? else {
+            return Ok(None);
+        };
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let staged = transaction.execute(
+            "INSERT INTO transfer_cleanup
+               (transfer_id, destination, partial_path, reservation_token,
+                destination_reserved, transfer_protocol, status)
+             SELECT t.transfer_id, t.local_path, t.partial_path, t.reservation_token,
+                    t.destination_reserved, t.transfer_protocol, 'awaitingAcceptance'
+             FROM transfers t
+             JOIN incoming_transfer_decisions d ON d.transfer_id = t.transfer_id
+             WHERE t.transfer_id = ?1 AND t.peer_id = ?2 AND d.decision_token = ?3
+               AND d.accepted = 1 AND d.state = 'submissionPending'
+               AND t.direction = 'incoming' AND t.status = 'transferring'
+               AND t.receive_claimed = 0 AND t.transferred_bytes = 0
+             ON CONFLICT(transfer_id) DO NOTHING",
+            params![transfer_id, peer_id, decision_token],
+        )?;
+        if staged != 1 {
+            let pending: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM incoming_transfer_decisions
+                 WHERE transfer_id = ?1 AND peer_id = ?2 AND decision_token = ?3",
+                params![transfer_id, peer_id, decision_token],
+                |row| row.get(0),
+            )?;
+            if pending == 0 {
+                return Ok(None);
+            }
+            return Err(AppError::Storage(
+                "接收决定回退时所有权清理仍在等待（cleanup pending）".to_string(),
+            ));
+        }
+        let changed = transaction.execute(
+            "UPDATE transfers
+             SET local_path = NULL, destination_reserved = 0, reservation_token = NULL,
+                 partial_path = NULL, transferred_bytes = 0, status = 'awaitingAcceptance',
+                 error = ?8, receive_claimed = 0,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE transfer_id = ?1 AND peer_id = ?2 AND direction = 'incoming'
+               AND transfer_protocol = ?4 AND status = 'transferring'
+               AND receive_claimed = 0 AND transferred_bytes = 0
+               AND local_path IS ?5 AND destination_reserved = ?6
+               AND reservation_token IS ?7 AND partial_path IS ?9
+               AND EXISTS (
+                   SELECT 1 FROM incoming_transfer_decisions
+                   WHERE transfer_id = ?1 AND peer_id = ?2 AND decision_token = ?3
+                     AND accepted = 1 AND state = 'submissionPending'
+               )",
+            params![
+                transfer_id,
+                peer_id,
+                decision_token,
+                transfer.transfer_protocol,
+                transfer.local_path,
+                transfer.destination_reserved,
+                transfer.reservation_token,
+                error,
+                transfer.partial_path,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(AppError::Storage(
+                "接收决定回退期间状态已变化，保留待处理决定".to_string(),
+            ));
+        }
+        transaction.execute(
+            "DELETE FROM incoming_transfer_decisions
+             WHERE transfer_id = ?1 AND peer_id = ?2 AND decision_token = ?3",
+            params![transfer_id, peer_id, decision_token],
+        )?;
+        transaction.execute(
+            "DELETE FROM transfer_chunks WHERE transfer_id = ?1",
+            [transfer_id],
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        if let Some(record) = self.pending_terminal_cleanup(transfer_id)? {
+            if let Err(cleanup_error) = self.cleanup_pending_terminal_artifact(&record) {
+                tracing::warn!(
+                    %transfer_id,
+                    %cleanup_error,
+                    "deferring failed decision artifact cleanup for a later retry"
+                );
+            }
+        }
+        self.get_transfer(transfer_id)
+    }
+
+    pub(crate) fn pending_incoming_decision_token(
+        &self,
+        transfer_id: &str,
+    ) -> Result<Option<String>, AppError> {
+        self.connection()?
+            .query_row(
+                "SELECT decision_token FROM incoming_transfer_decisions
+                 WHERE transfer_id = ?1",
+                [transfer_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(AppError::from)
     }
 
     pub fn try_claim_outgoing_transfer(
@@ -1015,7 +1210,13 @@ impl Storage {
                      error = NULL, updated_at = ?6
                  WHERE transfer_id = ?1 AND peer_id = ?2 AND direction = 'incoming'
                    AND transfer_protocol = ?7
-                   AND status = 'awaitingAcceptance' AND receive_claimed = 0",
+                   AND status = 'awaitingAcceptance' AND receive_claimed = 0
+                   AND NOT EXISTS (
+                       SELECT 1 FROM transfer_cleanup WHERE transfer_id = ?1
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM incoming_transfer_decisions WHERE transfer_id = ?1
+                   )",
                 params![
                     transfer.transfer_id,
                     transfer.peer_id,
@@ -1031,9 +1232,152 @@ impl Storage {
             Ok(changed == 1)
         })();
         if !matches!(result, Ok(true)) {
-            Self::cleanup_unpersisted_resumable_partial(&accepted);
+            let error = match &result {
+                Ok(false) => "接收确认期间状态已变化，请重新选择保存位置".to_string(),
+                Err(error) => format!("接收确认准备失败，请重新选择保存位置：{error}"),
+                Ok(true) => unreachable!(),
+            };
+            match self.persist_incoming_acceptance_fallback(&accepted, &error) {
+                Ok(true) => {}
+                Ok(false) => Self::cleanup_unpersisted_resumable_partial(&accepted),
+                Err(cleanup_error) => {
+                    tracing::warn!(
+                        transfer_id = %accepted.transfer_id,
+                        %cleanup_error,
+                        "failed to durably stage unpersisted acceptance cleanup"
+                    );
+                    Self::cleanup_unpersisted_resumable_partial(&accepted);
+                }
+            }
         }
         result
+    }
+
+    pub fn drain_incoming_cleanup_before_acceptance(
+        &self,
+        transfer_id: &str,
+    ) -> Result<(), AppError> {
+        let Some(record) = self.pending_terminal_cleanup(transfer_id)? else {
+            return Ok(());
+        };
+        let cleanup_result = self.cleanup_pending_terminal_artifact(&record);
+        let remains = self.pending_terminal_cleanup(transfer_id)?.is_some();
+        if cleanup_result.is_ok() && !remains {
+            return Ok(());
+        }
+
+        let detail = cleanup_result
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "所有权校验尚未完成".to_string());
+        let message = format!(
+            "上次接收文件的清理仍在等待目标磁盘，请恢复原保存位置后重试（cleanup pending）：{detail}"
+        );
+        let connection = self.connection()?;
+        connection.execute(
+            "UPDATE transfers
+             SET error = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE transfer_id = ?1 AND direction = 'incoming'
+               AND status = 'awaitingAcceptance' AND receive_claimed = 0",
+            params![transfer_id, message],
+        )?;
+        Err(AppError::Storage(message))
+    }
+
+    pub fn persist_incoming_acceptance_fallback(
+        &self,
+        ownership: &TransferRecord,
+        error: &str,
+    ) -> Result<bool, AppError> {
+        if ownership.direction != Direction::Incoming
+            || !matches!(ownership.transfer_protocol, 1 | 2)
+            || ownership.transferred_bytes != 0
+            || ownership.local_path.is_none()
+            || ownership.reservation_token.is_none()
+        {
+            return Err(AppError::InvalidInput(
+                "接收回退缺少可验证的文件所有权".to_string(),
+            ));
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let staged = transaction.execute(
+            "INSERT INTO transfer_cleanup
+               (transfer_id, destination, partial_path, reservation_token,
+                destination_reserved, transfer_protocol, status)
+             VALUES (?1, ?4, ?7, ?6, ?5, ?3, 'awaitingAcceptance')
+             ON CONFLICT(transfer_id) DO UPDATE SET
+               destination = excluded.destination,
+               partial_path = COALESCE(excluded.partial_path, transfer_cleanup.partial_path),
+               reservation_token = excluded.reservation_token,
+               destination_reserved = excluded.destination_reserved,
+               transfer_protocol = excluded.transfer_protocol,
+               status = excluded.status
+             WHERE transfer_cleanup.destination IS excluded.destination
+               AND transfer_cleanup.reservation_token IS excluded.reservation_token
+               AND transfer_cleanup.transfer_protocol = excluded.transfer_protocol",
+            params![
+                ownership.transfer_id,
+                ownership.peer_id,
+                ownership.transfer_protocol,
+                ownership.local_path,
+                ownership.destination_reserved,
+                ownership.reservation_token,
+                ownership.partial_path,
+            ],
+        )?;
+        if staged != 1 {
+            return Err(AppError::Storage(
+                "接收确认已有不同所有权的待清理记录（cleanup pending）".to_string(),
+            ));
+        }
+        let changed = transaction.execute(
+            "UPDATE transfers
+             SET local_path = NULL, destination_reserved = 0, reservation_token = NULL,
+                 partial_path = NULL, transferred_bytes = 0, status = 'awaitingAcceptance',
+                 error = ?8, receive_claimed = 0,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE transfer_id = ?1 AND peer_id = ?2 AND direction = 'incoming'
+               AND transfer_protocol = ?3 AND receive_claimed = 0 AND transferred_bytes = 0
+               AND (
+                 (status = 'awaitingAcceptance' AND local_path IS NULL
+                   AND destination_reserved = 0 AND reservation_token IS NULL
+                   AND partial_path IS NULL)
+                 OR
+                 (status = 'transferring' AND local_path IS ?4
+                   AND destination_reserved = ?5 AND reservation_token IS ?6
+                   AND partial_path IS ?7)
+               )",
+            params![
+                ownership.transfer_id,
+                ownership.peer_id,
+                ownership.transfer_protocol,
+                ownership.local_path,
+                ownership.destination_reserved,
+                ownership.reservation_token,
+                ownership.partial_path,
+                error,
+            ],
+        )?;
+        if changed != 1 {
+            return Ok(false);
+        }
+        transaction.execute(
+            "DELETE FROM transfer_chunks WHERE transfer_id = ?1",
+            [&ownership.transfer_id],
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        if let Some(record) = self.pending_terminal_cleanup(&ownership.transfer_id)? {
+            if let Err(cleanup_error) = self.cleanup_pending_terminal_artifact(&record) {
+                tracing::warn!(
+                    transfer_id = %ownership.transfer_id,
+                    %cleanup_error,
+                    "deferring reverted acceptance artifact cleanup for a later retry"
+                );
+            }
+        }
+        Ok(true)
     }
 
     #[cfg(test)]
@@ -1170,8 +1514,9 @@ impl Storage {
         transfer_protocol: u8,
         error: &str,
     ) -> Result<bool, AppError> {
-        let connection = self.connection()?;
-        let changed = connection.execute(
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
             "UPDATE transfers
              SET status = 'cancelled', error = ?4, receive_claimed = 0,
                   updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
@@ -1181,6 +1526,14 @@ impl Storage {
                AND receive_claimed = 0",
             params![transfer_id, peer_id, transfer_protocol, error],
         )?;
+        if changed == 1 {
+            transaction.execute(
+                "DELETE FROM incoming_transfer_decisions
+                 WHERE transfer_id = ?1 AND peer_id = ?2",
+                params![transfer_id, peer_id],
+            )?;
+        }
+        transaction.commit()?;
         drop(connection);
         if changed == 1 {
             self.cleanup_owned_transfer_artifacts(transfer_id)?;
@@ -1623,6 +1976,16 @@ impl Storage {
                destination_reserved INTEGER NOT NULL,
                transfer_protocol INTEGER NOT NULL,
                status TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS incoming_transfer_decisions (
+               transfer_id TEXT PRIMARY KEY NOT NULL,
+               peer_id TEXT NOT NULL,
+               decision_token TEXT NOT NULL UNIQUE,
+               accepted INTEGER NOT NULL,
+               state TEXT NOT NULL,
+               created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL,
+               FOREIGN KEY (transfer_id) REFERENCES transfers(transfer_id) ON DELETE CASCADE
              );",
         )?;
         let has_destination_reserved: i64 = transaction.query_row(
@@ -3946,6 +4309,246 @@ mod tests {
 
         drop(storage);
         fs::remove_dir_all(fixture).expect("remove storage fixture");
+    }
+
+    #[test]
+    fn pending_cleanup_blocks_reaccept_until_exact_artifacts_are_drained() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-reaccept-cleanup-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let media = fixture.join("selected-media");
+        let detached = fixture.join("detached-media");
+        fs::create_dir_all(&media).expect("create selected media");
+        let storage = Storage::open(&fixture.join("localnet.sqlite3")).expect("open storage");
+        let transfer_id = "incoming-reaccept-cleanup";
+        let destination = media.join("report.bin");
+        {
+            let connection = storage.connection().expect("insert awaiting transfer");
+            connection
+                .execute(
+                    "INSERT INTO transfers
+                       (transfer_id, peer_id, direction, kind, file_name, file_size, mime_type,
+                        sha256, transfer_protocol, chunk_size, chunk_count, manifest_sha256,
+                        transferred_bytes, status, created_at, updated_at)
+                     VALUES (?1, 'peer-one', 'incoming', 'file', 'report.bin', 4,
+                             'application/octet-stream', ?2, 2, ?3, 1, ?2, 0,
+                             'awaitingAcceptance', ?4, ?4)",
+                    rusqlite::params![
+                        transfer_id,
+                        "0".repeat(64),
+                        TRANSFER_CHUNK_BYTES,
+                        "2026-08-25T00:00:00.000Z",
+                    ],
+                )
+                .expect("insert awaiting transfer");
+        }
+
+        let first_token = "token-reaccept-first";
+        reserve_receive_path(&destination, transfer_id, first_token)
+            .expect("reserve first destination");
+        let mut first = storage
+            .get_transfer(transfer_id)
+            .expect("load awaiting transfer")
+            .expect("awaiting transfer exists");
+        first.local_path = Some(destination.to_string_lossy().into_owned());
+        first.destination_reserved = true;
+        first.reservation_token = Some(first_token.to_string());
+        first.status = TransferStatus::Transferring;
+        assert!(
+            storage
+                .try_accept_incoming_transfer(&first)
+                .expect("accept first attempt")
+        );
+        assert!(
+            storage
+                .try_claim_incoming_transfer(transfer_id, "peer-one")
+                .expect("claim first attempt")
+        );
+        let first_claimed = storage
+            .get_transfer(transfer_id)
+            .expect("reload first claim")
+            .expect("claimed transfer exists");
+        fs::rename(&media, &detached).expect("detach selected media before rollback");
+        assert!(
+            storage
+                .try_return_claimed_incoming_to_awaiting(
+                    &first_claimed,
+                    "first submission did not reach the peer",
+                )
+                .expect("persist first durable rollback")
+        );
+
+        let blocked = storage
+            .drain_incoming_cleanup_before_acceptance(transfer_id)
+            .expect_err("unavailable media must block reacceptance");
+        assert!(blocked.to_string().contains("cleanup pending"));
+        let awaiting = storage
+            .get_transfer(transfer_id)
+            .expect("reload blocked transfer")
+            .expect("blocked transfer exists");
+        assert_eq!(awaiting.status, TransferStatus::AwaitingAcceptance);
+        let claimed: i64 = storage
+            .connection()
+            .expect("inspect blocked claim")
+            .query_row(
+                "SELECT receive_claimed FROM transfers WHERE transfer_id = ?1",
+                [transfer_id],
+                |row| row.get(0),
+            )
+            .expect("load blocked claim flag");
+        assert_eq!(claimed, 0);
+        assert!(
+            storage
+                .pending_incoming_decision_token(transfer_id)
+                .expect("inspect blocked decision")
+                .is_none()
+        );
+        assert!(
+            !storage
+                .try_claim_incoming_transfer(transfer_id, "peer-one")
+                .expect("cleanup-pending transfer cannot acquire a receive claim")
+        );
+
+        fs::rename(&detached, &media).expect("restore selected media");
+        storage
+            .drain_incoming_cleanup_before_acceptance(transfer_id)
+            .expect("restored media drains old ownership");
+        assert!(
+            storage
+                .pending_terminal_cleanup(transfer_id)
+                .unwrap()
+                .is_none()
+        );
+
+        let second_token = "token-reaccept-second";
+        reserve_receive_path(&destination, transfer_id, second_token)
+            .expect("reserve destination after old cleanup drains");
+        let mut second = storage
+            .get_transfer(transfer_id)
+            .expect("load second awaiting transfer")
+            .expect("second awaiting transfer exists");
+        second.local_path = Some(destination.to_string_lossy().into_owned());
+        second.destination_reserved = true;
+        second.reservation_token = Some(second_token.to_string());
+        second.status = TransferStatus::Transferring;
+        second.error = None;
+        assert!(
+            storage
+                .try_accept_incoming_transfer(&second)
+                .expect("accept second attempt")
+        );
+        let pending = storage
+            .prepare_incoming_acceptance_decision(transfer_id, "peer-one")
+            .expect("durably prepare the later decision");
+        fs::rename(&media, &detached).expect("detach selected media before second rollback");
+        let reverted = storage
+            .rollback_pending_incoming_decision(
+                transfer_id,
+                "peer-one",
+                &pending.decision_token,
+                "second submission did not reach the peer",
+            )
+            .expect("persist second durable rollback")
+            .expect("later rollback wins");
+        assert_eq!(reverted.status, TransferStatus::AwaitingAcceptance);
+        let fresh = storage
+            .pending_terminal_cleanup(transfer_id)
+            .expect("inspect fresh cleanup tombstone")
+            .expect("later rollback creates a fresh tombstone");
+        assert_eq!(fresh.reservation_token.as_deref(), Some(second_token));
+
+        drop(storage);
+        fs::rename(&detached, &media).expect("restore fixture media");
+        let storage = Storage::open(&fixture.join("localnet.sqlite3"))
+            .expect("drain final tombstone during startup");
+        drop(storage);
+        fs::remove_dir_all(fixture).expect("remove reaccept cleanup fixture");
+    }
+
+    #[test]
+    fn pending_acceptance_decision_survives_restart_until_claim_or_cancel_consumes_it() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-pending-decision-restart-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&fixture).expect("create pending decision fixture");
+        let database = fixture.join("localnet.sqlite3");
+        let storage = Storage::open(&database).expect("open storage");
+        let transfer_id = "pending-decision-restart";
+        let destination = fixture.join("report.bin");
+        let token = "token-pending-decision-restart";
+        {
+            let connection = storage.connection().expect("insert awaiting transfer");
+            connection
+                .execute(
+                    "INSERT INTO transfers
+                       (transfer_id, peer_id, direction, kind, file_name, file_size, mime_type,
+                        sha256, transfer_protocol, chunk_size, chunk_count, manifest_sha256,
+                        transferred_bytes, status, created_at, updated_at)
+                     VALUES (?1, 'peer-one', 'incoming', 'file', 'report.bin', 4,
+                             'application/octet-stream', ?2, 2, ?3, 1, ?2, 0,
+                             'awaitingAcceptance', ?4, ?4)",
+                    rusqlite::params![
+                        transfer_id,
+                        "0".repeat(64),
+                        TRANSFER_CHUNK_BYTES,
+                        "2026-08-25T00:00:00.000Z",
+                    ],
+                )
+                .expect("insert awaiting transfer");
+        }
+        reserve_receive_path(&destination, transfer_id, token).expect("reserve destination");
+        let mut accepted = storage
+            .get_transfer(transfer_id)
+            .expect("load awaiting transfer")
+            .expect("awaiting transfer exists");
+        accepted.local_path = Some(destination.to_string_lossy().into_owned());
+        accepted.destination_reserved = true;
+        accepted.reservation_token = Some(token.to_string());
+        accepted.status = TransferStatus::Transferring;
+        assert!(
+            storage
+                .try_accept_incoming_transfer(&accepted)
+                .expect("accept transfer")
+        );
+        let pending = storage
+            .prepare_incoming_acceptance_decision(transfer_id, "peer-one")
+            .expect("persist pending decision before submission");
+        drop(storage);
+
+        let storage = Storage::open(&database).expect("reopen after simulated runtime crash");
+        let restarted = storage
+            .get_transfer(transfer_id)
+            .expect("reload restarted transfer")
+            .expect("restarted transfer exists");
+        assert_eq!(restarted.status, TransferStatus::Paused);
+        assert_eq!(
+            storage
+                .pending_incoming_decision_token(transfer_id)
+                .unwrap()
+                .as_deref(),
+            Some(pending.decision_token.as_str())
+        );
+        assert!(
+            storage
+                .try_cancel_unclaimed_incoming_transfer(
+                    transfer_id,
+                    "peer-one",
+                    TransferProtocol::ResumableV2 as u8,
+                    "test cleanup",
+                )
+                .expect("cancel restarted transfer")
+        );
+        assert!(
+            storage
+                .pending_incoming_decision_token(transfer_id)
+                .unwrap()
+                .is_none()
+        );
+
+        drop(storage);
+        fs::remove_dir_all(fixture).expect("remove pending decision fixture");
     }
 
     #[test]

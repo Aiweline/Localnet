@@ -90,3 +90,44 @@ This section supersedes the earlier compatibility statement that v1 skipped pref
 - Resume safety: the test partial length matches committed SQLite chunks. Space failure and stale-offset failure both stop before body access, preserve bytes/chunks, persist an actionable paused error, and release the claim atomically; restored space uses receiver-authoritative subtraction.
 - Settings safety: disabling auto-receive and nickname updates with an unchanged unavailable directory still do not probe it. Validation occurs only when enabling or accepting.
 - No known Task 6 blocker. Task 7 still owns reconnect query/response scheduling and v2 acceptor registration; none was added here.
+
+## Review fix round 2 — 2026-08-25
+
+### Implementation and files
+
+- `src-tauri/src/storage.rs`: automatic setup failure now first commits the exact `AwaitingAcceptance` row, actionable error, cleared ownership/claim state, and an identity/token-owned `transfer_cleanup` tombstone in one immediate SQLite transaction. Filesystem cleanup runs only after commit; unavailable media or an identity mismatch retains the tombstone. A new acceptance must drain that exact tombstone before preflight/reservation, and acceptance/claim CAS predicates independently reject a surviving cleanup record.
+- `src-tauri/src/storage.rs`: added durable `incoming_transfer_decisions`. The `submissionPending` token is inserted only after exact local acceptance validation and before transport submission. Exact send/rejection/failure/timeout rollback atomically creates the cleanup tombstone, restores `AwaitingAcceptance`, deletes the token, and then attempts filesystem cleanup. Receive claim and incoming cancellation consume the token in their own transaction; the token survives restart until claim/cancel consumes it.
+- `src-tauri/src/network/runtime.rs`: manual and automatic production handlers both use the same runtime submission boundary. All fallible SQLite validation/pending registration precedes the single `send_request`; after it returns, only infallible in-memory registration, event emission, timeout spawn, and completion remain. No `Transferring` event/completion is produced before successful submission. Rejection and outbound failure carry the exact durable token, preventing stale responses from reverting a later acceptance.
+- `src-tauri/src/network/transfer.rs`: the start timeout carries the durable decision token and can only roll back that exact still-unclaimed pending action. A body claim wins atomically and makes a late timeout harmless.
+- `src-tauri/src/commands.rs`: manual acceptance drains deferred cleanup before preflight or reservation, and a lost completion channel never reverts an acceptance whose durable submission token still exists.
+
+### Genuine RED → GREEN evidence
+
+1. Durable automatic fallback RED: `cargo test --manifest-path src-tauri/Cargo.toml automatic_fallback_is_durable_before_unavailable_media_cleanup -- --nocapture` failed at the fallback expectation with `Io(Custom { kind: NotFound, error: "接收目录或磁盘当前不可用" })`; reservation cleanup ran before the actionable row was persisted. GREEN: the same test passes, the row is durably `AwaitingAcceptance` while media is detached, and startup drains the retained tombstone after media returns.
+2. Runtime ordering RED was replayed with the reviewed send-before-prepare ordering: `cargo test --manifest-path src-tauri/Cargo.toml --lib runtime_handler_local_validation_failure_submits_zero_requests -- --nocapture` failed `left: 1, right: 0`, proving an invalid local acceptance submitted one request. GREEN after restoring durable-first ordering: the same test passes with zero submissions.
+3. Additional GREEN coverage uses the production runtime handler for manual and automatic send failure, success with exactly one request, duplicate suppression, body-claim-versus-timeout, and timeout-versus-late-response. Storage coverage detaches media after partial creation, blocks reacceptance with `cleanup pending` and no claim/decision, drains after media returns, accepts again, and proves a later rollback creates a fresh tombstone for the new token.
+
+### Pending-decision state ordering
+
+1. Existing Task 5 acceptance CAS owns the destination/reservation/partial but remains invisible to the caller while its command is pending.
+2. The runtime transaction revalidates the exact unclaimed zero-byte row, verifies no cleanup/pending conflict, and inserts one unique `submissionPending` token.
+3. `send_request` is invoked exactly once. Synchronous submission failure consumes that token via durable rollback; after successful submission no fallible local operation can reinterpret it as unsent.
+4. Control rejection, outbound failure, and start timeout may consume only their exact token. A receive claim or cancel deletes the token atomically; an accepted control response intentionally leaves it until body start or timeout resolves the action.
+
+### Exact final verification
+
+- Locked focused suites: runtime 22 passed; storage/reacceptance coverage passed; commands 11 passed; production receive boundary 2 passed.
+- `cargo test --manifest-path src-tauri/Cargo.toml --locked` with `CARGO_TARGET_DIR=G:\codex-localnet-target` — PASS, 161 library tests, 0 binary tests, 0 doc tests; only the existing informational Windows linker import-library message.
+- `cargo check --manifest-path src-tauri/Cargo.toml --locked` — PASS, debug profile without compiler warnings.
+- `cargo check --manifest-path src-tauri/Cargo.toml --release --locked` — PASS, optimized profile.
+- `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check` — PASS.
+- `git diff --check` — PASS.
+- `pnpm release:check` with `npm_config_script_shell=powershell.exe` — PASS, synchronized `0.1.7`.
+
+### Self-review and concerns
+
+- TOCTOU/side effects: volume preflight ordering from rounds 1–2 remains unchanged. Deferred cleanup is drained before a new preflight/reservation; create-new reservation and identity checks still fail safely if media changes afterward. No acceptance signal is possible before durable setup and pending-decision validation.
+- Error visibility: cleanup-pending, automatic setup, and submission errors remain on the durable awaiting row and reach the existing caller/event paths. Filesystem cleanup failure is logged but no longer replaces or prevents the actionable state.
+- Ownership: tombstones can be updated only for the same destination/token/protocol identity; unrelated or later ownership is never overwritten. New receive claims cannot coexist with a cleanup tombstone, and stale decision tokens cannot roll back a fresh acceptance.
+- Settings/resume: the settings-disable/nickname paths remain probe-free; v1/v2 preflight and the authoritative post-claim resume-offset/body boundary from round 1 remain covered and unchanged.
+- No known Task 6 blocker. Libp2p's synchronous `send_request` returns an outbound ID rather than a `Result`; the production handler's injected submission closure tests the failure boundary, while actual asynchronous rejection/outbound failure use the same durable token rollback. Task 7 reconnect query/scheduler work remains out of scope.

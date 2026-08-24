@@ -428,11 +428,17 @@ pub async fn resolve_transfer(
             Ok(Err(message)) => return Err(AppError::Network(message)),
             Err(error) => {
                 let message = format!("接收确认未提交，请重新确认：{error}");
-                crate::network::return_pending_incoming_decision_to_manual(
-                    &transfer.transfer_id,
-                    &state.storage,
-                    message.clone(),
-                )?;
+                if state
+                    .storage
+                    .pending_incoming_decision_token(&transfer.transfer_id)?
+                    .is_none()
+                {
+                    crate::network::return_pending_incoming_decision_to_manual(
+                        &transfer.transfer_id,
+                        &state.storage,
+                        message.clone(),
+                    )?;
+                }
                 return Err(AppError::Network(message));
             }
         }
@@ -662,6 +668,7 @@ where
             "文件保存位置必须是绝对路径".to_string(),
         ));
     }
+    storage.drain_incoming_cleanup_before_acceptance(&transfer.transfer_id)?;
     let parent = path
         .parent()
         .ok_or_else(|| AppError::InvalidInput("接收文件保存位置无效".to_string()))?;

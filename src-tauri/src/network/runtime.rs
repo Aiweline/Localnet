@@ -172,11 +172,21 @@ pub fn spawn_network(
 #[derive(Debug)]
 enum PendingAction {
     Hello,
-    FriendRequest { request_id: String },
+    FriendRequest {
+        request_id: String,
+    },
     FriendDecision,
-    Text { message_id: String },
-    TransferOffer { transfer_id: String },
-    TransferDecision { transfer_id: String, accepted: bool },
+    Text {
+        message_id: String,
+    },
+    TransferOffer {
+        transfer_id: String,
+    },
+    TransferDecision {
+        transfer_id: String,
+        accepted: bool,
+        decision_token: Option<String>,
+    },
     TransferCancel,
 }
 
@@ -372,34 +382,43 @@ impl NetworkRuntime {
             } => {
                 let peer_id = parse_peer_id(&peer_id)?;
                 self.ensure_connected(&peer_id)?;
-                let outbound_id = self.swarm.behaviour_mut().control.send_request(
-                    &peer_id,
-                    ControlRequest::TransferDecision {
-                        transfer_id: transfer_id.clone(),
-                        accepted,
+                let storage = self.storage.clone();
+                let submission = Self::handle_transfer_decision_submission(
+                    &storage,
+                    &peer_id.to_string(),
+                    &transfer_id,
+                    accepted,
+                    || {
+                        Ok(self.swarm.behaviour_mut().control.send_request(
+                            &peer_id,
+                            ControlRequest::TransferDecision {
+                                transfer_id: transfer_id.clone(),
+                                accepted,
+                            },
+                        ))
                     },
-                );
+                )?;
                 self.pending.insert(
-                    outbound_id,
+                    submission.request_id,
                     PendingAction::TransferDecision {
                         transfer_id: transfer_id.clone(),
                         accepted,
+                        decision_token: submission.decision_token.clone(),
                     },
                 );
                 if accepted {
-                    let submitted = self.storage.get_transfer(&transfer_id)?.ok_or_else(|| {
-                        AppError::Storage("已提交的接收确认记录不存在".to_string())
-                    })?;
-                    if submitted.status != TransferStatus::Transferring {
-                        return Err(AppError::Storage(
-                            "接收确认提交后状态不一致，请刷新后重试".to_string(),
-                        ));
-                    }
+                    let submitted = submission
+                        .transfer
+                        .expect("accepted submission is prepared");
+                    let decision_token = submission
+                        .decision_token
+                        .expect("accepted submission has a durable decision token");
                     self.emit(NetworkEvent::TransferUpdated {
                         transfer: submitted,
                     });
                     transfer::spawn_incoming_start_timeout(
                         transfer_id,
+                        decision_token,
                         self.storage.clone(),
                         self.app_handle.clone(),
                     );
@@ -444,17 +463,25 @@ impl NetworkRuntime {
                 completion,
                 ..
             } => {
+                complete_transfer_decision(completion, Err(error.to_string()));
                 let compensation = if *accepted {
-                    let message = format!("接收确认未提交，请重新确认：{error}");
-                    transfer::return_pending_incoming_decision_to_manual(
-                        transfer_id,
-                        &self.storage,
-                        message,
-                    )
+                    if self
+                        .storage
+                        .pending_incoming_decision_token(transfer_id)?
+                        .is_some()
+                    {
+                        Ok(None)
+                    } else {
+                        let message = format!("接收确认未提交，请重新确认：{error}");
+                        transfer::return_pending_incoming_decision_to_manual(
+                            transfer_id,
+                            &self.storage,
+                            message,
+                        )
+                    }
                 } else {
                     Ok(None)
                 };
-                complete_transfer_decision(completion, Err(error.to_string()));
                 if let Some(transfer) = compensation? {
                     self.emit(NetworkEvent::TransferUpdated { transfer });
                 }
@@ -802,40 +829,70 @@ impl NetworkRuntime {
                 )?;
                 let transfer = outcome.transfer;
                 if outcome.transfer_decision == Some(true) {
-                    let outbound_id = self.swarm.behaviour_mut().control.send_request(
-                        &peer_id,
-                        ControlRequest::TransferDecision {
-                            transfer_id: transfer.transfer_id.clone(),
-                            accepted: true,
-                        },
-                    );
-                    self.pending.insert(
-                        outbound_id,
-                        PendingAction::TransferDecision {
-                            transfer_id: transfer.transfer_id.clone(),
-                            accepted: true,
-                        },
-                    );
-                    match finalize_accepted_transfer_submission(
-                        &self.storage,
+                    let storage = self.storage.clone();
+                    match Self::handle_transfer_decision_submission(
+                        &storage,
+                        &peer_id.to_string(),
                         &transfer.transfer_id,
-                        Ok(()),
-                    )? {
-                        AcceptedSubmissionOutcome::Submitted { transfer } => {
+                        true,
+                        || {
+                            Ok(self.swarm.behaviour_mut().control.send_request(
+                                &peer_id,
+                                ControlRequest::TransferDecision {
+                                    transfer_id: transfer.transfer_id.clone(),
+                                    accepted: true,
+                                },
+                            ))
+                        },
+                    ) {
+                        Ok(submission) => {
+                            let decision_token = submission
+                                .decision_token
+                                .clone()
+                                .expect("automatic acceptance has a durable decision token");
+                            let submitted = submission
+                                .transfer
+                                .expect("automatic acceptance is locally prepared");
+                            self.pending.insert(
+                                submission.request_id,
+                                PendingAction::TransferDecision {
+                                    transfer_id: submitted.transfer_id.clone(),
+                                    accepted: true,
+                                    decision_token: Some(decision_token.clone()),
+                                },
+                            );
                             self.emit(NetworkEvent::TransferUpdated {
-                                transfer: transfer.clone(),
+                                transfer: submitted.clone(),
                             });
                             transfer::spawn_incoming_start_timeout(
-                                transfer.transfer_id,
+                                submitted.transfer_id,
+                                decision_token,
                                 self.storage.clone(),
                                 self.app_handle.clone(),
                             );
                         }
-                        AcceptedSubmissionOutcome::Reverted { transfer, error } => {
-                            self.emit(NetworkEvent::TransferUpdated { transfer });
+                        Err(error) => {
+                            let message = format!("自动接收确认未提交，请手动重新确认：{error}");
+                            if let Some(current) =
+                                self.storage.get_transfer(&transfer.transfer_id)?
+                            {
+                                let corrected = if current.status == TransferStatus::Transferring {
+                                    transfer::return_pending_incoming_decision_to_manual(
+                                        &current.transfer_id,
+                                        &self.storage,
+                                        message.clone(),
+                                    )?
+                                    .unwrap_or(current)
+                                } else {
+                                    current
+                                };
+                                self.emit(NetworkEvent::TransferUpdated {
+                                    transfer: corrected,
+                                });
+                            }
                             self.emit(NetworkEvent::NetworkError {
                                 code: error.code().to_string(),
-                                message: error.to_string(),
+                                message,
                             });
                         }
                     }
@@ -1023,11 +1080,13 @@ impl NetworkRuntime {
                 PendingAction::TransferDecision {
                     transfer_id,
                     accepted: true,
+                    decision_token: Some(decision_token),
                 },
                 ControlResponse::Rejected { message, .. },
             ) => {
                 transfer::fail_pending_incoming_decision(
                     &transfer_id,
+                    &decision_token,
                     &self.storage,
                     &self.app_handle,
                     format!("接收确认未送达，请重新确认：{message}"),
@@ -1064,9 +1123,11 @@ impl NetworkRuntime {
             PendingAction::TransferDecision {
                 transfer_id,
                 accepted: true,
+                decision_token: Some(decision_token),
             } => {
                 transfer::fail_pending_incoming_decision(
                     &transfer_id,
+                    &decision_token,
                     &self.storage,
                     &self.app_handle,
                     format!("接收确认发送失败，请重新确认：{error}"),
@@ -1076,6 +1137,11 @@ impl NetworkRuntime {
             | PendingAction::FriendDecision
             | PendingAction::TransferDecision {
                 accepted: false, ..
+            }
+            | PendingAction::TransferDecision {
+                accepted: true,
+                decision_token: None,
+                ..
             }
             | PendingAction::TransferCancel => {
                 tracing::debug!(%error, "control request failed");
@@ -1309,6 +1375,60 @@ struct IncomingOfferOutcome {
     transfer_decision: Option<bool>,
 }
 
+#[derive(Debug)]
+struct SubmittedTransferDecision<R> {
+    request_id: R,
+    transfer: Option<TransferRecord>,
+    decision_token: Option<String>,
+}
+
+impl NetworkRuntime {
+    fn handle_transfer_decision_submission<R, S>(
+        storage: &Storage,
+        peer_id: &str,
+        transfer_id: &str,
+        accepted: bool,
+        submit_once: S,
+    ) -> Result<SubmittedTransferDecision<R>, AppError>
+    where
+        S: FnOnce() -> Result<R, AppError>,
+    {
+        if !accepted {
+            return submit_once().map(|request_id| SubmittedTransferDecision {
+                request_id,
+                transfer: None,
+                decision_token: None,
+            });
+        }
+
+        let prepared = storage.prepare_incoming_acceptance_decision(transfer_id, peer_id)?;
+        match submit_once() {
+            Ok(request_id) => Ok(SubmittedTransferDecision {
+                request_id,
+                transfer: Some(prepared.transfer),
+                decision_token: Some(prepared.decision_token),
+            }),
+            Err(error) => {
+                let message = format!("接收确认未提交，请重新确认：{error}");
+                let reverted = storage.rollback_pending_incoming_decision(
+                    transfer_id,
+                    peer_id,
+                    &prepared.decision_token,
+                    &message,
+                )?;
+                if reverted.is_none() {
+                    return Err(AppError::Storage(
+                        "接收确认提交失败但本地待处理状态已变化，请刷新后重试".to_string(),
+                    ));
+                }
+                Err(error)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
 enum AcceptedSubmissionOutcome {
     Submitted {
         transfer: TransferRecord,
@@ -1319,6 +1439,7 @@ enum AcceptedSubmissionOutcome {
     },
 }
 
+#[cfg(test)]
 fn finalize_accepted_transfer_submission(
     storage: &Storage,
     transfer_id: &str,
@@ -1420,6 +1541,18 @@ where
         });
     }
 
+    if let Err(error) = storage.drain_incoming_cleanup_before_acceptance(&transfer.transfer_id) {
+        let message = error.to_string();
+        transfer = storage
+            .get_transfer(&transfer.transfer_id)?
+            .ok_or_else(|| AppError::Storage("自动接收清理等待记录不存在".to_string()))?;
+        return Ok(IncomingOfferOutcome {
+            transfer,
+            automatic_receive_error: Some(message),
+            transfer_decision: None,
+        });
+    }
+
     let (path, reservation_token) = match automatic_receive_path_with_preflight(
         preferences,
         &offer.file_name,
@@ -1484,35 +1617,30 @@ where
 
 fn compensate_automatic_acceptance_setup(
     storage: &Storage,
-    mut awaiting: TransferRecord,
+    awaiting: TransferRecord,
     destination: &std::path::Path,
     reservation_token: &str,
     error: AppError,
 ) -> Result<IncomingOfferOutcome, AppError> {
     let message = format!("自动接收准备失败，请手动选择保存位置：{error}");
-    if let Some(current) = storage.get_transfer(&awaiting.transfer_id)? {
-        if current.status == TransferStatus::Transferring {
-            let transfer = transfer::return_pending_incoming_decision_to_manual(
-                &awaiting.transfer_id,
-                storage,
-                message.clone(),
-            )?
-            .ok_or_else(|| {
-                AppError::Storage("自动接收回退期间传输状态已变化，请刷新后重试".to_string())
-            })?;
-            return Ok(IncomingOfferOutcome {
-                transfer,
-                automatic_receive_error: Some(message),
-                transfer_decision: None,
-            });
-        }
-    }
-    remove_owned_reservation(destination, &awaiting.transfer_id, reservation_token)?;
-    awaiting.error = Some(message.clone());
-    awaiting.updated_at = now_rfc3339();
-    storage.upsert_transfer(&awaiting)?;
-    let transfer = storage
+    let current = storage
         .get_transfer(&awaiting.transfer_id)?
+        .unwrap_or(awaiting);
+    let mut ownership = current;
+    if ownership.local_path.is_none() {
+        ownership.local_path = Some(destination.to_string_lossy().into_owned());
+    }
+    if ownership.reservation_token.is_none() {
+        ownership.reservation_token = Some(reservation_token.to_string());
+    }
+    ownership.destination_reserved = true;
+    if !storage.persist_incoming_acceptance_fallback(&ownership, &message)? {
+        return Err(AppError::Storage(
+            "自动接收回退期间传输状态已变化，请刷新后重试".to_string(),
+        ));
+    }
+    let transfer = storage
+        .get_transfer(&ownership.transfer_id)?
         .ok_or_else(|| AppError::Storage("自动接收回退记录不存在".to_string()))?;
     Ok(IncomingOfferOutcome {
         transfer,
@@ -1523,18 +1651,18 @@ fn compensate_automatic_acceptance_setup(
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::{cell::Cell, fs, path::PathBuf};
 
     use super::{
-        AcceptedSubmissionOutcome, automatic_receive_path, finalize_accepted_transfer_submission,
-        persist_incoming_offer_with_preflight, persist_incoming_offer_with_preflight_and_accept,
-        validate_transfer_offer,
+        AcceptedSubmissionOutcome, NetworkRuntime, automatic_receive_path,
+        finalize_accepted_transfer_submission, persist_incoming_offer_with_preflight,
+        persist_incoming_offer_with_preflight_and_accept, validate_transfer_offer,
     };
     use crate::{
         domain::{TransferKind, TransferPreferences, TransferStatus},
         error::AppError,
         protocol::TransferOffer,
-        receive_paths::{preflight_receive_directory, reservation_is_owned},
+        receive_paths::{preflight_receive_directory, reservation_is_owned, reserve_receive_path},
         storage::{IncomingAcceptancePhase, Storage},
         transfer_policy::{TRANSFER_CHUNK_BYTES, TransferProtocol},
         volume_preflight::{VolumeSnapshot, validate_volume},
@@ -1557,6 +1685,347 @@ mod tests {
             receive_directory: directory.to_string_lossy().into_owned(),
         };
         (directory, storage, preferences)
+    }
+
+    fn prepare_manual_runtime_acceptance(
+        directory: &std::path::Path,
+        storage: &Storage,
+        peer_id: &str,
+        offer: &TransferOffer,
+    ) -> crate::domain::TransferRecord {
+        let preferences = TransferPreferences {
+            auto_receive_files: false,
+            receive_directory: directory.to_string_lossy().into_owned(),
+        };
+        let awaiting = persist_incoming_offer_with_preflight(
+            storage,
+            peer_id,
+            offer,
+            &preferences,
+            &|_, _, _| Ok(()),
+        )
+        .expect("persist manual awaiting transfer")
+        .transfer;
+        let destination = directory.join(format!("manual-{}", offer.file_name));
+        let token = format!("manual-token-{}", offer.transfer_id);
+        reserve_receive_path(&destination, &offer.transfer_id, &token)
+            .expect("reserve manual destination");
+        let mut accepted = awaiting;
+        accepted.local_path = Some(destination.to_string_lossy().into_owned());
+        accepted.destination_reserved = true;
+        accepted.reservation_token = Some(token);
+        accepted.status = TransferStatus::Transferring;
+        assert!(
+            storage
+                .try_accept_incoming_transfer(&accepted)
+                .expect("persist manual acceptance")
+        );
+        storage
+            .get_transfer(&offer.transfer_id)
+            .expect("reload manual acceptance")
+            .expect("manual acceptance exists")
+    }
+
+    #[test]
+    fn runtime_handler_local_validation_failure_submits_zero_requests() {
+        let (directory, storage, mut preferences) = automatic_fixture("runtime-zero-send");
+        preferences.auto_receive_files = false;
+        let offer = v2_offer();
+        let awaiting = persist_incoming_offer_with_preflight(
+            &storage,
+            "runtime-peer",
+            &offer,
+            &preferences,
+            &|_, _, _| Ok(()),
+        )
+        .expect("persist an unprepared acceptance")
+        .transfer;
+        let requests = Cell::new(0_u8);
+
+        let error = NetworkRuntime::handle_transfer_decision_submission(
+            &storage,
+            &awaiting.peer_id,
+            &awaiting.transfer_id,
+            true,
+            || {
+                requests.set(requests.get() + 1);
+                Ok(1_u8)
+            },
+        )
+        .expect_err("local validation must reject before transport submission");
+
+        assert_eq!(requests.get(), 0);
+        assert!(error.to_string().contains("未向对方发送决定"));
+        assert_eq!(
+            storage
+                .get_transfer(&offer.transfer_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            TransferStatus::AwaitingAcceptance
+        );
+        assert!(
+            storage
+                .pending_incoming_decision_token(&offer.transfer_id)
+                .unwrap()
+                .is_none()
+        );
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove zero-send fixture");
+    }
+
+    #[test]
+    fn runtime_handler_manual_send_failure_durably_rolls_back_without_active_state() {
+        let (directory, storage, _) = automatic_fixture("runtime-manual-send-failure");
+        let offer = v2_offer();
+        let accepted =
+            prepare_manual_runtime_acceptance(&directory, &storage, "runtime-peer", &offer);
+        let requests = Cell::new(0_u8);
+
+        let error = NetworkRuntime::handle_transfer_decision_submission(
+            &storage,
+            &accepted.peer_id,
+            &accepted.transfer_id,
+            true,
+            || {
+                requests.set(requests.get() + 1);
+                Err::<u8, _>(AppError::Network(
+                    "injected send_request failure".to_string(),
+                ))
+            },
+        )
+        .expect_err("send_request failure must durably compensate the manual acceptance");
+
+        assert_eq!(requests.get(), 1);
+        assert!(error.to_string().contains("send_request"));
+        let reverted = storage.get_transfer(&offer.transfer_id).unwrap().unwrap();
+        assert_eq!(reverted.status, TransferStatus::AwaitingAcceptance);
+        assert!(
+            reverted
+                .error
+                .as_deref()
+                .is_some_and(|message| message.contains("send_request"))
+        );
+        assert!(
+            storage
+                .pending_incoming_decision_token(&offer.transfer_id)
+                .unwrap()
+                .is_none()
+        );
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove manual send failure fixture");
+    }
+
+    #[test]
+    fn runtime_handler_automatic_send_failure_durably_falls_back_without_active_state() {
+        let (directory, storage, preferences) = automatic_fixture("runtime-auto-send-failure");
+        let offer = v2_offer();
+        let accepted = persist_incoming_offer_with_preflight(
+            &storage,
+            "runtime-peer",
+            &offer,
+            &preferences,
+            &|_, _, _| Ok(()),
+        )
+        .expect("prepare automatic acceptance")
+        .transfer;
+        let requests = Cell::new(0_u8);
+
+        let error = NetworkRuntime::handle_transfer_decision_submission(
+            &storage,
+            &accepted.peer_id,
+            &accepted.transfer_id,
+            true,
+            || {
+                requests.set(requests.get() + 1);
+                Err::<u8, _>(AppError::Network(
+                    "automatic send_request failed".to_string(),
+                ))
+            },
+        )
+        .expect_err("automatic transport failure must revert the exact pending action");
+
+        assert_eq!(requests.get(), 1);
+        assert!(error.to_string().contains("send_request"));
+        let reverted = storage.get_transfer(&offer.transfer_id).unwrap().unwrap();
+        assert_eq!(reverted.status, TransferStatus::AwaitingAcceptance);
+        assert!(
+            storage
+                .pending_incoming_decision_token(&offer.transfer_id)
+                .unwrap()
+                .is_none()
+        );
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove automatic send failure fixture");
+    }
+
+    #[test]
+    fn runtime_handler_automatic_success_submits_once_and_timeout_races_are_token_scoped() {
+        let (directory, storage, preferences) = automatic_fixture("runtime-auto-success-races");
+        let offer = v2_offer();
+        let accepted = persist_incoming_offer_with_preflight(
+            &storage,
+            "runtime-peer",
+            &offer,
+            &preferences,
+            &|_, _, _| Ok(()),
+        )
+        .expect("prepare automatic acceptance")
+        .transfer;
+        let requests = Cell::new(0_u8);
+
+        let submitted = NetworkRuntime::handle_transfer_decision_submission(
+            &storage,
+            &accepted.peer_id,
+            &accepted.transfer_id,
+            true,
+            || {
+                requests.set(requests.get() + 1);
+                Ok(41_u8)
+            },
+        )
+        .expect("automatic acceptance submits after durable preparation");
+
+        assert_eq!(requests.get(), 1);
+        assert_eq!(submitted.request_id, 41);
+        let token = submitted.decision_token.expect("durable pending token");
+        assert_eq!(
+            storage
+                .pending_incoming_decision_token(&offer.transfer_id)
+                .unwrap()
+                .as_deref(),
+            Some(token.as_str())
+        );
+        assert_eq!(
+            storage
+                .get_transfer(&offer.transfer_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            TransferStatus::Transferring
+        );
+
+        let duplicate = NetworkRuntime::handle_transfer_decision_submission(
+            &storage,
+            &accepted.peer_id,
+            &accepted.transfer_id,
+            true,
+            || {
+                requests.set(requests.get() + 1);
+                Ok(42_u8)
+            },
+        )
+        .expect_err("a durable pending action prevents a second decision submission");
+        assert!(duplicate.to_string().contains("未重复发送决定"));
+        assert_eq!(requests.get(), 1);
+        assert_eq!(
+            storage
+                .pending_incoming_decision_token(&offer.transfer_id)
+                .unwrap()
+                .as_deref(),
+            Some(token.as_str())
+        );
+
+        assert!(
+            storage
+                .try_claim_incoming_transfer(&offer.transfer_id, &accepted.peer_id)
+                .expect("body claim wins against timeout")
+        );
+        assert!(
+            storage
+                .pending_incoming_decision_token(&offer.transfer_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            storage
+                .rollback_pending_incoming_decision(
+                    &offer.transfer_id,
+                    &accepted.peer_id,
+                    &token,
+                    "late timeout must lose",
+                )
+                .expect("late timeout is harmless")
+                .is_none()
+        );
+        assert_eq!(
+            storage
+                .get_transfer(&offer.transfer_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            TransferStatus::Transferring
+        );
+        assert!(
+            storage
+                .try_pause_claimed_incoming_transfer(
+                    &offer.transfer_id,
+                    &accepted.peer_id,
+                    "test cleanup",
+                )
+                .expect("pause claimed fixture")
+        );
+        assert!(
+            storage
+                .try_cancel_unclaimed_incoming_transfer(
+                    &offer.transfer_id,
+                    &accepted.peer_id,
+                    accepted.transfer_protocol,
+                    "test cleanup",
+                )
+                .expect("cancel fixture")
+        );
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove automatic success fixture");
+    }
+
+    #[test]
+    fn runtime_handler_timeout_then_late_response_rolls_back_only_once() {
+        let (directory, storage, _) = automatic_fixture("runtime-timeout-response-race");
+        let offer = v2_offer();
+        let accepted =
+            prepare_manual_runtime_acceptance(&directory, &storage, "runtime-peer", &offer);
+        let submitted = NetworkRuntime::handle_transfer_decision_submission(
+            &storage,
+            &accepted.peer_id,
+            &accepted.transfer_id,
+            true,
+            || Ok(43_u8),
+        )
+        .expect("submit pending acceptance");
+        let token = submitted.decision_token.expect("pending token");
+
+        let timed_out = storage
+            .rollback_pending_incoming_decision(
+                &offer.transfer_id,
+                &accepted.peer_id,
+                &token,
+                "timeout wins",
+            )
+            .expect("timeout rollback")
+            .expect("timeout changes the transfer");
+        assert_eq!(timed_out.status, TransferStatus::AwaitingAcceptance);
+        assert!(
+            storage
+                .rollback_pending_incoming_decision(
+                    &offer.transfer_id,
+                    &accepted.peer_id,
+                    &token,
+                    "late rejected response",
+                )
+                .expect("late response is harmless")
+                .is_none()
+        );
+        assert_eq!(
+            storage
+                .get_transfer(&offer.transfer_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            TransferStatus::AwaitingAcceptance
+        );
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove timeout race fixture");
     }
 
     fn large_v2_offer() -> TransferOffer {
@@ -1921,6 +2390,80 @@ mod tests {
     }
 
     #[test]
+    fn automatic_fallback_is_durable_before_unavailable_media_cleanup() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-automatic-durable-fallback-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let directory = fixture.join("selected-media");
+        fs::create_dir_all(&directory).expect("create selected media fixture");
+        let storage = Storage::open(&fixture.join("localnet.sqlite3"))
+            .expect("open durable fallback storage");
+        let preferences = TransferPreferences {
+            auto_receive_files: true,
+            receive_directory: directory.to_string_lossy().into_owned(),
+        };
+        let offer = v2_offer();
+        let detached = fixture.join("detached-media");
+
+        let outcome = persist_incoming_offer_with_preflight_and_accept(
+            &storage,
+            "automatic-preflight-peer",
+            &offer,
+            &preferences,
+            &|_, _, _| Ok(()),
+            &|_, _| {
+                fs::rename(&directory, &detached).expect("detach selected media before fallback");
+                Err(AppError::Storage(
+                    "injected setup failure while media is unavailable".to_string(),
+                ))
+            },
+        )
+        .expect("filesystem cleanup failure must not erase the durable manual fallback");
+
+        assert!(outcome.transfer_decision.is_none());
+        assert_eq!(outcome.transfer.status, TransferStatus::AwaitingAcceptance);
+        assert!(
+            outcome
+                .transfer
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("media is unavailable"))
+        );
+        drop(storage);
+
+        let storage = Storage::open(&fixture.join("localnet.sqlite3"))
+            .expect("reopen database while selected media remains detached");
+        let durable = storage
+            .get_transfer(&offer.transfer_id)
+            .expect("reload durable fallback")
+            .expect("fallback transfer exists");
+        assert_eq!(durable.status, TransferStatus::AwaitingAcceptance);
+        assert!(
+            durable
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("media is unavailable"))
+        );
+
+        drop(storage);
+        fs::rename(&detached, &directory).expect("restore selected media");
+        let storage = Storage::open(&fixture.join("localnet.sqlite3"))
+            .expect("reopen storage to drain deferred cleanup");
+        assert!(
+            fs::read_dir(&directory)
+                .expect("list restored media")
+                .filter_map(Result::ok)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".weline-localnet"))
+        );
+        drop(storage);
+        fs::remove_dir_all(fixture).expect("remove durable fallback fixture");
+    }
+
+    #[test]
     fn automatic_partial_setup_failure_cleans_owned_partial_and_retains_awaiting_row() {
         let (directory, storage, preferences) = automatic_fixture("partial-setup-failure");
         let offer = v2_offer();
@@ -1960,6 +2503,67 @@ mod tests {
         );
         drop(storage);
         fs::remove_dir_all(directory).expect("remove partial compensation fixture");
+    }
+
+    #[test]
+    fn automatic_partial_failure_persists_tombstone_before_unavailable_media_cleanup() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-partial-cleanup-pending-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let media = fixture.join("selected-media");
+        let detached = fixture.join("detached-media");
+        fs::create_dir_all(&media).expect("create selected media");
+        let storage = Storage::open(&fixture.join("localnet.sqlite3")).expect("open storage");
+        let preferences = TransferPreferences {
+            auto_receive_files: true,
+            receive_directory: media.to_string_lossy().into_owned(),
+        };
+        let offer = v2_offer();
+
+        let outcome = persist_incoming_offer_with_preflight_and_accept(
+            &storage,
+            "automatic-preflight-peer",
+            &offer,
+            &preferences,
+            &|_, _, _| Ok(()),
+            &|storage, accepted| {
+                storage.try_accept_incoming_transfer_with_hook(accepted, &mut |phase| {
+                    if phase == IncomingAcceptancePhase::AfterPartialSetup {
+                        fs::rename(&media, &detached)
+                            .expect("detach media after owned partial setup");
+                        return Err(AppError::Storage(
+                            "injected partial persistence failure".to_string(),
+                        ));
+                    }
+                    Ok(())
+                })
+            },
+        )
+        .expect("partial cleanup failure must retain an actionable manual fallback");
+
+        assert_eq!(outcome.transfer.status, TransferStatus::AwaitingAcceptance);
+        assert!(outcome.transfer_decision.is_none());
+        let pending = storage
+            .drain_incoming_cleanup_before_acceptance(&offer.transfer_id)
+            .expect_err("detached media retains the exact cleanup tombstone");
+        assert!(pending.to_string().contains("cleanup pending"));
+
+        fs::rename(&detached, &media).expect("restore selected media");
+        storage
+            .drain_incoming_cleanup_before_acceptance(&offer.transfer_id)
+            .expect("restored media drains the owned partial and reservation");
+        assert!(
+            fs::read_dir(&media)
+                .expect("list restored media")
+                .filter_map(Result::ok)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".weline-localnet"))
+        );
+        drop(storage);
+        fs::remove_dir_all(fixture).expect("remove partial cleanup pending fixture");
     }
 
     #[test]

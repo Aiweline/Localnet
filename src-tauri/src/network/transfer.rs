@@ -127,11 +127,17 @@ pub fn spawn_outgoing_transfer(
     });
 }
 
-pub fn spawn_incoming_start_timeout(transfer_id: String, storage: Storage, app_handle: AppHandle) {
+pub fn spawn_incoming_start_timeout(
+    transfer_id: String,
+    decision_token: String,
+    storage: Storage,
+    app_handle: AppHandle,
+) {
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(INCOMING_START_TIMEOUT).await;
         let result = fail_pending_incoming_decision(
             &transfer_id,
+            &decision_token,
             &storage,
             &app_handle,
             "对方未在限定时间内开始传输，请重新确认接收".to_string(),
@@ -144,13 +150,20 @@ pub fn spawn_incoming_start_timeout(transfer_id: String, storage: Storage, app_h
 
 pub fn fail_pending_incoming_decision(
     transfer_id: &str,
+    decision_token: &str,
     storage: &Storage,
     app_handle: &AppHandle,
     message: String,
 ) -> Result<(), AppError> {
-    if let Some(updated) =
-        return_pending_incoming_decision_to_manual(transfer_id, storage, message.clone())?
-    {
+    let Some(candidate) = storage.get_transfer(transfer_id)? else {
+        return Ok(());
+    };
+    if let Some(updated) = storage.rollback_pending_incoming_decision(
+        transfer_id,
+        &candidate.peer_id,
+        decision_token,
+        &message,
+    )? {
         emit_event(
             app_handle,
             &NetworkEvent::TransferUpdated { transfer: updated },
