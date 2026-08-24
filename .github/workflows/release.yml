@@ -39,6 +39,9 @@ jobs:
       - name: Run presence regression test
         run: node --test --experimental-strip-types tests/presence.test.ts
 
+      - name: Run transfer status regression test
+        run: node --test --experimental-strip-types tests/transfer-status.test.ts
+
       - name: Validate synchronized versions
         id: version
         shell: bash

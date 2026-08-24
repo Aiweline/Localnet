@@ -13,6 +13,7 @@ import {
   UsersRound, Wifi, WifiOff, X,
 } from "lucide-react";
 import { mergePresenceSnapshot, startSnapshotReconciliation } from "./presence";
+import { transferStatusPresentation, type TransferStatusInput } from "./transfer-status";
 import "./styles.css";
 
 type Platform = "windows" | "macos" | "unknown";
@@ -21,14 +22,13 @@ type FriendRequestStatus = "pending" | "accepted" | "rejected";
 type MessageKind = "text" | "image" | "file";
 type MessageStatus = "sending" | "delivered" | "failed";
 type TransferKind = "image" | "file";
-type TransferStatus = "awaitingAcceptance" | "transferring" | "completed" | "cancelled" | "failed";
 
 interface LocalProfile { peerId: string; nickname: string; platform: Platform; protocolVersion: number }
 interface PeerSummary { peerId: string; nickname: string; platform: Platform; online: boolean; protocolVersion: number; lastSeen: string }
 interface FriendRequest { requestId: string; peerId: string; nickname: string; direction: Direction; status: FriendRequestStatus; createdAt: string; updatedAt: string }
 interface Friend { peerId: string; nickname: string; platform: Platform; online: boolean; addedAt: string; lastSeen: string }
 interface ChatMessage { messageId: string; peerId: string; direction: Direction; kind: MessageKind; body?: string; localPath?: string; fileName?: string; fileSize?: number; status: MessageStatus; error?: string; createdAt: string }
-interface TransferRecord { transferId: string; peerId: string; direction: Direction; kind: TransferKind; fileName: string; fileSize: number; mimeType: string; sha256: string; localPath?: string; transferredBytes: number; status: TransferStatus; error?: string; createdAt: string; updatedAt: string }
+interface TransferRecord extends TransferStatusInput { transferId: string; peerId: string; kind: TransferKind; fileName: string; mimeType: string; sha256: string; localPath?: string; createdAt: string; updatedAt: string }
 interface TransferPreferences { autoReceiveFiles: boolean; receiveDirectory: string }
 interface PresenceSnapshot { peers: PeerSummary[]; friends: Friend[] }
 interface BootstrapSnapshot { localProfile: LocalProfile | null; transferPreferences: TransferPreferences; peers: PeerSummary[]; friendRequests: FriendRequest[]; friends: Friend[]; messages: ChatMessage[]; transfers: TransferRecord[] }
@@ -406,7 +406,7 @@ function Conversation({ friend, messages, transfers, messageText, setMessageText
         {timeline.map((item) => item.type === "message" ? (
           <MessageBubble key={item.message.messageId} message={item.message} transfer={transferMap.get(item.message.messageId)} busy={busyKey === `retry:${item.message.messageId}` || busyKey === `transfer:${item.message.messageId}`} onRetry={onRetry} onCancelTransfer={onCancelTransfer} />
         ) : (
-          <TransferOfferCard key={item.transfer.transferId} transfer={item.transfer} busy={busyKey === `transfer:${item.transfer.transferId}`} onResolve={onResolveTransfer} />
+          <TransferOfferCard key={item.transfer.transferId} transfer={item.transfer} busy={busyKey === `transfer:${item.transfer.transferId}`} onResolve={onResolveTransfer} onCancel={onCancelTransfer} />
         ))}
         <div ref={bottomRef} />
       </div>
@@ -430,14 +430,15 @@ function Conversation({ friend, messages, transfers, messageText, setMessageText
 
 function MessageBubble({ message, transfer, busy, onRetry, onCancelTransfer }: { message: ChatMessage; transfer?: TransferRecord; busy: boolean; onRetry: (messageId: string) => void; onCancelTransfer: (transferId: string) => void }) {
   const outgoing = message.direction === "outgoing";
+  const presentation = transfer ? transferStatusPresentation(transfer) : null;
   return (
     <div className={`message-line ${outgoing ? "outgoing" : "incoming"}`}>
       <div className={`message-bubble ${message.kind !== "text" ? "attachment-bubble" : ""}`}>
         {message.kind === "text" ? <p>{message.body}</p> : message.kind === "image" ? <ImageMessage message={message} /> : <FileMessage message={message} />}
-        {transfer && transfer.status !== "completed" && <TransferProgress transfer={transfer} />}
+        {transfer && <TransferStatusDisplay transfer={transfer} />}
         <div className="message-meta"><span>{formatTime(message.createdAt)}</span>{outgoing && <MessageStatusIcon status={message.status} />}</div>
         {message.status === "failed" && <div className="message-error"><AlertCircle size={13} /><span>{message.error || transfer?.error || "发送失败"}</span>{message.kind === "text" && <button disabled={busy} onClick={() => onRetry(message.messageId)}>{busy ? <LoaderCircle size={12} className="spin" /> : <RefreshCw size={12} />} 重试</button>}</div>}
-        {transfer?.direction === "outgoing" && transfer.status === "awaitingAcceptance" && <button className="cancel-link" disabled={busy} onClick={() => onCancelTransfer(transfer.transferId)}>取消发送</button>}
+        {transfer && presentation?.showCancel && <button type="button" className="cancel-link" disabled={busy} onClick={() => onCancelTransfer(transfer.transferId)}>取消传输</button>}
       </div>
     </div>
   );
@@ -457,15 +458,15 @@ function FileMessage({ message }: { message: ChatMessage }) {
   return <div className="file-message"><span className="file-icon"><File size={22} /></span><span><strong>{message.fileName || "文件"}</strong><small>{formatBytes(message.fileSize || 0)}</small></span>{message.status === "delivered" && message.localPath && <button title="打开文件" onClick={() => void openPath(message.localPath!)}><FileDown size={17} /></button>}</div>;
 }
 
-function TransferOfferCard({ transfer, busy, onResolve }: { transfer: TransferRecord; busy: boolean; onResolve: (transfer: TransferRecord, accepted: boolean) => void }) {
+function TransferOfferCard({ transfer, busy, onResolve, onCancel }: { transfer: TransferRecord; busy: boolean; onResolve: (transfer: TransferRecord, accepted: boolean) => void; onCancel: (transferId: string) => void }) {
   const incoming = transfer.direction === "incoming";
-  return <div className={`message-line ${incoming ? "incoming" : "outgoing"}`}><div className="transfer-card"><span className="file-icon"><FileDown size={22} /></span><span><small>{incoming ? "收到文件" : "正在发送"}</small><strong>{transfer.fileName}</strong><em>{formatBytes(transfer.fileSize)}</em></span>{incoming && transfer.status === "awaitingAcceptance" ? <div className="transfer-actions"><button disabled={busy} onClick={() => onResolve(transfer, false)}>拒绝</button><button className="primary" disabled={busy} onClick={() => onResolve(transfer, true)}>{busy ? <LoaderCircle size={14} className="spin" /> : <FileDown size={14} />} 接收</button></div> : <TransferProgress transfer={transfer} />}</div></div>;
+  const presentation = transferStatusPresentation(transfer);
+  return <div className={`message-line ${incoming ? "incoming" : "outgoing"}`}><div className={`transfer-card ${presentation.tone}`}><span className="file-icon"><FileDown size={22} /></span><span><small>{incoming ? "收到文件" : "正在发送"}</small><strong>{transfer.fileName}</strong><em>{formatBytes(transfer.fileSize)}</em></span>{incoming && transfer.status === "awaitingAcceptance" ? <div className="transfer-actions"><button type="button" disabled={busy} onClick={() => onResolve(transfer, false)}>拒绝</button><button type="button" className="primary" disabled={busy} onClick={() => onResolve(transfer, true)}>{busy ? <LoaderCircle size={14} className="spin" /> : <FileDown size={14} />} 接收</button></div> : <><TransferStatusDisplay transfer={transfer} />{presentation.showCancel && <button type="button" className="cancel-link" disabled={busy} onClick={() => onCancel(transfer.transferId)}>取消传输</button>}</>}</div></div>;
 }
 
-function TransferProgress({ transfer }: { transfer: TransferRecord }) {
-  const percent = transfer.fileSize === 0 ? 100 : Math.min(100, Math.round((transfer.transferredBytes / transfer.fileSize) * 100));
-  const label: Record<TransferStatus, string> = { awaitingAcceptance: transfer.direction === "outgoing" ? "等待对方接收" : "等待确认", transferring: `传输中 ${percent}%`, completed: "已完成", cancelled: "已取消", failed: "传输失败" };
-  return <div className={`transfer-progress ${transfer.status}`}><div><span style={{ width: `${percent}%` }} /></div><small>{label[transfer.status]}</small></div>;
+function TransferStatusDisplay({ transfer }: { transfer: TransferRecord }) {
+  const presentation = transferStatusPresentation(transfer);
+  return <div className={`transfer-progress ${transfer.status} ${presentation.tone}`} role="status" aria-live={transfer.status === "paused" ? "polite" : undefined}>{presentation.showProgress && <div role="progressbar" aria-label={presentation.label} aria-valuemin={0} aria-valuemax={100} aria-valuenow={presentation.percent} aria-valuetext={presentation.label}><span style={{ width: `${presentation.percent}%` }} /></div>}<small>{presentation.label}</small></div>;
 }
 
 function MessageStatusIcon({ status }: { status: MessageStatus }) {
