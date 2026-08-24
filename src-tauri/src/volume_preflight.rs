@@ -1,4 +1,8 @@
-use std::path::Path;
+use std::{
+    fs::{self, OpenOptions},
+    io::Write,
+    path::Path,
+};
 
 use crate::{
     error::AppError,
@@ -7,6 +11,7 @@ use crate::{
 
 const DESTINATION_SPACE_RESERVE_CHUNKS: u64 = 16;
 const FAT32_MAX_FILE_BYTES: u64 = (4 * 1024 * 1024 * 1024) - 1;
+const WRITE_PROBE_ATTEMPTS: u8 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VolumeSnapshot {
@@ -85,9 +90,75 @@ pub fn preflight_destination(
     file_size: u64,
     committed_bytes: u64,
 ) -> Result<VolumeSnapshot, AppError> {
+    // The receiver creates its `.part` file inside this directory, so it remains on this volume.
+    probe_writable_directory(directory)?;
     let snapshot = inspect_volume(directory)?;
     validate_volume(&snapshot, file_size, committed_bytes)?;
     Ok(snapshot)
+}
+
+fn probe_writable_directory(directory: &Path) -> Result<(), AppError> {
+    let metadata = fs::metadata(directory).map_err(|error| {
+        AppError::Storage(format!(
+            "无法访问接收目录 {}：{error}；请选择可访问且可写入的目录后重试",
+            directory.display()
+        ))
+    })?;
+    if !metadata.is_dir() {
+        return Err(AppError::Storage(format!(
+            "接收位置 {} 不是目录；请选择可写入的目录后重试",
+            directory.display()
+        )));
+    }
+
+    for _ in 0..WRITE_PROBE_ATTEMPTS {
+        let probe_path = directory.join(format!(
+            ".localnet-write-probe-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe_path)
+        {
+            Ok(mut file) => {
+                let write_result = file.write_all(&[0]).map_err(|error| {
+                    AppError::Storage(format!(
+                        "无法写入接收目录 {}：{error}；请选择可写入的目录后重试",
+                        directory.display()
+                    ))
+                });
+                drop(file);
+                let cleanup_result = fs::remove_file(&probe_path).map_err(|error| {
+                    AppError::Storage(format!(
+                        "无法清理接收目录 {} 的写入检查文件：{error}；请选择可写入的目录后重试",
+                        directory.display()
+                    ))
+                });
+
+                return match (write_result, cleanup_result) {
+                    (Ok(()), Ok(())) => Ok(()),
+                    (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+                    (Err(write_error), Err(cleanup_error)) => Err(AppError::Storage(format!(
+                        "{write_error}；另一个检查文件无法清理：{cleanup_error}"
+                    ))),
+                };
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(AppError::Storage(format!(
+                    "无法在接收目录 {} 创建写入检查文件：{error}；请选择可写入的目录后重试",
+                    directory.display()
+                )));
+            }
+        }
+    }
+
+    Err(AppError::Storage(format!(
+        "无法在接收目录 {} 创建唯一的写入检查文件；请重新选择目录后重试",
+        directory.display()
+    )))
 }
 
 fn normalize_filesystem_name(filesystem: &str) -> String {
@@ -99,7 +170,7 @@ fn normalize_filesystem_name(filesystem: &str) -> String {
 
 fn maximum_file_bytes(filesystem: &str) -> Option<u64> {
     match normalize_filesystem_name(filesystem).as_str() {
-        "FAT32" => Some(FAT32_MAX_FILE_BYTES),
+        "FAT32" | "MSDOS" => Some(FAT32_MAX_FILE_BYTES),
         _ => None,
     }
 }
@@ -273,7 +344,12 @@ mod platform {
 
 #[cfg(test)]
 mod tests {
-    use super::{VolumeSnapshot, validate_volume};
+    use std::{fs, path::PathBuf};
+
+    use super::{
+        FAT32_MAX_FILE_BYTES, VolumeSnapshot, maximum_file_bytes, preflight_destination,
+        validate_volume,
+    };
     use crate::transfer_policy::TRANSFER_CHUNK_BYTES;
 
     const GIB: u64 = 1024 * 1024 * 1024;
@@ -308,14 +384,18 @@ mod tests {
     }
 
     #[test]
-    fn fat32_rejects_a_five_gib_file() {
-        let snapshot = VolumeSnapshot::known("\0 fat32 \0", 10 * GIB, Some(4 * GIB - 1));
-        assert!(
-            validate_volume(&snapshot, 5 * GIB, 0)
-                .unwrap_err()
-                .to_string()
-                .contains("FAT32")
-        );
+    fn fat32_aliases_reject_a_five_gib_file_through_the_production_mapping() {
+        for filesystem in ["FAT32", "MSDOS", "msdos"] {
+            let snapshot =
+                VolumeSnapshot::known(filesystem, 10 * GIB, maximum_file_bytes(filesystem));
+            assert_eq!(snapshot.max_file_bytes, Some(FAT32_MAX_FILE_BYTES));
+            assert!(
+                validate_volume(&snapshot, 5 * GIB, 0)
+                    .unwrap_err()
+                    .to_string()
+                    .contains(&snapshot.filesystem)
+            );
+        }
     }
 
     #[test]
@@ -334,5 +414,31 @@ mod tests {
             VolumeSnapshot::known("NTFS", file_size - committed_bytes + RESERVE_BYTES, None);
 
         validate_volume(&snapshot, file_size, committed_bytes).unwrap();
+    }
+
+    #[test]
+    fn preflight_rejects_a_target_that_is_not_a_writable_directory() {
+        let file_path = unique_test_path("not-a-directory");
+        fs::write(&file_path, b"not a directory").unwrap();
+        let _cleanup = TestFileCleanup(file_path.clone());
+
+        assert!(
+            preflight_destination(&file_path, 0, 0)
+                .unwrap_err()
+                .to_string()
+                .contains("目录")
+        );
+    }
+
+    fn unique_test_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("localnet-{name}-{}", uuid::Uuid::now_v7()))
+    }
+
+    struct TestFileCleanup(PathBuf);
+
+    impl Drop for TestFileCleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
     }
 }
