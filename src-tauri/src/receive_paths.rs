@@ -164,6 +164,46 @@ pub fn remove_owned_reservation(
     Ok(true)
 }
 
+pub fn resumable_partial_path(destination: &Path, transfer_id: &str) -> io::Result<PathBuf> {
+    let directory = destination
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "接收文件保存位置无效"))?;
+    let transfer_id = transfer_id.trim();
+    if transfer_id.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "文件传输编号无效",
+        ));
+    }
+    let digest = hex::encode(Sha256::digest(transfer_id.as_bytes()));
+    Ok(directory.join(format!(".weline-localnet-partial-{}.part", &digest[..24])))
+}
+
+pub fn remove_owned_partial(
+    partial: &Path,
+    destination: &Path,
+    transfer_id: &str,
+) -> io::Result<bool> {
+    let expected = resumable_partial_path(destination, transfer_id)?;
+    if partial != expected || partial == destination {
+        return Ok(false);
+    }
+    match fs::remove_file(partial) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if partial.parent().is_some_and(|parent| parent.is_dir()) {
+                Ok(true)
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "接收目录或磁盘当前不可用",
+                ))
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub fn finalize_reserved_receive(
     partial: &Path,
     reserved_destination: &Path,
@@ -322,8 +362,9 @@ mod tests {
 
     use super::{
         commit_without_overwrite, copy_without_overwrite, finalize_reserved_receive,
-        remove_owned_reservation, reservation_is_owned, reserve_available_receive_path,
-        reserve_receive_path, safe_file_name,
+        remove_owned_partial, remove_owned_reservation, reservation_is_owned,
+        reserve_available_receive_path, reserve_receive_path, resumable_partial_path,
+        safe_file_name,
     };
 
     fn temporary_directory(label: &str) -> std::path::PathBuf {
@@ -486,6 +527,62 @@ mod tests {
         assert_eq!(
             fs::read(&destination).expect("read preserved destination"),
             b"user-or-received-data"
+        );
+        fs::remove_dir_all(directory).expect("remove receive fixture");
+    }
+
+    #[test]
+    fn resumable_partial_is_hidden_deterministic_and_on_destination_volume() {
+        let directory = temporary_directory("deterministic-partial");
+        let destination = directory.join("Report.bin");
+
+        let first = resumable_partial_path(&destination, "A0B1-C2D3")
+            .expect("derive deterministic partial path");
+        let repeated = resumable_partial_path(&destination, "A0B1-C2D3")
+            .expect("derive repeated partial path");
+        let differently_cased = resumable_partial_path(&destination, "a0b1-c2d3")
+            .expect("derive case-distinct partial path");
+
+        assert_eq!(first, repeated);
+        assert_ne!(first, differently_cased);
+        assert_eq!(first.parent(), destination.parent());
+        let file_name = first
+            .file_name()
+            .and_then(|value| value.to_str())
+            .expect("partial file name");
+        assert!(file_name.starts_with('.'));
+        assert!(file_name.ends_with(".part"));
+    }
+
+    #[test]
+    fn owned_partial_cleanup_rejects_unrelated_paths_and_preserves_destination() {
+        let directory = temporary_directory("owned-partial-cleanup");
+        fs::create_dir_all(&directory).expect("create receive directory");
+        let destination = directory.join("report.bin");
+        let partial = resumable_partial_path(&destination, "transfer-one")
+            .expect("derive deterministic partial path");
+        let unrelated = directory.join("user-data.part");
+        fs::write(&destination, b"completed-or-user-data").expect("write destination");
+        fs::write(&partial, b"owned-partial").expect("write owned partial");
+        fs::write(&unrelated, b"unrelated").expect("write unrelated file");
+
+        assert!(
+            !remove_owned_partial(&unrelated, &destination, "transfer-one")
+                .expect("reject unrelated cleanup")
+        );
+        assert!(partial.exists());
+        assert!(
+            remove_owned_partial(&partial, &destination, "transfer-one")
+                .expect("remove exact owned partial")
+        );
+        assert!(!partial.exists());
+        assert_eq!(
+            fs::read(&destination).expect("read preserved destination"),
+            b"completed-or-user-data"
+        );
+        assert_eq!(
+            fs::read(&unrelated).expect("read unrelated file"),
+            b"unrelated"
         );
         fs::remove_dir_all(directory).expect("remove receive fixture");
     }

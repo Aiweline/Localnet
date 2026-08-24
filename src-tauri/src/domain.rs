@@ -97,6 +97,7 @@ string_enum!(TransferKind {
 string_enum!(TransferStatus {
     AwaitingAcceptance => "awaitingAcceptance",
     Transferring => "transferring",
+    Paused => "paused",
     Completed => "completed",
     Cancelled => "cancelled",
     Failed => "failed",

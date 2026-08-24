@@ -12,8 +12,8 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use super::{
     resumable_transfer::{
-        open_resumable_partial, receive_acknowledged_chunks, send_acknowledged_chunks,
-        verify_committed_manifest,
+        is_recoverable_transport_error, open_resumable_partial, receive_acknowledged_chunks,
+        send_acknowledged_chunks, verify_committed_manifest,
     },
     runtime::{NetworkEvent, emit_event},
 };
@@ -124,6 +124,24 @@ pub fn fail_pending_incoming_decision(
         || candidate.status != TransferStatus::Transferring
         || !storage.try_claim_incoming_transfer(transfer_id, &candidate.peer_id)?
     {
+        return Ok(());
+    }
+    if candidate.transfer_protocol == TransferProtocol::ResumableV2 as u8 {
+        if storage.try_pause_claimed_incoming_transfer(transfer_id, &candidate.peer_id, &message)? {
+            if let Some(updated) = storage.get_transfer(transfer_id)? {
+                emit_event(
+                    app_handle,
+                    &NetworkEvent::TransferUpdated { transfer: updated },
+                );
+            }
+            emit_event(
+                app_handle,
+                &NetworkEvent::NetworkError {
+                    code: "transfer.receive_not_started".to_string(),
+                    message,
+                },
+            );
+        }
         return Ok(());
     }
     let result = storage
@@ -425,16 +443,30 @@ async fn receive_resumable_transfer(
         header.start_offset,
     )
     .await;
-    if let Err(error) = storage.release_incoming_transfer_claim(&transfer.transfer_id) {
-        tracing::warn!(
-            transfer_id = %transfer.transfer_id,
-            %error,
-            "failed to release resumable incoming transfer claim"
-        );
-    }
-    if let Err(error) = result {
+    if let Err(error) = &result {
+        let changed = if is_recoverable_transport_error(error) {
+            storage.try_pause_claimed_incoming_transfer(
+                &transfer.transfer_id,
+                &transfer.peer_id,
+                &error.to_string(),
+            )?
+        } else {
+            storage.try_fail_claimed_incoming_transfer(
+                &transfer.transfer_id,
+                &transfer.peer_id,
+                &error.to_string(),
+            )?
+        };
+        if changed {
+            if let Some(updated) = storage.get_transfer(&transfer.transfer_id)? {
+                emit_event(
+                    &app_handle,
+                    &NetworkEvent::TransferUpdated { transfer: updated },
+                );
+            }
+        }
         let _ = stream.close().await;
-        return Err(error);
+        return result;
     }
     stream.close().await?;
     Ok(())
@@ -696,7 +728,15 @@ fn complete_incoming(
     transfer.status = TransferStatus::Completed;
     transfer.error = None;
     transfer.updated_at = now_rfc3339();
-    storage.upsert_transfer(&transfer)?;
+    if transfer.transfer_protocol == TransferProtocol::ResumableV2 as u8 {
+        if !storage.try_complete_claimed_incoming_transfer(&transfer)? {
+            return Err(AppError::Storage(
+                "可恢复接收完成状态已变化，未覆盖当前记录".to_string(),
+            ));
+        }
+    } else {
+        storage.upsert_transfer(&transfer)?;
+    }
     let message = ChatMessage {
         message_id: transfer.transfer_id.clone(),
         peer_id: transfer.peer_id.clone(),

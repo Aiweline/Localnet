@@ -1,5 +1,6 @@
 use std::{
-    path::Path,
+    fs::{self, OpenOptions},
+    path::{Path, PathBuf},
     str::FromStr,
     sync::{Arc, Mutex, MutexGuard},
 };
@@ -13,7 +14,7 @@ use crate::{
         TransferKind, TransferPreferences, TransferRecord, TransferStatus,
     },
     error::AppError,
-    receive_paths::remove_owned_reservation,
+    receive_paths::{remove_owned_partial, remove_owned_reservation, resumable_partial_path},
     transfer_manifest::{
         TransferChunk, decode_sha256, expected_chunk_count, expected_chunk_length, manifest_root,
         validate_transfer_metadata,
@@ -40,6 +41,8 @@ impl Storage {
         };
         storage.migrate()?;
         storage.reset_ephemeral_state()?;
+        storage.reconcile_resumable_partials()?;
+        storage.cleanup_stale_owned_artifacts()?;
         Ok(storage)
     }
 
@@ -361,10 +364,11 @@ impl Storage {
     }
 
     pub fn upsert_transfer(&self, transfer: &TransferRecord) -> Result<(), AppError> {
-        let source_modified_ns = validate_transfer_for_storage(transfer)?;
+        let transfer = transfer_with_resumable_partial(transfer)?;
+        let source_modified_ns = validate_transfer_for_storage(&transfer)?;
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
-        Self::upsert_transfer_in_transaction(&transaction, transfer, source_modified_ns)?;
+        Self::upsert_transfer_in_transaction(&transaction, &transfer, source_modified_ns)?;
         transaction.commit()?;
         Ok(())
     }
@@ -605,20 +609,256 @@ impl Storage {
     ) -> Result<bool, AppError> {
         let connection = self.connection()?;
         let changed = connection.execute(
-            "UPDATE transfers SET receive_claimed = 1
+            "UPDATE transfers
+             SET receive_claimed = 1,
+                 status = CASE WHEN transfer_protocol = 2 THEN 'transferring' ELSE status END,
+                 error = CASE WHEN transfer_protocol = 2 THEN NULL ELSE error END,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
              WHERE transfer_id = ?1 AND peer_id = ?2 AND direction = 'incoming'
-               AND status = 'transferring' AND receive_claimed = 0",
+               AND receive_claimed = 0
+               AND ((transfer_protocol = 2 AND status IN ('paused', 'transferring'))
+                    OR (transfer_protocol != 2 AND status = 'transferring'))",
             params![transfer_id, peer_id],
         )?;
         Ok(changed == 1)
     }
 
+    #[allow(dead_code)] // Task 7 consumes the outbound resume claim API.
+    pub fn try_claim_outgoing_transfer(
+        &self,
+        transfer_id: &str,
+        peer_id: &str,
+    ) -> Result<bool, AppError> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE transfers
+             SET send_claimed = 1, status = 'transferring', error = NULL,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE transfer_id = ?1 AND peer_id = ?2 AND direction = 'outgoing'
+               AND transfer_protocol = 2 AND status IN ('paused', 'transferring')
+               AND send_claimed = 0",
+            params![transfer_id, peer_id],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn try_pause_claimed_incoming_transfer(
+        &self,
+        transfer_id: &str,
+        peer_id: &str,
+        error: &str,
+    ) -> Result<bool, AppError> {
+        self.try_transition_claimed_incoming_transfer(
+            transfer_id,
+            peer_id,
+            TransferStatus::Paused,
+            Some(error),
+        )
+    }
+
+    pub fn try_fail_claimed_incoming_transfer(
+        &self,
+        transfer_id: &str,
+        peer_id: &str,
+        error: &str,
+    ) -> Result<bool, AppError> {
+        let changed = self.try_transition_claimed_incoming_transfer(
+            transfer_id,
+            peer_id,
+            TransferStatus::Failed,
+            Some(error),
+        )?;
+        if changed {
+            self.cleanup_owned_transfer_artifacts(transfer_id)?;
+        }
+        Ok(changed)
+    }
+
+    pub fn try_complete_claimed_incoming_transfer(
+        &self,
+        transfer: &TransferRecord,
+    ) -> Result<bool, AppError> {
+        if transfer.direction != Direction::Incoming
+            || transfer.transfer_protocol != 2
+            || transfer.status != TransferStatus::Completed
+            || transfer.local_path.is_none()
+            || transfer.partial_path.is_some()
+            || transfer.transferred_bytes != transfer.file_size
+        {
+            return Err(AppError::InvalidInput("可恢复接收完成状态无效".to_string()));
+        }
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE transfers
+             SET local_path = ?3, destination_reserved = ?4, reservation_token = ?5,
+                 partial_path = NULL, transferred_bytes = file_size, status = 'completed',
+                 error = NULL, receive_claimed = 0, updated_at = ?6
+             WHERE transfer_id = ?1 AND peer_id = ?2 AND direction = 'incoming'
+               AND transfer_protocol = 2 AND status = 'transferring' AND receive_claimed = 1",
+            params![
+                transfer.transfer_id,
+                transfer.peer_id,
+                transfer.local_path,
+                transfer.destination_reserved,
+                transfer.reservation_token,
+                transfer.updated_at,
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    fn try_transition_claimed_incoming_transfer(
+        &self,
+        transfer_id: &str,
+        peer_id: &str,
+        status: TransferStatus,
+        error: Option<&str>,
+    ) -> Result<bool, AppError> {
+        if !matches!(status, TransferStatus::Paused | TransferStatus::Failed) {
+            return Err(AppError::InvalidInput(
+                "接收文件的已占用状态转换无效".to_string(),
+            ));
+        }
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE transfers
+             SET status = ?3, error = ?4, receive_claimed = 0,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE transfer_id = ?1 AND peer_id = ?2 AND direction = 'incoming'
+               AND transfer_protocol = 2 AND status = 'transferring' AND receive_claimed = 1",
+            params![transfer_id, peer_id, status.as_str(), error],
+        )?;
+        Ok(changed == 1)
+    }
+
+    #[allow(dead_code)] // Task 7 maps recoverable send failures to this CAS.
+    pub fn try_pause_claimed_outgoing_transfer(
+        &self,
+        transfer_id: &str,
+        peer_id: &str,
+        error: &str,
+    ) -> Result<bool, AppError> {
+        self.try_transition_claimed_outgoing_transfer(
+            transfer_id,
+            peer_id,
+            TransferStatus::Paused,
+            Some(error),
+        )
+    }
+
+    #[allow(dead_code)] // Task 7 maps terminal send failures to this CAS.
+    pub fn try_fail_claimed_outgoing_transfer(
+        &self,
+        transfer_id: &str,
+        peer_id: &str,
+        error: &str,
+    ) -> Result<bool, AppError> {
+        let changed = self.try_transition_claimed_outgoing_transfer(
+            transfer_id,
+            peer_id,
+            TransferStatus::Failed,
+            Some(error),
+        )?;
+        if changed {
+            self.delete_terminal_transfer_chunks(transfer_id)?;
+        }
+        Ok(changed)
+    }
+
+    #[allow(dead_code)] // Task 7 completes claimed resumable sends through this CAS.
+    pub fn try_complete_claimed_outgoing_transfer(
+        &self,
+        transfer_id: &str,
+        peer_id: &str,
+    ) -> Result<bool, AppError> {
+        self.try_transition_claimed_outgoing_transfer(
+            transfer_id,
+            peer_id,
+            TransferStatus::Completed,
+            None,
+        )
+    }
+
+    fn try_transition_claimed_outgoing_transfer(
+        &self,
+        transfer_id: &str,
+        peer_id: &str,
+        status: TransferStatus,
+        error: Option<&str>,
+    ) -> Result<bool, AppError> {
+        if !matches!(
+            status,
+            TransferStatus::Paused | TransferStatus::Failed | TransferStatus::Completed
+        ) {
+            return Err(AppError::InvalidInput(
+                "发送文件的已占用状态转换无效".to_string(),
+            ));
+        }
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE transfers
+             SET status = ?3, error = ?4, send_claimed = 0,
+                 transferred_bytes = CASE WHEN ?3 = 'completed' THEN file_size
+                                           ELSE transferred_bytes END,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE transfer_id = ?1 AND peer_id = ?2 AND direction = 'outgoing'
+               AND transfer_protocol = 2 AND status = 'transferring' AND send_claimed = 1",
+            params![transfer_id, peer_id, status.as_str(), error],
+        )?;
+        Ok(changed == 1)
+    }
+
+    #[allow(dead_code)] // Task 7 routes resumable cancellation through this CAS.
+    pub fn try_cancel_unclaimed_outgoing_transfer(
+        &self,
+        transfer_id: &str,
+        peer_id: &str,
+        error: &str,
+    ) -> Result<bool, AppError> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE transfers
+             SET status = 'cancelled', error = ?3, send_claimed = 0,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE transfer_id = ?1 AND peer_id = ?2 AND direction = 'outgoing'
+               AND transfer_protocol = 2
+               AND status IN ('awaitingAcceptance', 'transferring', 'paused')
+               AND send_claimed = 0",
+            params![transfer_id, peer_id, error],
+        )?;
+        drop(connection);
+        if changed == 1 {
+            self.delete_terminal_transfer_chunks(transfer_id)?;
+        }
+        Ok(changed == 1)
+    }
+
+    #[allow(dead_code)] // Task 7 queries resumable sends after reconnect.
+    pub fn list_resumable_outgoing(&self, peer_id: &str) -> Result<Vec<TransferRecord>, AppError> {
+        Ok(self
+            .list_transfers()?
+            .into_iter()
+            .filter(|transfer| {
+                transfer.peer_id == peer_id
+                    && transfer.direction == Direction::Outgoing
+                    && transfer.transfer_protocol == 2
+                    && transfer.status == TransferStatus::Paused
+            })
+            .collect())
+    }
+
     pub fn release_incoming_transfer_claim(&self, transfer_id: &str) -> Result<(), AppError> {
         let connection = self.connection()?;
-        connection.execute(
-            "UPDATE transfers SET receive_claimed = 0 WHERE transfer_id = ?1",
+        let changed = connection.execute(
+            "UPDATE transfers SET receive_claimed = 0
+             WHERE transfer_id = ?1 AND transfer_protocol != 2 AND receive_claimed = 1",
             [transfer_id],
         )?;
+        if changed != 1 {
+            return Err(AppError::InvalidInput(
+                "可恢复传输必须在状态转换时原子释放接收占用".to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -634,11 +874,25 @@ impl Storage {
         {
             return Err(AppError::InvalidInput("接收文件状态不允许确认".to_string()));
         }
+        let partial_path = if transfer.transfer_protocol == 2 {
+            let destination = transfer
+                .local_path
+                .as_deref()
+                .ok_or_else(|| AppError::InvalidInput("接收文件保存位置无效".to_string()))?;
+            Some(
+                resumable_partial_path(Path::new(destination), &transfer.transfer_id)?
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        } else {
+            None
+        };
         let connection = self.connection()?;
         let changed = connection.execute(
             "UPDATE transfers
              SET local_path = ?3, destination_reserved = 1, reservation_token = ?4,
-                 transferred_bytes = 0, status = 'transferring', error = NULL, updated_at = ?5
+                 partial_path = ?5, transferred_bytes = 0, status = 'transferring',
+                 error = NULL, updated_at = ?6
              WHERE transfer_id = ?1 AND peer_id = ?2 AND direction = 'incoming'
                AND status = 'awaitingAcceptance' AND receive_claimed = 0",
             params![
@@ -646,6 +900,7 @@ impl Storage {
                 transfer.peer_id,
                 transfer.local_path,
                 transfer.reservation_token,
+                partial_path,
                 transfer.updated_at,
             ],
         )?;
@@ -661,12 +916,17 @@ impl Storage {
         let connection = self.connection()?;
         let changed = connection.execute(
             "UPDATE transfers
-             SET status = 'cancelled', error = ?3,
-                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             SET status = 'cancelled', error = ?3, receive_claimed = 0,
+                  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
              WHERE transfer_id = ?1 AND peer_id = ?2 AND direction = 'incoming'
-               AND status IN ('awaitingAcceptance', 'transferring') AND receive_claimed = 0",
+               AND status IN ('awaitingAcceptance', 'transferring', 'paused')
+               AND receive_claimed = 0",
             params![transfer_id, peer_id, error],
         )?;
+        drop(connection);
+        if changed == 1 {
+            self.cleanup_owned_transfer_artifacts(transfer_id)?;
+        }
         Ok(changed == 1)
     }
 
@@ -1235,55 +1495,378 @@ impl Storage {
     }
 
     fn reset_ephemeral_state(&self) -> Result<(), AppError> {
-        let connection = self.connection()?;
-        let reservations = {
-            let mut statement = connection.prepare(
-                "SELECT transfer_id, local_path, reservation_token FROM transfers
-                 WHERE destination_reserved = 1 AND local_path IS NOT NULL",
-            )?;
-            statement
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                    ))
-                })?
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        for (transfer_id, local_path, reservation_token) in reservations {
-            let cleanup = match reservation_token.as_deref() {
-                Some(token) => {
-                    remove_owned_reservation(Path::new(&local_path), &transfer_id, token)
-                }
-                None => Ok(false),
-            };
-            match cleanup {
-                Ok(_) => {
-                    connection.execute(
-                        "UPDATE transfers
-                         SET destination_reserved = 0, reservation_token = NULL
-                         WHERE transfer_id = ?1",
-                        [&transfer_id],
-                    )?;
-                }
-                Err(error) => {
-                    tracing::warn!(%transfer_id, %error, "failed to clean stale receive reservation");
-                }
-            }
-        }
-        connection.execute("UPDATE peers SET online = 0", [])?;
-        connection.execute(
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        transaction.execute("UPDATE peers SET online = 0", [])?;
+        transaction.execute(
             "UPDATE messages SET status = 'failed', error = '应用重新启动，请重试发送'
              WHERE status = 'sending'",
             [],
         )?;
-        connection.execute(
-            "UPDATE transfers SET status = 'failed', error = '应用重新启动，请重试传输',
-                                  receive_claimed = 0,
-                                  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-             WHERE status = 'transferring'",
+        transaction.execute(
+            "UPDATE transfers
+             SET status = 'paused',
+                 error = CASE WHEN status = 'transferring'
+                              THEN '应用重新启动，等待自动恢复'
+                              ELSE error END,
+                 receive_claimed = 0, send_claimed = 0,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE transfer_protocol = 2 AND status IN ('transferring', 'paused')",
             [],
+        )?;
+        transaction.execute(
+            "UPDATE transfers SET status = 'failed', error = '应用重新启动，请重试传输',
+                                  receive_claimed = 0, send_claimed = 0,
+                                  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE transfer_protocol != 2 AND status = 'transferring'",
+            [],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn reconcile_resumable_partials(&self) -> Result<(), AppError> {
+        let records = {
+            let connection = self.connection()?;
+            let mut statement = connection.prepare(
+                "SELECT transfer_id, local_path, partial_path, file_size, chunk_size,
+                        chunk_count, manifest_sha256, transferred_bytes
+                 FROM transfers
+                 WHERE direction = 'incoming' AND transfer_protocol = 2 AND status = 'paused'",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok(PartialRecoveryRecord {
+                        transfer_id: row.get(0)?,
+                        destination: row.get::<_, Option<String>>(1)?.map(PathBuf::from),
+                        stored_partial: row.get::<_, Option<String>>(2)?.map(PathBuf::from),
+                        file_size: row.get(3)?,
+                        chunk_size: row.get(4)?,
+                        chunk_count: row.get(5)?,
+                        manifest_sha256: row.get(6)?,
+                        committed_bytes: row.get(7)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+
+        for record in records {
+            if let Err(error) = self.reconcile_resumable_partial(&record) {
+                tracing::warn!(
+                    transfer_id = %record.transfer_id,
+                    %error,
+                    "failed to reconcile resumable incoming partial"
+                );
+                self.set_paused_transfer_error(&record.transfer_id, &error.to_string())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn reconcile_resumable_partial(&self, record: &PartialRecoveryRecord) -> Result<(), AppError> {
+        let file_size = u64::try_from(record.file_size)
+            .map_err(|_| AppError::Storage("可恢复文件大小无效".to_string()))?;
+        let chunk_size = u32::try_from(record.chunk_size)
+            .map_err(|_| AppError::Storage("可恢复文件分块大小无效".to_string()))?;
+        let committed_bytes = u64::try_from(record.committed_bytes)
+            .map_err(|_| AppError::Storage("可恢复文件已提交进度无效".to_string()))?;
+        let chunk_count = u32::try_from(record.chunk_count)
+            .map_err(|_| AppError::Storage("可恢复文件分块数量无效".to_string()))?;
+        validate_transfer_metadata(
+            2,
+            file_size,
+            chunk_size,
+            chunk_count,
+            record.manifest_sha256.as_deref(),
+        )
+        .map_err(storage_metadata_error)?;
+        if committed_bytes > file_size
+            || (committed_bytes != file_size && committed_bytes % u64::from(chunk_size) != 0)
+        {
+            return Err(AppError::Storage(
+                "可恢复文件已提交进度不在分块边界".to_string(),
+            ));
+        }
+
+        let Some(destination) = record.destination.as_deref() else {
+            self.rollback_resumable_progress(record, 0, None)?;
+            return Ok(());
+        };
+        let expected_partial = resumable_partial_path(destination, &record.transfer_id)?;
+        if record.stored_partial.as_deref() != Some(expected_partial.as_path()) {
+            self.store_reconciled_partial_path(
+                &record.transfer_id,
+                &expected_partial,
+                record.stored_partial.as_deref(),
+            )?;
+        }
+
+        let partial_metadata = match fs::metadata(&expected_partial) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !expected_partial
+                    .parent()
+                    .is_some_and(|parent| parent.is_dir())
+                {
+                    return Err(AppError::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "接收目录或磁盘当前不可用",
+                    )));
+                }
+                self.rollback_resumable_progress(record, 0, Some(&expected_partial))?;
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if !partial_metadata.is_file() {
+            return Err(AppError::Storage("可恢复部分路径不是普通文件".to_string()));
+        }
+        let partial_length = partial_metadata.len();
+        let available_bytes = partial_length.min(committed_bytes);
+        let trusted_bytes = self.largest_complete_received_boundary(
+            record,
+            file_size,
+            chunk_size,
+            available_bytes,
+        )?;
+        if trusted_bytes < committed_bytes {
+            truncate_and_sync(&expected_partial, trusted_bytes)?;
+            self.rollback_resumable_progress(record, trusted_bytes, Some(&expected_partial))?;
+        } else if partial_length > committed_bytes {
+            truncate_and_sync(&expected_partial, committed_bytes)?;
+        }
+        Ok(())
+    }
+
+    fn largest_complete_received_boundary(
+        &self,
+        record: &PartialRecoveryRecord,
+        file_size: u64,
+        chunk_size: u32,
+        available_bytes: u64,
+    ) -> Result<u64, AppError> {
+        let chunks = self.list_transfer_chunks(&record.transfer_id)?;
+        let mut boundary = 0_u64;
+        for (expected_index, chunk) in chunks.iter().enumerate() {
+            let expected_index = u32::try_from(expected_index)
+                .map_err(|_| AppError::Storage("可恢复文件分块索引溢出".to_string()))?;
+            let expected_length = expected_chunk_length(file_size, chunk_size, expected_index)
+                .map_err(storage_metadata_error)?;
+            if chunk.index != expected_index || chunk.length != expected_length {
+                break;
+            }
+            let next_boundary = boundary
+                .checked_add(u64::from(chunk.length))
+                .ok_or_else(|| AppError::Storage("可恢复文件分块边界溢出".to_string()))?;
+            if next_boundary > available_bytes {
+                break;
+            }
+            boundary = next_boundary;
+        }
+        Ok(boundary)
+    }
+
+    fn rollback_resumable_progress(
+        &self,
+        record: &PartialRecoveryRecord,
+        rollback_bytes: u64,
+        partial_path: Option<&Path>,
+    ) -> Result<(), AppError> {
+        let rollback_bytes = i64::try_from(rollback_bytes)
+            .map_err(|_| AppError::Storage("可恢复文件回退进度超出存储范围".to_string()))?;
+        let retained_chunks = rollback_bytes
+            .checked_div(record.chunk_size)
+            .ok_or_else(|| AppError::Storage("可恢复文件分块大小无效".to_string()))?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE transfers
+             SET transferred_bytes = ?2, partial_path = COALESCE(?3, partial_path),
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE transfer_id = ?1 AND direction = 'incoming' AND transfer_protocol = 2
+               AND status = 'paused' AND transferred_bytes = ?4",
+            params![
+                record.transfer_id,
+                rollback_bytes,
+                partial_path.map(|path| path.to_string_lossy().into_owned()),
+                record.committed_bytes,
+            ],
+        )?;
+        if changed != 1 {
+            return Ok(());
+        }
+        transaction.execute(
+            "DELETE FROM transfer_chunks WHERE transfer_id = ?1 AND chunk_index >= ?2",
+            params![record.transfer_id, retained_chunks],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn store_reconciled_partial_path(
+        &self,
+        transfer_id: &str,
+        partial_path: &Path,
+        previous_partial_path: Option<&Path>,
+    ) -> Result<(), AppError> {
+        let connection = self.connection()?;
+        connection.execute(
+            "UPDATE transfers
+             SET partial_path = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE transfer_id = ?1 AND direction = 'incoming' AND transfer_protocol = 2
+               AND status = 'paused'
+               AND ((partial_path IS NULL AND ?3 IS NULL) OR partial_path = ?3)",
+            params![
+                transfer_id,
+                partial_path.to_string_lossy(),
+                previous_partial_path.map(|path| path.to_string_lossy().into_owned()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn set_paused_transfer_error(&self, transfer_id: &str, error: &str) -> Result<(), AppError> {
+        let connection = self.connection()?;
+        connection.execute(
+            "UPDATE transfers
+             SET error = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE transfer_id = ?1 AND direction = 'incoming' AND transfer_protocol = 2
+               AND status = 'paused'",
+            params![transfer_id, error],
+        )?;
+        Ok(())
+    }
+
+    fn cleanup_stale_owned_artifacts(&self) -> Result<(), AppError> {
+        let records = {
+            let connection = self.connection()?;
+            let mut statement = connection.prepare(
+                "SELECT transfer_id, local_path, partial_path, reservation_token,
+                        destination_reserved, transfer_protocol, status
+                 FROM transfers
+                 WHERE destination_reserved = 1
+                    OR (partial_path IS NOT NULL AND status IN ('cancelled', 'failed'))",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok(OwnedArtifactRecord {
+                        transfer_id: row.get(0)?,
+                        destination: row.get::<_, Option<String>>(1)?.map(PathBuf::from),
+                        partial: row.get::<_, Option<String>>(2)?.map(PathBuf::from),
+                        reservation_token: row.get(3)?,
+                        destination_reserved: row.get(4)?,
+                        transfer_protocol: row.get(5)?,
+                        status: row.get(6)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for record in records {
+            if record.transfer_protocol == 2 && record.status == "paused" {
+                continue;
+            }
+            self.cleanup_owned_artifact_record(&record)?;
+        }
+        Ok(())
+    }
+
+    fn cleanup_owned_transfer_artifacts(&self, transfer_id: &str) -> Result<(), AppError> {
+        let record = {
+            let connection = self.connection()?;
+            connection
+                .query_row(
+                    "SELECT transfer_id, local_path, partial_path, reservation_token,
+                            destination_reserved, transfer_protocol, status
+                     FROM transfers WHERE transfer_id = ?1",
+                    [transfer_id],
+                    |row| {
+                        Ok(OwnedArtifactRecord {
+                            transfer_id: row.get(0)?,
+                            destination: row.get::<_, Option<String>>(1)?.map(PathBuf::from),
+                            partial: row.get::<_, Option<String>>(2)?.map(PathBuf::from),
+                            reservation_token: row.get(3)?,
+                            destination_reserved: row.get(4)?,
+                            transfer_protocol: row.get(5)?,
+                            status: row.get(6)?,
+                        })
+                    },
+                )
+                .optional()?
+        };
+        if let Some(record) = record {
+            self.cleanup_owned_artifact_record(&record)?;
+        }
+        Ok(())
+    }
+
+    fn cleanup_owned_artifact_record(&self, record: &OwnedArtifactRecord) -> Result<(), AppError> {
+        let mut reservation_cleaned = !record.destination_reserved;
+        if record.destination_reserved {
+            if let (Some(destination), Some(token)) = (
+                record.destination.as_deref(),
+                record.reservation_token.as_deref(),
+            ) {
+                match remove_owned_reservation(destination, &record.transfer_id, token) {
+                    Ok(_) => reservation_cleaned = true,
+                    Err(error) => tracing::warn!(
+                        transfer_id = %record.transfer_id,
+                        %error,
+                        "failed to clean stale receive reservation"
+                    ),
+                }
+            }
+        }
+
+        let terminal = matches!(record.status.as_str(), "cancelled" | "failed");
+        let mut partial_cleaned = record.partial.is_none();
+        if terminal {
+            if let (Some(partial), Some(destination)) =
+                (record.partial.as_deref(), record.destination.as_deref())
+            {
+                match remove_owned_partial(partial, destination, &record.transfer_id) {
+                    Ok(cleaned) => partial_cleaned = cleaned,
+                    Err(error) => tracing::warn!(
+                        transfer_id = %record.transfer_id,
+                        %error,
+                        "failed to clean stale resumable partial"
+                    ),
+                }
+            }
+        }
+
+        let connection = self.connection()?;
+        if reservation_cleaned {
+            connection.execute(
+                "UPDATE transfers
+                 SET destination_reserved = 0, reservation_token = NULL
+                 WHERE transfer_id = ?1 AND destination_reserved = 1",
+                [&record.transfer_id],
+            )?;
+        }
+        if terminal && partial_cleaned {
+            connection.execute(
+                "UPDATE transfers SET partial_path = NULL WHERE transfer_id = ?1
+                 AND status IN ('cancelled', 'failed')",
+                [&record.transfer_id],
+            )?;
+            connection.execute(
+                "DELETE FROM transfer_chunks WHERE transfer_id = ?1",
+                [&record.transfer_id],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn delete_terminal_transfer_chunks(&self, transfer_id: &str) -> Result<(), AppError> {
+        let connection = self.connection()?;
+        connection.execute(
+            "DELETE FROM transfer_chunks
+             WHERE transfer_id = ?1
+               AND EXISTS (
+                   SELECT 1 FROM transfers
+                   WHERE transfer_id = ?1 AND status IN ('cancelled', 'failed')
+               )",
+            [transfer_id],
         )?;
         Ok(())
     }
@@ -1293,6 +1876,57 @@ impl Storage {
             AppError::Storage("本地数据锁异常，请重新启动 Weline Localnet".to_string())
         })
     }
+}
+
+#[derive(Debug)]
+struct PartialRecoveryRecord {
+    transfer_id: String,
+    destination: Option<PathBuf>,
+    stored_partial: Option<PathBuf>,
+    file_size: i64,
+    chunk_size: i64,
+    chunk_count: i64,
+    manifest_sha256: Option<String>,
+    committed_bytes: i64,
+}
+
+#[derive(Debug)]
+struct OwnedArtifactRecord {
+    transfer_id: String,
+    destination: Option<PathBuf>,
+    partial: Option<PathBuf>,
+    reservation_token: Option<String>,
+    destination_reserved: bool,
+    transfer_protocol: i64,
+    status: String,
+}
+
+fn transfer_with_resumable_partial(transfer: &TransferRecord) -> Result<TransferRecord, AppError> {
+    let mut transfer = transfer.clone();
+    if transfer.direction == Direction::Incoming
+        && transfer.transfer_protocol == 2
+        && matches!(
+            transfer.status,
+            TransferStatus::Transferring | TransferStatus::Paused
+        )
+        && transfer.partial_path.is_none()
+    {
+        if let Some(destination) = transfer.local_path.as_deref() {
+            transfer.partial_path = Some(
+                resumable_partial_path(Path::new(destination), &transfer.transfer_id)?
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+    }
+    Ok(transfer)
+}
+
+fn truncate_and_sync(path: &Path, length: u64) -> Result<(), AppError> {
+    let file = OpenOptions::new().write(true).open(path)?;
+    file.set_len(length)?;
+    file.sync_all()?;
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -1530,9 +2164,87 @@ mod tests {
             Direction, PeerSummary, Platform, TransferKind, TransferPreferences, TransferRecord,
             TransferStatus,
         },
+        receive_paths::{reservation_is_owned, reserve_receive_path, resumable_partial_path},
         transfer_manifest::{TransferChunk, manifest_root},
         transfer_policy::TRANSFER_CHUNK_BYTES,
     };
+
+    fn initialize_database(database: &std::path::Path) {
+        drop(Storage::open(database).expect("initialize current storage schema"));
+    }
+
+    fn seed_resumable_incoming(
+        database: &std::path::Path,
+        destination: &std::path::Path,
+        transfer_id: &str,
+        committed_bytes: u64,
+        partial_length: Option<u64>,
+    ) -> std::path::PathBuf {
+        let token = format!("token-{transfer_id}");
+        reserve_receive_path(destination, transfer_id, &token)
+            .expect("reserve incoming destination");
+        let partial = resumable_partial_path(destination, transfer_id)
+            .expect("derive deterministic partial path");
+        if let Some(length) = partial_length {
+            let file = fs::File::create(&partial).expect("create partial fixture");
+            file.set_len(length).expect("size partial fixture");
+            file.sync_all().expect("sync partial fixture");
+        }
+
+        let connection = Connection::open(database).expect("open startup fixture database");
+        connection
+            .execute(
+                "INSERT INTO transfers
+                   (transfer_id, peer_id, direction, kind, file_name, file_size, mime_type,
+                    sha256, local_path, destination_reserved, reservation_token,
+                    receive_claimed, transfer_protocol, chunk_size, chunk_count, manifest_sha256,
+                    partial_path, transferred_bytes, status, created_at, updated_at)
+                 VALUES (?1, 'peer-one', 'incoming', 'file', 'report.bin', ?2,
+                         'application/octet-stream', ?3, ?4, 1, ?5, 1, 2, ?6, 3, ?3, ?7, ?8,
+                         'transferring', ?9, ?9)",
+                rusqlite::params![
+                    transfer_id,
+                    u64::from(TRANSFER_CHUNK_BYTES) * 2 + 2,
+                    "0".repeat(64),
+                    destination.to_string_lossy(),
+                    token,
+                    TRANSFER_CHUNK_BYTES,
+                    partial.to_string_lossy(),
+                    committed_bytes,
+                    "2026-08-24T00:00:00.000Z",
+                ],
+            )
+            .expect("insert resumable startup fixture");
+        let committed_chunks = committed_bytes / u64::from(TRANSFER_CHUNK_BYTES);
+        for index in 0..committed_chunks {
+            connection
+                .execute(
+                    "INSERT INTO transfer_chunks
+                       (transfer_id, chunk_index, chunk_length, sha256)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![
+                        transfer_id,
+                        index,
+                        TRANSFER_CHUNK_BYTES,
+                        [u8::try_from(index + 1).expect("small chunk index"); 32].as_slice(),
+                    ],
+                )
+                .expect("insert committed chunk fixture");
+        }
+        partial
+    }
+
+    fn receive_claimed(storage: &Storage, transfer_id: &str) -> bool {
+        storage
+            .connection()
+            .expect("inspect receive claim")
+            .query_row(
+                "SELECT receive_claimed FROM transfers WHERE transfer_id = ?1",
+                [transfer_id],
+                |row| row.get(0),
+            )
+            .expect("read receive claim")
+    }
 
     #[test]
     fn transfer_preferences_default_to_manual_and_persist_selected_directory() {
@@ -2370,6 +3082,785 @@ mod tests {
             !storage
                 .try_accept_incoming_transfer(&cancelled)
                 .expect("ignore manual acceptance after cancellation")
+        );
+
+        drop(storage);
+        fs::remove_dir_all(fixture).expect("remove storage fixture");
+    }
+
+    #[test]
+    fn outgoing_resumable_claim_has_one_winner_and_pause_releases_atomically() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-outgoing-resume-claim-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&fixture).expect("create storage fixture");
+        let database = fixture.join("localnet.sqlite3");
+        let storage = Storage::open(&database).expect("open storage");
+        {
+            let connection = storage.connection().expect("insert transfer fixture");
+            connection
+                .execute(
+                    "INSERT INTO transfers
+                       (transfer_id, peer_id, direction, kind, file_name, file_size, mime_type,
+                        sha256, transfer_protocol, chunk_size, chunk_count, manifest_sha256,
+                        transferred_bytes, status, created_at, updated_at)
+                     VALUES ('outgoing-resume', 'peer-one', 'outgoing', 'file', 'report.bin',
+                             4194304, 'application/octet-stream', ?1, 2, 4194304, 1, ?1,
+                             0, 'paused', ?2, ?2)",
+                    rusqlite::params!["0".repeat(64), "2026-08-24T00:00:00.000Z"],
+                )
+                .expect("insert paused outgoing transfer");
+        }
+
+        assert!(
+            storage
+                .try_claim_outgoing_transfer("outgoing-resume", "peer-one")
+                .expect("claim paused outgoing transfer")
+        );
+        assert!(
+            !storage
+                .try_claim_outgoing_transfer("outgoing-resume", "peer-one")
+                .expect("reject duplicate outgoing claim")
+        );
+        assert!(
+            storage
+                .try_pause_claimed_outgoing_transfer(
+                    "outgoing-resume",
+                    "peer-one",
+                    "network disconnected",
+                )
+                .expect("pause claimed outgoing transfer")
+        );
+
+        let paused = storage
+            .get_transfer("outgoing-resume")
+            .expect("load paused outgoing transfer")
+            .expect("outgoing transfer exists");
+        assert_eq!(paused.status, TransferStatus::Paused);
+        assert!(!paused.send_claimed);
+        assert_eq!(paused.error.as_deref(), Some("network disconnected"));
+
+        drop(storage);
+        fs::remove_dir_all(fixture).expect("remove storage fixture");
+    }
+
+    #[test]
+    fn incoming_resume_claim_and_cancel_have_one_cas_winner() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-incoming-resume-cancel-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&fixture).expect("create storage fixture");
+        let database = fixture.join("localnet.sqlite3");
+        let storage = Storage::open(&database).expect("open storage");
+        {
+            let connection = storage.connection().expect("insert transfer fixture");
+            connection
+                .execute(
+                    "INSERT INTO transfers
+                       (transfer_id, peer_id, direction, kind, file_name, file_size, mime_type,
+                        sha256, local_path, transfer_protocol, chunk_size, chunk_count,
+                        manifest_sha256, transferred_bytes, status, created_at, updated_at)
+                     VALUES ('incoming-resume', 'peer-one', 'incoming', 'file', 'report.bin',
+                             4194304, 'application/octet-stream', ?1, ?2, 2, 4194304, 1, ?1,
+                             0, 'paused', ?3, ?3)",
+                    rusqlite::params![
+                        "0".repeat(64),
+                        fixture.join("report.bin").to_string_lossy(),
+                        "2026-08-24T00:00:00.000Z"
+                    ],
+                )
+                .expect("insert paused incoming transfer");
+        }
+
+        assert!(
+            storage
+                .try_claim_incoming_transfer("incoming-resume", "peer-one")
+                .expect("claim paused incoming transfer")
+        );
+        assert!(
+            !storage
+                .try_cancel_unclaimed_incoming_transfer("incoming-resume", "peer-one", "cancelled",)
+                .expect("active resume claim wins cancellation race")
+        );
+        assert!(
+            storage
+                .try_pause_claimed_incoming_transfer(
+                    "incoming-resume",
+                    "peer-one",
+                    "network disconnected",
+                )
+                .expect("pause incoming resume")
+        );
+        assert!(
+            storage
+                .try_cancel_unclaimed_incoming_transfer("incoming-resume", "peer-one", "cancelled",)
+                .expect("cancel after pause releases claim")
+        );
+        assert!(
+            !storage
+                .try_claim_incoming_transfer("incoming-resume", "peer-one")
+                .expect("cancelled incoming transfer cannot resume")
+        );
+
+        drop(storage);
+        fs::remove_dir_all(fixture).expect("remove storage fixture");
+    }
+
+    #[test]
+    fn raw_claim_release_cannot_open_a_v2_status_transition_window() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-v2-raw-release-guard-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&fixture).expect("create storage fixture");
+        let database = fixture.join("localnet.sqlite3");
+        let storage = Storage::open(&database).expect("open storage");
+        {
+            let connection = storage.connection().expect("insert transfer fixture");
+            connection
+                .execute(
+                    "INSERT INTO transfers
+                       (transfer_id, peer_id, direction, kind, file_name, file_size, mime_type,
+                        sha256, transfer_protocol, chunk_size, chunk_count, manifest_sha256,
+                        transferred_bytes, status, created_at, updated_at)
+                     VALUES ('v2-release-guard', 'peer-one', 'incoming', 'file', 'report.bin',
+                             4194304, 'application/octet-stream', ?1, 2, 4194304, 1, ?1,
+                             0, 'transferring', ?2, ?2)",
+                    rusqlite::params!["0".repeat(64), "2026-08-24T00:00:00.000Z"],
+                )
+                .expect("insert v2 transfer");
+        }
+        assert!(
+            storage
+                .try_claim_incoming_transfer("v2-release-guard", "peer-one")
+                .expect("claim v2 transfer")
+        );
+
+        storage
+            .release_incoming_transfer_claim("v2-release-guard")
+            .expect_err("v2 claims require a status-and-claim CAS");
+
+        assert!(receive_claimed(&storage, "v2-release-guard"));
+        assert_eq!(
+            storage
+                .get_transfer("v2-release-guard")
+                .expect("load guarded transfer")
+                .expect("guarded transfer exists")
+                .status,
+            TransferStatus::Transferring
+        );
+
+        drop(storage);
+        fs::remove_dir_all(fixture).expect("remove storage fixture");
+    }
+
+    #[test]
+    fn completed_claimed_transfer_ignores_late_failure() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-completed-late-failure-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&fixture).expect("create storage fixture");
+        let database = fixture.join("localnet.sqlite3");
+        let storage = Storage::open(&database).expect("open storage");
+        {
+            let connection = storage.connection().expect("insert transfer fixture");
+            connection
+                .execute(
+                    "INSERT INTO transfers
+                       (transfer_id, peer_id, direction, kind, file_name, file_size, mime_type,
+                        sha256, transfer_protocol, chunk_size, chunk_count, manifest_sha256,
+                        transferred_bytes, status, created_at, updated_at)
+                     VALUES ('outgoing-complete', 'peer-one', 'outgoing', 'file', 'report.bin',
+                             4194304, 'application/octet-stream', ?1, 2, 4194304, 1, ?1,
+                             0, 'paused', ?2, ?2)",
+                    rusqlite::params!["0".repeat(64), "2026-08-24T00:00:00.000Z"],
+                )
+                .expect("insert paused outgoing transfer");
+        }
+
+        assert!(
+            storage
+                .try_claim_outgoing_transfer("outgoing-complete", "peer-one")
+                .expect("claim outgoing transfer")
+        );
+        assert!(
+            storage
+                .try_complete_claimed_outgoing_transfer("outgoing-complete", "peer-one")
+                .expect("complete claimed outgoing transfer")
+        );
+        assert!(
+            !storage
+                .try_fail_claimed_outgoing_transfer(
+                    "outgoing-complete",
+                    "peer-one",
+                    "late stream failure",
+                )
+                .expect("ignore late failure")
+        );
+
+        let completed = storage
+            .get_transfer("outgoing-complete")
+            .expect("load completed transfer")
+            .expect("completed transfer exists");
+        assert_eq!(completed.status, TransferStatus::Completed);
+        assert_eq!(completed.transferred_bytes, completed.file_size);
+        assert!(!completed.send_claimed);
+        assert_eq!(completed.error, None);
+
+        drop(storage);
+        fs::remove_dir_all(fixture).expect("remove storage fixture");
+    }
+
+    #[test]
+    fn incoming_completion_persists_finalized_path_and_clears_claim_in_one_cas() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-incoming-completion-cas-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&fixture).expect("create storage fixture");
+        let database = fixture.join("localnet.sqlite3");
+        let storage = Storage::open(&database).expect("open storage");
+        {
+            let connection = storage.connection().expect("insert transfer fixture");
+            connection
+                .execute(
+                    "INSERT INTO transfers
+                       (transfer_id, peer_id, direction, kind, file_name, file_size, mime_type,
+                        sha256, local_path, destination_reserved, reservation_token,
+                        receive_claimed, transfer_protocol, chunk_size, chunk_count, manifest_sha256,
+                        partial_path, transferred_bytes, status, created_at, updated_at)
+                     VALUES ('incoming-complete', 'peer-one', 'incoming', 'file', 'report.bin',
+                             4194304, 'application/octet-stream', ?1, ?2, 1, 'token-one', 1,
+                             2, 4194304, 1, ?1, ?3, 4194304, 'transferring', ?4, ?4)",
+                    rusqlite::params![
+                        "0".repeat(64),
+                        fixture.join("report.bin").to_string_lossy(),
+                        fixture.join("partial.part").to_string_lossy(),
+                        "2026-08-24T00:00:00.000Z",
+                    ],
+                )
+                .expect("insert claimed incoming transfer");
+        }
+        let mut finalized = storage
+            .get_transfer("incoming-complete")
+            .expect("load claimed incoming transfer")
+            .expect("incoming transfer exists");
+        let final_path = fixture.join("report (1).bin");
+        finalized.local_path = Some(final_path.to_string_lossy().into_owned());
+        finalized.destination_reserved = false;
+        finalized.reservation_token = None;
+        finalized.partial_path = None;
+        finalized.status = TransferStatus::Completed;
+        finalized.error = None;
+
+        assert!(
+            storage
+                .try_complete_claimed_incoming_transfer(&finalized)
+                .expect("complete finalized incoming transfer")
+        );
+
+        let completed = storage
+            .get_transfer("incoming-complete")
+            .expect("load completed incoming transfer")
+            .expect("completed transfer exists");
+        assert_eq!(completed.status, TransferStatus::Completed);
+        assert_eq!(
+            completed.local_path.as_deref(),
+            Some(final_path.to_string_lossy().as_ref())
+        );
+        assert!(!completed.destination_reserved);
+        assert_eq!(completed.reservation_token, None);
+        assert_eq!(completed.partial_path, None);
+        assert!(!receive_claimed(&storage, "incoming-complete"));
+        assert!(
+            !storage
+                .try_fail_claimed_incoming_transfer(
+                    "incoming-complete",
+                    "peer-one",
+                    "late final acknowledgement failure",
+                )
+                .expect("ignore late failure after completion")
+        );
+
+        drop(storage);
+        fs::remove_dir_all(fixture).expect("remove storage fixture");
+    }
+
+    #[test]
+    fn resumable_outgoing_query_is_scoped_to_paused_v2_peer_records() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-resumable-outgoing-query-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&fixture).expect("create storage fixture");
+        let database = fixture.join("localnet.sqlite3");
+        let storage = Storage::open(&database).expect("open storage");
+        {
+            let connection = storage.connection().expect("insert transfer fixtures");
+            connection
+                .execute_batch(
+                    "INSERT INTO transfers
+                       (transfer_id, peer_id, direction, kind, file_name, file_size, mime_type,
+                        sha256, transfer_protocol, chunk_size, chunk_count, manifest_sha256,
+                        transferred_bytes, status, created_at, updated_at)
+                     VALUES
+                       ('wanted', 'peer-one', 'outgoing', 'file', 'wanted.bin', 4194304,
+                        'application/octet-stream',
+                        '0000000000000000000000000000000000000000000000000000000000000000',
+                        2, 4194304, 1,
+                        '0000000000000000000000000000000000000000000000000000000000000000',
+                        0, 'paused', '2026-08-24T00:00:00.000Z', '2026-08-24T00:00:00.000Z'),
+                       ('legacy', 'peer-one', 'outgoing', 'file', 'legacy.bin', 1,
+                        'application/octet-stream',
+                        '0000000000000000000000000000000000000000000000000000000000000000',
+                        1, 0, 0, NULL, 0, 'paused', '2026-08-24T00:00:00.000Z',
+                        '2026-08-24T00:00:00.000Z'),
+                       ('other-peer', 'peer-two', 'outgoing', 'file', 'other.bin', 4194304,
+                        'application/octet-stream',
+                        '0000000000000000000000000000000000000000000000000000000000000000',
+                        2, 4194304, 1,
+                        '0000000000000000000000000000000000000000000000000000000000000000',
+                        0, 'paused', '2026-08-24T00:00:00.000Z', '2026-08-24T00:00:00.000Z'),
+                       ('incoming', 'peer-one', 'incoming', 'file', 'incoming.bin', 4194304,
+                        'application/octet-stream',
+                        '0000000000000000000000000000000000000000000000000000000000000000',
+                        2, 4194304, 1,
+                        '0000000000000000000000000000000000000000000000000000000000000000',
+                        0, 'paused', '2026-08-24T00:00:00.000Z', '2026-08-24T00:00:00.000Z');",
+                )
+                .expect("insert query fixtures");
+        }
+
+        let resumable = storage
+            .list_resumable_outgoing("peer-one")
+            .expect("list resumable outgoing transfers");
+        assert_eq!(resumable.len(), 1);
+        assert_eq!(resumable[0].transfer_id, "wanted");
+
+        drop(storage);
+        fs::remove_dir_all(fixture).expect("remove storage fixture");
+    }
+
+    #[test]
+    fn startup_pauses_v2_and_preserves_equal_committed_partial_and_reservation() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-startup-equal-partial-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&fixture).expect("create storage fixture");
+        let database = fixture.join("localnet.sqlite3");
+        initialize_database(&database);
+        let destination = fixture.join("report.bin");
+        let committed = u64::from(TRANSFER_CHUNK_BYTES);
+        let partial = seed_resumable_incoming(
+            &database,
+            &destination,
+            "startup-equal",
+            committed,
+            Some(committed),
+        );
+
+        let storage = Storage::open(&database).expect("reopen and reconcile startup state");
+        let transfer = storage
+            .get_transfer("startup-equal")
+            .expect("load reconciled transfer")
+            .expect("transfer exists");
+        assert_eq!(transfer.status, TransferStatus::Paused);
+        assert_eq!(transfer.transferred_bytes, committed);
+        assert!(!receive_claimed(&storage, "startup-equal"));
+        assert_eq!(
+            storage.list_transfer_chunks("startup-equal").unwrap().len(),
+            1
+        );
+        assert_eq!(
+            fs::metadata(&partial).expect("inspect partial").len(),
+            committed
+        );
+        assert!(
+            reservation_is_owned(&destination, "startup-equal", "token-startup-equal")
+                .expect("inspect preserved reservation")
+        );
+
+        drop(storage);
+        fs::remove_dir_all(fixture).expect("remove storage fixture");
+    }
+
+    #[test]
+    fn startup_truncates_v2_partial_tail_beyond_committed_offset() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-startup-long-partial-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&fixture).expect("create storage fixture");
+        let database = fixture.join("localnet.sqlite3");
+        initialize_database(&database);
+        let destination = fixture.join("report.bin");
+        let committed = u64::from(TRANSFER_CHUNK_BYTES);
+        let partial = seed_resumable_incoming(
+            &database,
+            &destination,
+            "startup-long",
+            committed,
+            Some(committed + 321),
+        );
+
+        let storage = Storage::open(&database).expect("reopen and truncate durable tail");
+        let transfer = storage
+            .get_transfer("startup-long")
+            .expect("load reconciled transfer")
+            .expect("transfer exists");
+        assert_eq!(transfer.status, TransferStatus::Paused);
+        assert_eq!(transfer.transferred_bytes, committed);
+        assert_eq!(
+            fs::metadata(&partial).expect("inspect partial").len(),
+            committed
+        );
+        assert_eq!(
+            storage.list_transfer_chunks("startup-long").unwrap().len(),
+            1
+        );
+
+        drop(storage);
+        fs::remove_dir_all(fixture).expect("remove storage fixture");
+    }
+
+    #[test]
+    fn startup_rolls_short_v2_partial_back_to_complete_chunk_boundary() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-startup-short-partial-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&fixture).expect("create storage fixture");
+        let database = fixture.join("localnet.sqlite3");
+        initialize_database(&database);
+        let destination = fixture.join("report.bin");
+        let chunk = u64::from(TRANSFER_CHUNK_BYTES);
+        let partial = seed_resumable_incoming(
+            &database,
+            &destination,
+            "startup-short",
+            chunk * 2,
+            Some(chunk + 321),
+        );
+
+        let storage = Storage::open(&database).expect("reopen and roll back short partial");
+        let transfer = storage
+            .get_transfer("startup-short")
+            .expect("load reconciled transfer")
+            .expect("transfer exists");
+        assert_eq!(transfer.status, TransferStatus::Paused);
+        assert_eq!(transfer.transferred_bytes, chunk);
+        assert_eq!(
+            fs::metadata(&partial).expect("inspect partial").len(),
+            chunk
+        );
+        let chunks = storage
+            .list_transfer_chunks("startup-short")
+            .expect("load retained chunks");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].index, 0);
+        assert!(
+            reservation_is_owned(&destination, "startup-short", "token-startup-short")
+                .expect("inspect preserved reservation")
+        );
+
+        drop(storage);
+        fs::remove_dir_all(fixture).expect("remove storage fixture");
+    }
+
+    #[test]
+    fn startup_short_partial_never_invents_a_missing_committed_chunk_boundary() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-startup-missing-chunk-row-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&fixture).expect("create storage fixture");
+        let database = fixture.join("localnet.sqlite3");
+        initialize_database(&database);
+        let destination = fixture.join("report.bin");
+        let chunk = u64::from(TRANSFER_CHUNK_BYTES);
+        let partial = seed_resumable_incoming(
+            &database,
+            &destination,
+            "startup-missing-chunk",
+            chunk * 2,
+            Some(chunk + 321),
+        );
+        let connection = Connection::open(&database).expect("open startup fixture database");
+        connection
+            .execute(
+                "DELETE FROM transfer_chunks WHERE transfer_id = 'startup-missing-chunk'
+                 AND chunk_index = 0",
+                [],
+            )
+            .expect("remove first committed chunk row");
+        drop(connection);
+
+        let storage = Storage::open(&database).expect("reopen and distrust missing chunk row");
+        let transfer = storage
+            .get_transfer("startup-missing-chunk")
+            .expect("load reconciled transfer")
+            .expect("transfer exists");
+        assert_eq!(transfer.status, TransferStatus::Paused);
+        assert_eq!(transfer.transferred_bytes, 0);
+        assert_eq!(fs::metadata(&partial).expect("inspect partial").len(), 0);
+        assert!(
+            storage
+                .list_transfer_chunks("startup-missing-chunk")
+                .unwrap()
+                .is_empty()
+        );
+
+        drop(storage);
+        fs::remove_dir_all(fixture).expect("remove storage fixture");
+    }
+
+    #[test]
+    fn startup_missing_v2_partial_resets_only_unavailable_committed_data() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-startup-missing-partial-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&fixture).expect("create storage fixture");
+        let database = fixture.join("localnet.sqlite3");
+        initialize_database(&database);
+        let destination = fixture.join("report.bin");
+        let partial = seed_resumable_incoming(
+            &database,
+            &destination,
+            "startup-missing",
+            u64::from(TRANSFER_CHUNK_BYTES),
+            None,
+        );
+
+        let storage = Storage::open(&database).expect("reopen and reconcile missing partial");
+        let transfer = storage
+            .get_transfer("startup-missing")
+            .expect("load reconciled transfer")
+            .expect("transfer exists");
+        assert_eq!(transfer.status, TransferStatus::Paused);
+        assert_eq!(transfer.transferred_bytes, 0);
+        assert_eq!(
+            transfer.partial_path.as_deref(),
+            Some(partial.to_string_lossy().as_ref())
+        );
+        assert!(
+            storage
+                .list_transfer_chunks("startup-missing")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            reservation_is_owned(&destination, "startup-missing", "token-startup-missing",)
+                .expect("inspect preserved reservation")
+        );
+
+        drop(storage);
+        fs::remove_dir_all(fixture).expect("remove storage fixture");
+    }
+
+    #[test]
+    fn startup_keeps_v1_fail_and_owned_reservation_cleanup_behavior() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-startup-v1-cleanup-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&fixture).expect("create storage fixture");
+        let database = fixture.join("localnet.sqlite3");
+        initialize_database(&database);
+        let destination = fixture.join("legacy.bin");
+        reserve_receive_path(&destination, "startup-v1", "token-startup-v1")
+            .expect("reserve legacy destination");
+        let connection = Connection::open(&database).expect("open startup fixture database");
+        connection
+            .execute(
+                "INSERT INTO transfers
+                   (transfer_id, peer_id, direction, kind, file_name, file_size, mime_type,
+                    sha256, local_path, destination_reserved, reservation_token, receive_claimed,
+                    transferred_bytes, status, created_at, updated_at)
+                 VALUES ('startup-v1', 'peer-one', 'incoming', 'file', 'legacy.bin', 3,
+                         'application/octet-stream', ?1, ?2, 1, 'token-startup-v1', 1, 0,
+                         'transferring', ?3, ?3)",
+                rusqlite::params![
+                    "0".repeat(64),
+                    destination.to_string_lossy(),
+                    "2026-08-24T00:00:00.000Z"
+                ],
+            )
+            .expect("insert legacy startup fixture");
+        drop(connection);
+
+        let storage = Storage::open(&database).expect("reopen and fail legacy transfer");
+        let transfer = storage
+            .get_transfer("startup-v1")
+            .expect("load reconciled transfer")
+            .expect("transfer exists");
+        assert_eq!(transfer.status, TransferStatus::Failed);
+        assert!(!transfer.destination_reserved);
+        assert_eq!(transfer.reservation_token, None);
+        assert!(!receive_claimed(&storage, "startup-v1"));
+        assert!(
+            !reservation_is_owned(&destination, "startup-v1", "token-startup-v1")
+                .expect("inspect cleaned reservation")
+        );
+        assert!(!destination.exists());
+
+        drop(storage);
+        fs::remove_dir_all(fixture).expect("remove storage fixture");
+    }
+
+    #[test]
+    fn claimed_terminal_failure_cleans_only_owned_incoming_artifacts_after_cas() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-terminal-owned-cleanup-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&fixture).expect("create storage fixture");
+        let database = fixture.join("localnet.sqlite3");
+        initialize_database(&database);
+        let storage = Storage::open(&database).expect("open storage");
+        let destination = fixture.join("report.bin");
+        let committed = u64::from(TRANSFER_CHUNK_BYTES);
+        let partial = seed_resumable_incoming(
+            &database,
+            &destination,
+            "terminal-failure",
+            committed,
+            Some(committed),
+        );
+        fs::write(&destination, b"completed-or-user-data").expect("write protected destination");
+        let unrelated_destination = fixture.join("unrelated-legacy.bin");
+        reserve_receive_path(
+            &unrelated_destination,
+            "unrelated-legacy",
+            "token-unrelated-legacy",
+        )
+        .expect("reserve unrelated legacy destination");
+        {
+            let connection = storage.connection().expect("insert unrelated transfer");
+            connection
+                .execute(
+                    "INSERT INTO transfers
+                       (transfer_id, peer_id, direction, kind, file_name, file_size, mime_type,
+                        sha256, local_path, destination_reserved, reservation_token,
+                        transferred_bytes, status, created_at, updated_at)
+                     VALUES ('unrelated-legacy', 'peer-two', 'incoming', 'file', 'legacy.bin', 3,
+                             'application/octet-stream', ?1, ?2, 1, 'token-unrelated-legacy', 0,
+                             'transferring', ?3, ?3)",
+                    rusqlite::params![
+                        "0".repeat(64),
+                        unrelated_destination.to_string_lossy(),
+                        "2026-08-24T00:00:00.000Z",
+                    ],
+                )
+                .expect("insert unrelated legacy transfer");
+        }
+
+        assert!(
+            storage
+                .try_fail_claimed_incoming_transfer(
+                    "terminal-failure",
+                    "peer-one",
+                    "integrity failure",
+                )
+                .expect("persist terminal failure")
+        );
+
+        let failed = storage
+            .get_transfer("terminal-failure")
+            .expect("load failed transfer")
+            .expect("failed transfer exists");
+        assert_eq!(failed.status, TransferStatus::Failed);
+        assert!(!failed.destination_reserved);
+        assert_eq!(failed.reservation_token, None);
+        assert_eq!(failed.partial_path, None);
+        assert!(!receive_claimed(&storage, "terminal-failure"));
+        assert!(!partial.exists());
+        assert!(
+            storage
+                .list_transfer_chunks("terminal-failure")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            fs::read(&destination).expect("read protected destination"),
+            b"completed-or-user-data"
+        );
+        assert!(
+            reservation_is_owned(
+                &unrelated_destination,
+                "unrelated-legacy",
+                "token-unrelated-legacy",
+            )
+            .expect("inspect unrelated reservation")
+        );
+        assert!(
+            storage
+                .get_transfer("unrelated-legacy")
+                .expect("load unrelated transfer")
+                .expect("unrelated transfer exists")
+                .destination_reserved
+        );
+
+        drop(storage);
+        fs::remove_dir_all(fixture).expect("remove storage fixture");
+    }
+
+    #[test]
+    fn paused_incoming_cancel_cleans_owned_partial_reservation_and_chunks() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-cancel-owned-cleanup-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&fixture).expect("create storage fixture");
+        let database = fixture.join("localnet.sqlite3");
+        initialize_database(&database);
+        let storage = Storage::open(&database).expect("open storage");
+        let destination = fixture.join("report.bin");
+        let committed = u64::from(TRANSFER_CHUNK_BYTES);
+        let partial = seed_resumable_incoming(
+            &database,
+            &destination,
+            "cancel-cleanup",
+            committed,
+            Some(committed),
+        );
+        assert!(
+            storage
+                .try_pause_claimed_incoming_transfer(
+                    "cancel-cleanup",
+                    "peer-one",
+                    "network disconnected",
+                )
+                .expect("pause claimed transfer")
+        );
+
+        assert!(
+            storage
+                .try_cancel_unclaimed_incoming_transfer("cancel-cleanup", "peer-one", "cancelled",)
+                .expect("cancel paused transfer")
+        );
+
+        let cancelled = storage
+            .get_transfer("cancel-cleanup")
+            .expect("load cancelled transfer")
+            .expect("cancelled transfer exists");
+        assert_eq!(cancelled.status, TransferStatus::Cancelled);
+        assert!(!cancelled.destination_reserved);
+        assert_eq!(cancelled.partial_path, None);
+        assert!(!partial.exists());
+        assert!(
+            storage
+                .list_transfer_chunks("cancel-cleanup")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !reservation_is_owned(&destination, "cancel-cleanup", "token-cancel-cleanup")
+                .expect("inspect cleaned reservation")
         );
 
         drop(storage);

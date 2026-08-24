@@ -512,6 +512,28 @@ fn validate_acknowledgement(
     Ok(())
 }
 
+pub(crate) fn is_recoverable_transport_error(error: &AppError) -> bool {
+    match error {
+        AppError::Network(_) | AppError::OfflinePeer => true,
+        AppError::Io(error) => matches!(
+            error.kind(),
+            std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::NotConnected
+                | std::io::ErrorKind::TimedOut
+        ),
+        AppError::InvalidInput(_)
+        | AppError::Storage(_)
+        | AppError::Identity(_)
+        | AppError::Permission(_)
+        | AppError::NotFriend
+        | AppError::IncompatibleProtocol
+        | AppError::IntegrityFailure => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -534,9 +556,10 @@ mod tests {
     };
 
     use super::{
-        ChunkFrameHeader, DurableChunkWriter, open_resumable_partial, read_chunk_frame,
-        receive_acknowledged_chunks, send_acknowledged_chunks, validate_resume_offset,
-        verify_committed_manifest, write_chunk_frame,
+        ChunkFrameHeader, DurableChunkWriter, is_recoverable_transport_error,
+        open_resumable_partial, read_chunk_frame, receive_acknowledged_chunks,
+        send_acknowledged_chunks, validate_resume_offset, verify_committed_manifest,
+        write_chunk_frame,
     };
     use crate::{
         domain::{Direction, TransferKind, TransferRecord, TransferStatus},
@@ -841,6 +864,43 @@ mod tests {
             .iter()
             .flat_map(|offset| offset.to_be_bytes())
             .collect()
+    }
+
+    #[test]
+    fn transport_disconnect_errors_are_recoverable_for_resumable_transfers() {
+        assert!(is_recoverable_transport_error(&AppError::Network(
+            "connection closed".to_string()
+        )));
+        assert!(is_recoverable_transport_error(&AppError::OfflinePeer));
+        for kind in [
+            io::ErrorKind::UnexpectedEof,
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::NotConnected,
+            io::ErrorKind::TimedOut,
+        ] {
+            assert!(is_recoverable_transport_error(&AppError::Io(
+                io::Error::new(kind, "transport stopped")
+            )));
+        }
+    }
+
+    #[test]
+    fn integrity_source_identity_and_local_io_errors_are_terminal() {
+        assert!(!is_recoverable_transport_error(&AppError::IntegrityFailure));
+        assert!(!is_recoverable_transport_error(&AppError::InvalidInput(
+            "源文件在传输前发生了变化".to_string()
+        )));
+        assert!(!is_recoverable_transport_error(&AppError::Permission(
+            "peer identity mismatch".to_string()
+        )));
+        assert!(!is_recoverable_transport_error(&AppError::Io(
+            io::Error::new(io::ErrorKind::NotFound, "source missing")
+        )));
+        assert!(!is_recoverable_transport_error(&AppError::Io(
+            io::Error::new(io::ErrorKind::InvalidData, "invalid local data")
+        )));
     }
 
     #[test]
