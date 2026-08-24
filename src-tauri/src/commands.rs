@@ -19,8 +19,12 @@ use crate::{
     },
     error::AppError,
     network::NetworkCommand,
-    receive_paths::{ensure_writable_directory, remove_owned_reservation, reserve_receive_path},
+    receive_paths::{
+        ensure_writable_directory, preflight_receive_directory, remove_owned_reservation,
+        reserve_receive_path,
+    },
     state::AppState,
+    storage::Storage,
     transfer_manifest::{TransferChunk, build_manifest_from_snapshot, capture_source_snapshot},
     transfer_policy::{TRANSFER_CHUNK_BYTES, TransferProtocol, select_transfer_protocol},
 };
@@ -398,49 +402,25 @@ pub fn resolve_transfer(
                 "文件保存位置必须是绝对路径".to_string(),
             ));
         }
-        let reservation_token = uuid::Uuid::new_v4().to_string();
-        reserve_manual_receive_destination(
-            transfer.transfer_protocol,
+        transfer = accept_incoming_transfer_with_preflight(
+            &state.storage,
+            &transfer,
             &path,
-            &transfer.transfer_id,
-            &reservation_token,
-        )
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                AppError::InvalidInput("保存位置已经存在同名文件，请重新选择".to_string())
-            } else {
-                AppError::Permission(format!("无法占用文件保存位置，请重新选择：{error}"))
-            }
-        })?;
-        transfer.local_path = Some(path.to_string_lossy().into_owned());
-        transfer.destination_reserved = true;
-        transfer.reservation_token = Some(reservation_token);
-        transfer.status = TransferStatus::Transferring;
-        transfer.error = None;
-        transfer.updated_at = now_rfc3339();
-        match state.storage.try_accept_incoming_transfer(&transfer) {
-            Ok(true) => {}
-            Ok(false) => {
-                if let (Some(path), Some(token)) = (
-                    transfer.local_path.as_deref(),
-                    transfer.reservation_token.as_deref(),
-                ) {
-                    let _ = remove_owned_reservation(Path::new(path), &transfer.transfer_id, token);
-                }
-                return Err(AppError::InvalidInput(
-                    "这次文件传输已经处理，请刷新后查看".to_string(),
-                ));
-            }
-            Err(error) => {
-                if let (Some(path), Some(token)) = (
-                    transfer.local_path.as_deref(),
-                    transfer.reservation_token.as_deref(),
-                ) {
-                    let _ = remove_owned_reservation(Path::new(path), &transfer.transfer_id, token);
-                }
-                return Err(error);
-            }
-        }
+            &preflight_receive_directory,
+            &mut |accepted| {
+                state.network()?.try_send(NetworkCommand::ResolveTransfer {
+                    peer_id: accepted.peer_id.clone(),
+                    transfer_id: accepted.transfer_id.clone(),
+                    accepted: true,
+                })
+            },
+        )?;
+        crate::network::spawn_incoming_start_timeout(
+            transfer.transfer_id.clone(),
+            state.storage.clone(),
+            app_handle,
+        );
+        return Ok(transfer);
     } else {
         if !state.storage.try_cancel_unclaimed_incoming_transfer(
             &transfer.transfer_id,
@@ -517,13 +497,6 @@ pub fn resolve_transfer(
         transfer.updated_at = now_rfc3339();
         state.storage.upsert_transfer(&transfer)?;
         return Err(error);
-    }
-    if accepted {
-        crate::network::spawn_incoming_start_timeout(
-            transfer.transfer_id.clone(),
-            state.storage.clone(),
-            app_handle,
-        );
     }
     Ok(transfer)
 }
@@ -660,6 +633,89 @@ fn reserve_manual_receive_destination(
         std::fs::create_dir_all(parent)?;
     }
     reserve_receive_path(path, transfer_id, reservation_token)
+}
+
+fn accept_incoming_transfer_with_preflight<P, D>(
+    storage: &Storage,
+    transfer: &TransferRecord,
+    path: &Path,
+    preflight: &P,
+    dispatch: &mut D,
+) -> Result<TransferRecord, AppError>
+where
+    P: Fn(&Path, u64, u64) -> Result<(), AppError>,
+    D: FnMut(&TransferRecord) -> Result<(), AppError>,
+{
+    if !path.is_absolute() {
+        return Err(AppError::InvalidInput(
+            "文件保存位置必须是绝对路径".to_string(),
+        ));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| AppError::InvalidInput("接收文件保存位置无效".to_string()))?;
+    if transfer.transfer_protocol == TransferProtocol::ResumableV2 as u8 {
+        preflight(parent, transfer.file_size, 0)?;
+    }
+
+    let reservation_token = uuid::Uuid::new_v4().to_string();
+    reserve_manual_receive_destination(
+        transfer.transfer_protocol,
+        path,
+        &transfer.transfer_id,
+        &reservation_token,
+    )
+    .map_err(map_receive_reservation_error)?;
+
+    let mut accepted = transfer.clone();
+    accepted.local_path = Some(path.to_string_lossy().into_owned());
+    accepted.destination_reserved = true;
+    accepted.reservation_token = Some(reservation_token);
+    accepted.status = TransferStatus::Transferring;
+    accepted.error = None;
+    accepted.updated_at = now_rfc3339();
+    match storage.try_accept_incoming_transfer(&accepted) {
+        Ok(true) => {}
+        Ok(false) => {
+            cleanup_manual_reservation(&accepted);
+            return Err(AppError::InvalidInput(
+                "这次文件传输已经处理，请刷新后查看".to_string(),
+            ));
+        }
+        Err(error) => {
+            cleanup_manual_reservation(&accepted);
+            return Err(error);
+        }
+    }
+
+    if let Err(error) = dispatch(&accepted) {
+        cleanup_manual_reservation(&accepted);
+        accepted.destination_reserved = false;
+        accepted.reservation_token = None;
+        accepted.status = TransferStatus::Failed;
+        accepted.error = Some(error.to_string());
+        accepted.updated_at = now_rfc3339();
+        storage.upsert_transfer(&accepted)?;
+        return Err(error);
+    }
+    Ok(accepted)
+}
+
+fn cleanup_manual_reservation(transfer: &TransferRecord) {
+    if let (Some(path), Some(token)) = (
+        transfer.local_path.as_deref(),
+        transfer.reservation_token.as_deref(),
+    ) {
+        let _ = remove_owned_reservation(Path::new(path), &transfer.transfer_id, token);
+    }
+}
+
+fn map_receive_reservation_error(error: std::io::Error) -> AppError {
+    if error.kind() == std::io::ErrorKind::AlreadyExists {
+        AppError::InvalidInput("保存位置已经存在同名文件，请重新选择".to_string())
+    } else {
+        AppError::Permission(format!("无法占用文件保存位置，请重新选择：{error}"))
+    }
 }
 
 fn prepare_transfer_preferences(
@@ -825,16 +881,92 @@ fn detect_mime_type(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
 
     use super::{
-        prepare_receive_directory, prepare_source, prepare_transfer_preferences,
-        reserve_manual_receive_destination,
+        accept_incoming_transfer_with_preflight, prepare_receive_directory, prepare_source,
+        prepare_transfer_preferences, reserve_manual_receive_destination,
     };
     use crate::{
-        domain::{TransferKind, TransferPreferences},
+        domain::{
+            Direction, TransferKind, TransferPreferences, TransferRecord, TransferStatus,
+            now_rfc3339,
+        },
+        error::AppError,
+        receive_paths::preflight_receive_directory,
+        storage::Storage,
         transfer_policy::{FILE_RESUME_V2_CAPABILITY, TRANSFER_CHUNK_BYTES, TransferProtocol},
+        volume_preflight::{VolumeSnapshot, validate_volume},
     };
+
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+    const DESTINATION_RESERVE_BYTES: u64 = 64 * MIB;
+
+    fn acceptance_fixture(name: &str, file_size: u64) -> (PathBuf, Storage, TransferRecord) {
+        let directory = std::env::temp_dir().join(format!(
+            "weline-localnet-manual-preflight-{name}-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&directory).expect("create manual preflight fixture");
+        let storage = Storage::open(&directory.join("localnet.sqlite3"))
+            .expect("open manual preflight storage");
+        let now = now_rfc3339();
+        let transfer = TransferRecord {
+            transfer_id: uuid::Uuid::now_v7().to_string(),
+            peer_id: "manual-preflight-peer".to_string(),
+            direction: Direction::Incoming,
+            kind: TransferKind::File,
+            file_name: "archive.bin".to_string(),
+            file_size,
+            mime_type: "application/octet-stream".to_string(),
+            sha256: "0".repeat(64),
+            local_path: None,
+            destination_reserved: false,
+            reservation_token: None,
+            transfer_protocol: TransferProtocol::ResumableV2 as u8,
+            chunk_size: TRANSFER_CHUNK_BYTES,
+            chunk_count: u32::try_from(file_size.div_ceil(u64::from(TRANSFER_CHUNK_BYTES)))
+                .expect("fixture chunk count"),
+            manifest_sha256: Some("1".repeat(64)),
+            partial_path: None,
+            source_modified_ns: None,
+            send_claimed: false,
+            transferred_bytes: 0,
+            status: TransferStatus::AwaitingAcceptance,
+            error: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        storage
+            .upsert_transfer(&transfer)
+            .expect("persist incoming acceptance fixture");
+        (directory, storage, transfer)
+    }
+
+    fn assert_manual_acceptance_unchanged(
+        storage: &Storage,
+        transfer_id: &str,
+        destination: &Path,
+    ) {
+        let stored = storage
+            .get_transfer(transfer_id)
+            .expect("reload incoming transfer")
+            .expect("incoming transfer remains");
+        assert_eq!(stored.status, TransferStatus::AwaitingAcceptance);
+        assert!(!stored.destination_reserved);
+        assert!(stored.reservation_token.is_none());
+        assert!(stored.local_path.is_none());
+        assert!(stored.partial_path.is_none());
+        assert!(!destination.exists());
+    }
 
     #[test]
     fn upgraded_peer_prepares_a_v2_manifest_before_offering_a_source() {
@@ -863,6 +995,153 @@ mod tests {
         assert_eq!(source.chunks.len(), 1);
 
         fs::remove_file(fixture).expect("remove source fixture");
+    }
+
+    #[test]
+    fn manual_acceptance_insufficient_space_has_no_reservation_or_transfer_decision() {
+        let file_size = 5 * GIB;
+        let (directory, storage, transfer) = acceptance_fixture("insufficient", file_size);
+        let destination = directory.join("archive.bin");
+        let decision_sent = Arc::new(AtomicBool::new(false));
+        let decision_sent_for_dispatch = decision_sent.clone();
+        let snapshot =
+            VolumeSnapshot::known("NTFS", file_size + DESTINATION_RESERVE_BYTES - 1, None);
+
+        let error = accept_incoming_transfer_with_preflight(
+            &storage,
+            &transfer,
+            &destination,
+            &|_, size, committed| validate_volume(&snapshot, size, committed),
+            &mut |_| {
+                decision_sent_for_dispatch.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .expect_err("one byte below the required margin must block acceptance");
+
+        assert!(error.to_string().contains("可用空间不足"));
+        assert!(!decision_sent.load(Ordering::SeqCst));
+        assert_manual_acceptance_unchanged(&storage, &transfer.transfer_id, &destination);
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove insufficient-space fixture");
+    }
+
+    #[test]
+    fn manual_acceptance_rejects_fat32_before_reservation_or_transfer_decision() {
+        let file_size = 5 * GIB;
+        let (directory, storage, transfer) = acceptance_fixture("fat32", file_size);
+        let destination = directory.join("archive.bin");
+        let decision_sent = Arc::new(AtomicBool::new(false));
+        let decision_sent_for_dispatch = decision_sent.clone();
+        let snapshot = VolumeSnapshot::known("FAT32", 10 * GIB, Some(4 * GIB - 1));
+
+        let error = accept_incoming_transfer_with_preflight(
+            &storage,
+            &transfer,
+            &destination,
+            &|_, size, committed| validate_volume(&snapshot, size, committed),
+            &mut |_| {
+                decision_sent_for_dispatch.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .expect_err("FAT32 must reject a five GiB destination");
+
+        assert!(error.to_string().contains("FAT32"));
+        assert!(!decision_sent.load(Ordering::SeqCst));
+        assert_manual_acceptance_unchanged(&storage, &transfer.transfer_id, &destination);
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove FAT32 fixture");
+    }
+
+    #[test]
+    fn manual_acceptance_allows_exact_remaining_plus_64_mib() {
+        let file_size = 5 * GIB;
+        let (directory, storage, transfer) = acceptance_fixture("exact-margin", file_size);
+        let destination = directory.join("archive.bin");
+        let snapshot = VolumeSnapshot::known("NTFS", file_size + DESTINATION_RESERVE_BYTES, None);
+        let mut decisions = 0_u8;
+
+        let accepted = accept_incoming_transfer_with_preflight(
+            &storage,
+            &transfer,
+            &destination,
+            &|_, size, committed| validate_volume(&snapshot, size, committed),
+            &mut |_| {
+                decisions += 1;
+                Ok(())
+            },
+        )
+        .expect("exact capacity margin must permit acceptance");
+
+        assert_eq!(decisions, 1);
+        assert_eq!(accepted.status, TransferStatus::Transferring);
+        assert!(accepted.destination_reserved);
+        assert!(
+            storage
+                .get_transfer(&accepted.transfer_id)
+                .expect("reload accepted transfer")
+                .expect("accepted transfer remains")
+                .partial_path
+                .is_some()
+        );
+        assert!(
+            storage
+                .try_cancel_unclaimed_incoming_transfer(
+                    &accepted.transfer_id,
+                    &accepted.peer_id,
+                    accepted.transfer_protocol,
+                    "test cleanup",
+                )
+                .expect("clean accepted fixture")
+        );
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove exact-margin fixture");
+    }
+
+    #[test]
+    fn manual_acceptance_missing_or_unwritable_destination_stays_awaiting() {
+        for unavailable in ["missing", "unwritable"] {
+            let file_size = GIB;
+            let (directory, storage, transfer) = acceptance_fixture(unavailable, file_size);
+            let destination = if unavailable == "missing" {
+                directory.join("missing-volume").join("archive.bin")
+            } else {
+                directory.join("archive.bin")
+            };
+            let mut decisions = 0_u8;
+            let error = accept_incoming_transfer_with_preflight(
+                &storage,
+                &transfer,
+                &destination,
+                &|target, size, committed| {
+                    if unavailable == "missing" {
+                        preflight_receive_directory(target, size, committed)
+                    } else {
+                        Err(AppError::Storage(format!(
+                            "无法写入接收目录 {}；请选择可写入的目录后重试",
+                            target.display()
+                        )))
+                    }
+                },
+                &mut |_| {
+                    decisions += 1;
+                    Ok(())
+                },
+            )
+            .expect_err("an unavailable destination must block acceptance");
+
+            let expected = if unavailable == "missing" {
+                "请选择可访问且可写入的目录"
+            } else {
+                "请选择可写入的目录后重试"
+            };
+            assert!(error.to_string().contains(expected));
+            assert_eq!(decisions, 0);
+            assert_manual_acceptance_unchanged(&storage, &transfer.transfer_id, &destination);
+            drop(storage);
+            fs::remove_dir_all(directory).expect("remove unavailable fixture");
+        }
     }
 
     #[test]

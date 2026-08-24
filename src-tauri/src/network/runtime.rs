@@ -34,8 +34,8 @@ use crate::{
     identity::LocalIdentity,
     protocol::{ControlRequest, ControlResponse, FILE_PROTOCOL, HelloPayload, TransferOffer},
     receive_paths::{
-        ensure_writable_directory, remove_owned_reservation, reserve_available_receive_path,
-        validate_existing_writable_directory,
+        ensure_writable_directory, preflight_receive_directory, remove_owned_reservation,
+        reserve_available_receive_path,
     },
     storage::Storage,
     transfer_manifest::validate_transfer_metadata,
@@ -734,79 +734,24 @@ impl NetworkRuntime {
                 let preferences = self
                     .storage
                     .load_transfer_preferences(&self.default_receive_directory)?;
-                let (local_path, reservation_token, automatic_receive_error) =
-                    if preferences.auto_receive_files {
-                        match automatic_receive_path(
-                            &preferences,
-                            &offer.file_name,
-                            &offer.transfer_id,
-                            offer.transfer_protocol,
-                        ) {
-                            Ok((path, token)) => {
-                                (Some(path.to_string_lossy().into_owned()), Some(token), None)
-                            }
-                            Err(error) => (None, None, Some(error.to_string())),
-                        }
-                    } else {
-                        (None, None, None)
-                    };
-                let destination_reserved = reservation_token.is_some();
-                let auto_accept = local_path.is_some();
-                let now = now_rfc3339();
-                let transfer = TransferRecord {
-                    transfer_id: offer.transfer_id.clone(),
-                    peer_id: peer_id.to_string(),
-                    direction: Direction::Incoming,
-                    kind: offer.kind,
-                    file_name: offer.file_name,
-                    file_size: offer.file_size,
-                    mime_type: offer.mime_type,
-                    sha256: offer.sha256,
-                    local_path,
-                    destination_reserved,
-                    reservation_token,
-                    transfer_protocol: offer.transfer_protocol,
-                    chunk_size: offer.chunk_size,
-                    chunk_count: offer.chunk_count,
-                    manifest_sha256: offer.manifest_sha256,
-                    partial_path: None,
-                    source_modified_ns: None,
-                    send_claimed: false,
-                    transferred_bytes: 0,
-                    status: if auto_accept {
-                        TransferStatus::Transferring
-                    } else {
-                        TransferStatus::AwaitingAcceptance
-                    },
-                    error: None,
-                    created_at: now.clone(),
-                    updated_at: now,
-                };
-                if let Err(error) = self.storage.upsert_transfer(&transfer) {
-                    if transfer.destination_reserved {
-                        if let (Some(path), Some(token)) = (
-                            transfer.local_path.as_deref(),
-                            transfer.reservation_token.as_deref(),
-                        ) {
-                            let _ = remove_owned_reservation(
-                                std::path::Path::new(path),
-                                &transfer.transfer_id,
-                                token,
-                            );
-                        }
-                    }
-                    return Err(error);
-                }
+                let outcome = persist_incoming_offer_with_preflight(
+                    &self.storage,
+                    &peer_id.to_string(),
+                    &offer,
+                    &preferences,
+                    &preflight_receive_directory,
+                )?;
+                let transfer = outcome.transfer;
                 self.emit(NetworkEvent::TransferUpdated {
                     transfer: transfer.clone(),
                 });
-                if let Some(message) = automatic_receive_error {
+                if let Some(message) = outcome.automatic_receive_error {
                     self.emit(NetworkEvent::NetworkError {
                         code: "transfer.auto_receive_unavailable".to_string(),
                         message: format!("自动接收目录当前不可用，请手动选择保存位置：{message}"),
                     });
                 }
-                if auto_accept {
+                if outcome.transfer_decision == Some(true) {
                     let outbound_id = self.swarm.behaviour_mut().control.send_request(
                         &peer_id,
                         ControlRequest::TransferDecision {
@@ -1232,15 +1177,44 @@ fn validate_transfer_offer(offer: &TransferOffer) -> Result<(), AppError> {
     Ok(())
 }
 
+#[cfg(test)]
 fn automatic_receive_path(
     preferences: &TransferPreferences,
     file_name: &str,
     transfer_id: &str,
     transfer_protocol: u8,
+    file_size: u64,
 ) -> Result<(PathBuf, String), AppError> {
+    automatic_receive_path_with_preflight(
+        preferences,
+        file_name,
+        transfer_id,
+        transfer_protocol,
+        file_size,
+        &preflight_receive_directory,
+    )
+}
+
+fn automatic_receive_path_with_preflight<P>(
+    preferences: &TransferPreferences,
+    file_name: &str,
+    transfer_id: &str,
+    transfer_protocol: u8,
+    file_size: u64,
+    preflight: &P,
+) -> Result<(PathBuf, String), AppError>
+where
+    P: Fn(&std::path::Path, u64, u64) -> Result<(), AppError>,
+{
     let configured = std::path::Path::new(&preferences.receive_directory);
     let directory = if transfer_protocol == TransferProtocol::ResumableV2 as u8 {
-        validate_existing_writable_directory(configured)?
+        if !configured.is_absolute() {
+            return Err(AppError::InvalidInput(
+                "文件接收目录必须是绝对路径".to_string(),
+            ));
+        }
+        preflight(configured, file_size, 0)?;
+        configured.to_path_buf()
     } else {
         ensure_writable_directory(configured)?
     };
@@ -1250,16 +1224,156 @@ fn automatic_receive_path(
     Ok((path, reservation_token))
 }
 
+struct IncomingOfferOutcome {
+    transfer: TransferRecord,
+    automatic_receive_error: Option<String>,
+    transfer_decision: Option<bool>,
+}
+
+fn persist_incoming_offer_with_preflight<P>(
+    storage: &Storage,
+    peer_id: &str,
+    offer: &TransferOffer,
+    preferences: &TransferPreferences,
+    preflight: &P,
+) -> Result<IncomingOfferOutcome, AppError>
+where
+    P: Fn(&std::path::Path, u64, u64) -> Result<(), AppError>,
+{
+    let (local_path, reservation_token, automatic_receive_error) = if preferences.auto_receive_files
+    {
+        match automatic_receive_path_with_preflight(
+            preferences,
+            &offer.file_name,
+            &offer.transfer_id,
+            offer.transfer_protocol,
+            offer.file_size,
+            preflight,
+        ) {
+            Ok((path, token)) => (Some(path.to_string_lossy().into_owned()), Some(token), None),
+            Err(error) => (None, None, Some(error.to_string())),
+        }
+    } else {
+        (None, None, None)
+    };
+    let destination_reserved = reservation_token.is_some();
+    let auto_accept = local_path.is_some();
+    let now = now_rfc3339();
+    let transfer = TransferRecord {
+        transfer_id: offer.transfer_id.clone(),
+        peer_id: peer_id.to_string(),
+        direction: Direction::Incoming,
+        kind: offer.kind,
+        file_name: offer.file_name.clone(),
+        file_size: offer.file_size,
+        mime_type: offer.mime_type.clone(),
+        sha256: offer.sha256.clone(),
+        local_path,
+        destination_reserved,
+        reservation_token,
+        transfer_protocol: offer.transfer_protocol,
+        chunk_size: offer.chunk_size,
+        chunk_count: offer.chunk_count,
+        manifest_sha256: offer.manifest_sha256.clone(),
+        partial_path: None,
+        source_modified_ns: None,
+        send_claimed: false,
+        transferred_bytes: 0,
+        status: if auto_accept {
+            TransferStatus::Transferring
+        } else {
+            TransferStatus::AwaitingAcceptance
+        },
+        error: automatic_receive_error.clone(),
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    if let Err(error) = storage.upsert_transfer(&transfer) {
+        if transfer.destination_reserved {
+            if let (Some(path), Some(token)) = (
+                transfer.local_path.as_deref(),
+                transfer.reservation_token.as_deref(),
+            ) {
+                let _ = remove_owned_reservation(
+                    std::path::Path::new(path),
+                    &transfer.transfer_id,
+                    token,
+                );
+            }
+        }
+        return Err(error);
+    }
+    Ok(IncomingOfferOutcome {
+        transfer,
+        automatic_receive_error,
+        transfer_decision: auto_accept.then_some(true),
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, path::PathBuf};
 
-    use super::{automatic_receive_path, validate_transfer_offer};
-    use crate::{
-        domain::{TransferKind, TransferPreferences},
-        protocol::TransferOffer,
-        transfer_policy::{TRANSFER_CHUNK_BYTES, TransferProtocol},
+    use super::{
+        automatic_receive_path, persist_incoming_offer_with_preflight, validate_transfer_offer,
     };
+    use crate::{
+        domain::{TransferKind, TransferPreferences, TransferStatus},
+        error::AppError,
+        protocol::TransferOffer,
+        receive_paths::preflight_receive_directory,
+        storage::Storage,
+        transfer_policy::{TRANSFER_CHUNK_BYTES, TransferProtocol},
+        volume_preflight::{VolumeSnapshot, validate_volume},
+    };
+
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+    const DESTINATION_RESERVE_BYTES: u64 = 64 * MIB;
+
+    fn automatic_fixture(name: &str) -> (PathBuf, Storage, TransferPreferences) {
+        let directory = std::env::temp_dir().join(format!(
+            "weline-localnet-automatic-preflight-{name}-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&directory).expect("create automatic preflight fixture");
+        let storage = Storage::open(&directory.join("localnet.sqlite3"))
+            .expect("open automatic preflight storage");
+        let preferences = TransferPreferences {
+            auto_receive_files: true,
+            receive_directory: directory.to_string_lossy().into_owned(),
+        };
+        (directory, storage, preferences)
+    }
+
+    fn large_v2_offer() -> TransferOffer {
+        let mut offer = v2_offer();
+        offer.transfer_id = uuid::Uuid::now_v7().to_string();
+        offer.file_name = "archive.bin".to_string();
+        offer.file_size = 5 * GIB;
+        offer.chunk_count =
+            u32::try_from(offer.file_size.div_ceil(u64::from(TRANSFER_CHUNK_BYTES)))
+                .expect("large offer chunk count");
+        offer
+    }
+
+    fn assert_automatic_fallback(storage: &Storage, transfer_id: &str, expected_error: &str) {
+        let stored = storage
+            .get_transfer(transfer_id)
+            .expect("reload automatic fallback")
+            .expect("automatic fallback transfer exists");
+        assert_eq!(stored.status, TransferStatus::AwaitingAcceptance);
+        assert!(!stored.destination_reserved);
+        assert!(stored.reservation_token.is_none());
+        assert!(stored.local_path.is_none());
+        assert!(stored.partial_path.is_none());
+        assert!(
+            stored
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains(expected_error))
+        );
+    }
 
     fn v2_offer() -> TransferOffer {
         TransferOffer {
@@ -1297,6 +1411,155 @@ mod tests {
     }
 
     #[test]
+    fn automatic_acceptance_insufficient_space_falls_back_without_transfer_decision_or_reservation()
+    {
+        let (directory, storage, preferences) = automatic_fixture("insufficient");
+        let offer = large_v2_offer();
+        let snapshot = VolumeSnapshot::known(
+            "NTFS",
+            offer.file_size + DESTINATION_RESERVE_BYTES - 1,
+            None,
+        );
+
+        let outcome = persist_incoming_offer_with_preflight(
+            &storage,
+            "automatic-preflight-peer",
+            &offer,
+            &preferences,
+            &|_, size, committed| validate_volume(&snapshot, size, committed),
+        )
+        .expect("preflight failure must persist a manual fallback");
+
+        assert!(outcome.transfer_decision.is_none());
+        assert!(
+            outcome
+                .automatic_receive_error
+                .as_deref()
+                .is_some_and(|error| error.contains("可用空间不足"))
+        );
+        assert_automatic_fallback(&storage, &offer.transfer_id, "可用空间不足");
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove insufficient automatic fixture");
+    }
+
+    #[test]
+    fn automatic_acceptance_fat32_falls_back_without_transfer_decision_or_reservation() {
+        let (directory, storage, preferences) = automatic_fixture("fat32");
+        let offer = large_v2_offer();
+        let snapshot = VolumeSnapshot::known("MSDOS", 10 * GIB, Some(4 * GIB - 1));
+
+        let outcome = persist_incoming_offer_with_preflight(
+            &storage,
+            "automatic-preflight-peer",
+            &offer,
+            &preferences,
+            &|_, size, committed| validate_volume(&snapshot, size, committed),
+        )
+        .expect("FAT32 failure must persist a manual fallback");
+
+        assert!(outcome.transfer_decision.is_none());
+        assert_automatic_fallback(&storage, &offer.transfer_id, "MSDOS");
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove FAT32 automatic fixture");
+    }
+
+    #[test]
+    fn automatic_acceptance_allows_exact_remaining_plus_64_mib() {
+        let (directory, storage, preferences) = automatic_fixture("exact-margin");
+        let offer = large_v2_offer();
+        let snapshot =
+            VolumeSnapshot::known("NTFS", offer.file_size + DESTINATION_RESERVE_BYTES, None);
+
+        let outcome = persist_incoming_offer_with_preflight(
+            &storage,
+            "automatic-preflight-peer",
+            &offer,
+            &preferences,
+            &|_, size, committed| validate_volume(&snapshot, size, committed),
+        )
+        .expect("exact capacity margin must permit automatic acceptance");
+
+        assert_eq!(outcome.transfer_decision, Some(true));
+        assert!(outcome.automatic_receive_error.is_none());
+        let stored = storage
+            .get_transfer(&offer.transfer_id)
+            .expect("reload accepted automatic transfer")
+            .expect("accepted automatic transfer exists");
+        assert_eq!(stored.status, TransferStatus::Transferring);
+        assert!(stored.destination_reserved);
+        assert!(stored.partial_path.is_some());
+        assert!(
+            storage
+                .try_cancel_unclaimed_incoming_transfer(
+                    &stored.transfer_id,
+                    &stored.peer_id,
+                    stored.transfer_protocol,
+                    "test cleanup",
+                )
+                .expect("clean accepted automatic fixture")
+        );
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove exact automatic fixture");
+    }
+
+    #[test]
+    fn automatic_acceptance_missing_destination_falls_back_to_manual_action() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-automatic-missing-preflight-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&fixture).expect("create missing destination fixture root");
+        let storage = Storage::open(&fixture.join("localnet.sqlite3"))
+            .expect("open missing destination storage");
+        let missing = fixture.join("unplugged-volume");
+        let preferences = TransferPreferences {
+            auto_receive_files: true,
+            receive_directory: missing.to_string_lossy().into_owned(),
+        };
+        let offer = large_v2_offer();
+
+        let outcome = persist_incoming_offer_with_preflight(
+            &storage,
+            "automatic-preflight-peer",
+            &offer,
+            &preferences,
+            &preflight_receive_directory,
+        )
+        .expect("missing media must persist a manual fallback");
+
+        assert!(outcome.transfer_decision.is_none());
+        assert_automatic_fallback(&storage, &offer.transfer_id, "请选择可访问且可写入的目录");
+        assert!(!missing.exists());
+        drop(storage);
+        fs::remove_dir_all(fixture).expect("remove missing automatic fixture");
+    }
+
+    #[test]
+    fn automatic_acceptance_unwritable_destination_falls_back_to_manual_action() {
+        let (directory, storage, preferences) = automatic_fixture("unwritable");
+        let offer = large_v2_offer();
+
+        let outcome = persist_incoming_offer_with_preflight(
+            &storage,
+            "automatic-preflight-peer",
+            &offer,
+            &preferences,
+            &|target, _, _| {
+                Err(AppError::Storage(format!(
+                    "无法写入接收目录 {}；请选择可写入的目录后重试",
+                    target.display()
+                )))
+            },
+        )
+        .expect("unwritable media must persist a manual fallback");
+
+        assert!(outcome.transfer_decision.is_none());
+        assert_automatic_fallback(&storage, &offer.transfer_id, "无法写入接收目录");
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove unwritable automatic fixture");
+    }
+
+    #[test]
     fn automatic_v2_acceptance_never_recreates_a_missing_selected_directory() {
         let fixture = std::env::temp_dir().join(format!(
             "weline-localnet-auto-v2-missing-directory-{}",
@@ -1313,10 +1576,12 @@ mod tests {
             "report.bin",
             "transfer-one",
             TransferProtocol::ResumableV2 as u8,
+            u64::from(TRANSFER_CHUNK_BYTES),
         )
         .expect_err("missing selected media must reject automatic v2 acceptance");
 
-        assert_eq!(error.code(), "io_error");
+        assert_eq!(error.code(), "storage_error");
+        assert!(error.to_string().contains("请选择可访问且可写入的目录"));
         assert!(!fixture.exists());
         let _ = fs::remove_dir_all(fixture);
     }

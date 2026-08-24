@@ -8,6 +8,8 @@ use std::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::{error::AppError, volume_preflight};
+
 const RESERVATION_PREFIX: &str = "WELINE-LOCALNET-RESERVATION:";
 const PARTIAL_OWNERSHIP_PREFIX: &str = "WELINE-LOCALNET-PARTIAL:";
 const FINALIZATION_PREFIX: &str = "WELINE-LOCALNET-FINALIZATION:";
@@ -2180,6 +2182,14 @@ pub fn validate_existing_writable_directory(path: &Path) -> std::io::Result<Path
     drop(file);
     std::fs::remove_file(probe)?;
     Ok(path.to_path_buf())
+}
+
+pub fn preflight_receive_directory(
+    directory: &Path,
+    file_size: u64,
+    committed_bytes: u64,
+) -> Result<(), AppError> {
+    volume_preflight::preflight_destination(directory, file_size, committed_bytes).map(|_| ())
 }
 
 fn safe_file_name(file_name: &str) -> String {

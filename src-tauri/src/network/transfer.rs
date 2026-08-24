@@ -12,8 +12,9 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use super::{
     resumable_transfer::{
-        is_recoverable_receive_error, is_recoverable_send_error, open_owned_resumable_partial,
-        receive_acknowledged_chunks, send_acknowledged_chunks, verify_committed_manifest,
+        claim_paused_incoming, is_recoverable_receive_error, is_recoverable_send_error,
+        open_owned_resumable_partial, receive_acknowledged_chunks, send_acknowledged_chunks,
+        verify_committed_manifest,
     },
     runtime::{NetworkEvent, emit_event},
 };
@@ -570,7 +571,10 @@ async fn receive_resumable_transfer(
         .ok_or_else(|| AppError::Permission("未找到已接受的可恢复文件传输".to_string()))?;
     if transfer.peer_id != peer_id.to_string()
         || transfer.direction != Direction::Incoming
-        || transfer.status != TransferStatus::Transferring
+        || !matches!(
+            transfer.status,
+            TransferStatus::Transferring | TransferStatus::Paused
+        )
         || transfer.transfer_protocol != TransferProtocol::ResumableV2 as u8
         || header.chunk_size != TRANSFER_CHUNK_BYTES
         || header.chunk_size != transfer.chunk_size
@@ -581,11 +585,40 @@ async fn receive_resumable_transfer(
             "该可恢复文件传输未获授权或恢复几何信息无效".to_string(),
         ));
     }
-    if !storage.try_claim_incoming_transfer(&transfer.transfer_id, &transfer.peer_id)? {
-        return Err(AppError::Permission(
-            "该文件传输已有接收连接，重复连接已拒绝".to_string(),
-        ));
-    }
+    let transfer = if transfer.status == TransferStatus::Paused {
+        match claim_paused_incoming(&storage, &transfer) {
+            Ok(Some(claimed)) => claimed,
+            Ok(None) => {
+                return Err(AppError::Permission(
+                    "该文件传输已有接收连接，重复连接已拒绝".to_string(),
+                ));
+            }
+            Err(error) => {
+                if let Some(updated) = storage.get_transfer(&transfer.transfer_id)? {
+                    emit_event(
+                        &app_handle,
+                        &NetworkEvent::TransferUpdated { transfer: updated },
+                    );
+                }
+                emit_event(
+                    &app_handle,
+                    &NetworkEvent::NetworkError {
+                        code: "transfer.resume_destination_unavailable".to_string(),
+                        message: error.to_string(),
+                    },
+                );
+                let _ = stream.close().await;
+                return Err(error);
+            }
+        }
+    } else {
+        if !storage.try_claim_incoming_transfer(&transfer.transfer_id, &transfer.peer_id)? {
+            return Err(AppError::Permission(
+                "该文件传输已有接收连接，重复连接已拒绝".to_string(),
+            ));
+        }
+        transfer
+    };
 
     let result = receive_resumable_body(
         &mut stream,

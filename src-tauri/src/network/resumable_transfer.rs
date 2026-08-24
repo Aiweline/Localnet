@@ -5,9 +5,9 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
 
 use crate::{
-    domain::{Direction, TransferRecord},
+    domain::{Direction, TransferRecord, TransferStatus},
     error::AppError,
-    receive_paths::open_owned_resumable_partial_file,
+    receive_paths::{open_owned_resumable_partial_file, preflight_receive_directory},
     storage::Storage,
     transfer_manifest::{
         TransferChunk, capture_source_snapshot, decode_sha256, expected_chunk_count,
@@ -17,6 +17,92 @@ use crate::{
 };
 
 const CHUNK_FRAME_HEADER_BYTES: usize = 40;
+
+pub(crate) fn claim_paused_incoming(
+    storage: &Storage,
+    candidate: &TransferRecord,
+) -> Result<Option<TransferRecord>, AppError> {
+    claim_paused_incoming_with_preflight(storage, candidate, &preflight_receive_directory)
+}
+
+fn claim_paused_incoming_with_preflight<P>(
+    storage: &Storage,
+    candidate: &TransferRecord,
+    preflight: &P,
+) -> Result<Option<TransferRecord>, AppError>
+where
+    P: Fn(&Path, u64, u64) -> Result<(), AppError>,
+{
+    if candidate.direction != Direction::Incoming
+        || candidate.transfer_protocol != TransferProtocol::ResumableV2 as u8
+        || candidate.status != TransferStatus::Paused
+    {
+        return Err(AppError::InvalidInput(
+            "只有暂停的可恢复接收可以执行恢复预检".to_string(),
+        ));
+    }
+    if !storage.try_claim_incoming_transfer(&candidate.transfer_id, &candidate.peer_id)? {
+        return Ok(None);
+    }
+
+    let preflight_result = match storage.get_transfer(&candidate.transfer_id) {
+        Ok(Some(claimed)) => (|| {
+            if claimed.direction != Direction::Incoming
+                || claimed.peer_id != candidate.peer_id
+                || claimed.transfer_protocol != TransferProtocol::ResumableV2 as u8
+                || claimed.status != TransferStatus::Transferring
+            {
+                return Err(AppError::Storage(
+                    "可恢复接收占用状态与持久化记录不一致".to_string(),
+                ));
+            }
+            let destination = claimed
+                .local_path
+                .as_deref()
+                .map(Path::new)
+                .ok_or_else(|| {
+                    AppError::Storage("可恢复接收缺少保存位置，请重新选择接收目录".to_string())
+                })?;
+            let directory = destination.parent().ok_or_else(|| {
+                AppError::Storage("可恢复接收保存位置无效，请重新选择接收目录".to_string())
+            })?;
+            let partial = claimed
+                .partial_path
+                .as_deref()
+                .map(Path::new)
+                .ok_or_else(|| {
+                    AppError::Storage("可恢复接收缺少部分文件路径，请重新选择接收目录".to_string())
+                })?;
+            if partial.parent() != Some(directory) {
+                return Err(AppError::Storage(
+                    "可恢复接收的部分文件不在目标目录所在磁盘，请取消后重新接收".to_string(),
+                ));
+            }
+            preflight(directory, claimed.file_size, claimed.transferred_bytes)?;
+            Ok(claimed)
+        })(),
+        Ok(None) => Err(AppError::Storage(
+            "已占用的可恢复接收记录不存在".to_string(),
+        )),
+        Err(error) => Err(error),
+    };
+
+    match preflight_result {
+        Ok(claimed) => Ok(Some(claimed)),
+        Err(error) => {
+            if !storage.try_pause_claimed_incoming_transfer(
+                &candidate.transfer_id,
+                &candidate.peer_id,
+                &error.to_string(),
+            )? {
+                return Err(AppError::Storage(
+                    "恢复预检失败后无法原子释放接收占用，请刷新传输状态".to_string(),
+                ));
+            }
+            Err(error)
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ChunkFrameHeader {
@@ -613,19 +699,24 @@ mod tests {
     };
 
     use super::{
-        ChunkFrameHeader, DurableChunkWriter, is_recoverable_receive_error,
-        is_recoverable_send_error, open_owned_resumable_partial, open_resumable_partial,
-        read_chunk_frame, read_source_chunk, receive_acknowledged_chunks, send_acknowledged_chunks,
-        validate_resume_offset, verify_committed_manifest, write_chunk_frame,
+        ChunkFrameHeader, DurableChunkWriter, claim_paused_incoming_with_preflight,
+        is_recoverable_receive_error, is_recoverable_send_error, open_owned_resumable_partial,
+        open_resumable_partial, read_chunk_frame, read_source_chunk, receive_acknowledged_chunks,
+        send_acknowledged_chunks, validate_resume_offset, verify_committed_manifest,
+        write_chunk_frame,
     };
     use crate::{
         domain::{Direction, TransferKind, TransferRecord, TransferStatus},
         error::AppError,
         receive_paths::{reserve_receive_path, reserve_resumable_partial},
         storage::Storage,
-        transfer_manifest::{TransferManifest, build_manifest, manifest_root},
+        transfer_manifest::{TransferChunk, TransferManifest, build_manifest, manifest_root},
         transfer_policy::{TRANSFER_CHUNK_BYTES, TransferProtocol},
+        volume_preflight::{VolumeSnapshot, validate_volume},
     };
+
+    const MIB: u64 = 1024 * 1024;
+    const DESTINATION_RESERVE_BYTES: u64 = 64 * MIB;
 
     #[derive(Default)]
     struct ScriptedStream {
@@ -830,6 +921,80 @@ mod tests {
         }
     }
 
+    fn paused_receive_fixture(name: &str) -> (PathBuf, Storage, TransferRecord) {
+        let directory = fixture_directory(name);
+        std::fs::create_dir_all(&directory).expect("create paused receive fixture");
+        let storage = Storage::open(&directory.join("receiver.sqlite3"))
+            .expect("open paused receive storage");
+        let chunks = vec![
+            TransferChunk {
+                index: 0,
+                length: TRANSFER_CHUNK_BYTES,
+                sha256: [1; 32],
+            },
+            TransferChunk {
+                index: 1,
+                length: TRANSFER_CHUNK_BYTES,
+                sha256: [2; 32],
+            },
+        ];
+        let manifest = TransferManifest {
+            file_size: 2 * u64::from(TRANSFER_CHUNK_BYTES),
+            file_sha256: [3; 32],
+            manifest_sha256: manifest_root(&chunks),
+            chunks: chunks.clone(),
+            source_modified_ns: 0,
+        };
+        let destination = directory.join("payload.bin");
+        let token = uuid::Uuid::now_v7().to_string();
+        let mut transfer = transfer_record(Direction::Incoming, None, None, None, &manifest);
+        transfer.transfer_id = uuid::Uuid::now_v7().to_string();
+        transfer.status = TransferStatus::AwaitingAcceptance;
+        storage
+            .upsert_transfer(&transfer)
+            .expect("persist awaiting receive fixture");
+        reserve_receive_path(&destination, &transfer.transfer_id, &token)
+            .expect("reserve paused receive destination");
+        transfer.local_path = Some(destination.to_string_lossy().into_owned());
+        transfer.destination_reserved = true;
+        transfer.reservation_token = Some(token);
+        transfer.status = TransferStatus::Transferring;
+        assert!(
+            storage
+                .try_accept_incoming_transfer(&transfer)
+                .expect("accept paused receive fixture")
+        );
+        assert!(
+            storage
+                .try_claim_incoming_transfer(&transfer.transfer_id, &transfer.peer_id)
+                .expect("claim paused receive fixture")
+        );
+        assert!(
+            storage
+                .commit_received_chunk(
+                    &transfer.transfer_id,
+                    &transfer.peer_id,
+                    &chunks[0],
+                    u64::from(TRANSFER_CHUNK_BYTES),
+                )
+                .expect("commit receiver-authoritative fixture progress")
+        );
+        assert!(
+            storage
+                .try_pause_claimed_incoming_transfer(
+                    &transfer.transfer_id,
+                    &transfer.peer_id,
+                    "network interrupted",
+                )
+                .expect("pause receive fixture")
+        );
+        let paused = storage
+            .get_transfer(&transfer.transfer_id)
+            .expect("reload paused fixture")
+            .expect("paused fixture remains");
+        (directory, storage, paused)
+    }
+
     fn small_incoming_transfer(payload: &[u8], advertised_hash: [u8; 32]) -> TransferRecord {
         let chunk = crate::transfer_manifest::TransferChunk {
             index: 0,
@@ -943,6 +1108,110 @@ mod tests {
                 "transport stopped"
             ))));
         }
+    }
+
+    #[test]
+    fn resume_preflight_space_shrink_stays_paused_with_actionable_error_and_no_body_start() {
+        let (directory, storage, paused) = paused_receive_fixture("resume-space-shrink");
+        let remaining = paused.file_size - paused.transferred_bytes;
+        let snapshot =
+            VolumeSnapshot::known("NTFS", remaining + DESTINATION_RESERVE_BYTES - 1, None);
+        let mut body_started = false;
+
+        let result =
+            claim_paused_incoming_with_preflight(&storage, &paused, &|_, size, committed| {
+                validate_volume(&snapshot, size, committed)
+            });
+        if result.is_ok() {
+            body_started = true;
+        }
+
+        let error = result.expect_err("space shrink must block resumed receive");
+        assert!(error.to_string().contains("可用空间不足"));
+        assert!(!body_started);
+        let blocked = storage
+            .get_transfer(&paused.transfer_id)
+            .expect("reload blocked resume")
+            .expect("blocked resume remains");
+        assert_eq!(blocked.status, TransferStatus::Paused);
+        assert!(
+            blocked
+                .error
+                .as_deref()
+                .is_some_and(|value| value.contains("可用空间不足"))
+        );
+
+        assert!(
+            storage
+                .try_cancel_unclaimed_incoming_transfer(
+                    &blocked.transfer_id,
+                    &blocked.peer_id,
+                    blocked.transfer_protocol,
+                    "test cleanup",
+                )
+                .expect("claim must be cleared atomically on preflight failure")
+        );
+        drop(storage);
+        std::fs::remove_dir_all(directory).expect("remove shrink fixture");
+    }
+
+    #[test]
+    fn resume_preflight_retries_after_space_returns_using_receiver_committed_bytes() {
+        let (directory, storage, paused) = paused_receive_fixture("resume-space-return");
+        let remaining = paused.file_size - paused.transferred_bytes;
+        let insufficient =
+            VolumeSnapshot::known("NTFS", remaining + DESTINATION_RESERVE_BYTES - 1, None);
+        claim_paused_incoming_with_preflight(&storage, &paused, &|_, size, committed| {
+            validate_volume(&insufficient, size, committed)
+        })
+        .expect_err("first resume attempt must observe shrunken space");
+        let retried = storage
+            .get_transfer(&paused.transfer_id)
+            .expect("reload retryable resume")
+            .expect("retryable resume remains");
+        let exact_remaining =
+            VolumeSnapshot::known("NTFS", remaining + DESTINATION_RESERVE_BYTES, None);
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observed_for_probe = observed.clone();
+
+        let claimed =
+            claim_paused_incoming_with_preflight(&storage, &retried, &|_, size, committed| {
+                observed_for_probe
+                    .lock()
+                    .expect("lock observed preflight")
+                    .push((size, committed));
+                validate_volume(&exact_remaining, size, committed)
+            })
+            .expect("space returning must permit another resume attempt")
+            .expect("resume claim must be acquired");
+
+        assert_eq!(
+            observed.lock().expect("lock observed preflight").as_slice(),
+            &[(paused.file_size, paused.transferred_bytes)]
+        );
+        assert_eq!(claimed.status, TransferStatus::Transferring);
+        assert_eq!(claimed.transferred_bytes, u64::from(TRANSFER_CHUNK_BYTES));
+        assert!(
+            storage
+                .try_pause_claimed_incoming_transfer(
+                    &claimed.transfer_id,
+                    &claimed.peer_id,
+                    "test cleanup",
+                )
+                .expect("release successful resume claim")
+        );
+        assert!(
+            storage
+                .try_cancel_unclaimed_incoming_transfer(
+                    &claimed.transfer_id,
+                    &claimed.peer_id,
+                    claimed.transfer_protocol,
+                    "test cleanup",
+                )
+                .expect("clean resumed fixture")
+        );
+        drop(storage);
+        std::fs::remove_dir_all(directory).expect("remove returned-space fixture");
     }
 
     #[test]
