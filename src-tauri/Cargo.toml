@@ -1,6 +1,6 @@
 [package]
 name = "localnet"
-version = "0.1.7"
+version = "0.2.0"
 description = "Weline Localnet private peer-to-peer LAN messenger and file transfer app for Windows and macOS"
 authors = ["成都阿玛云科技有限公司 <contact@amayum.com>"]
 homepage = "https://github.com/Aiweline/Localnet"

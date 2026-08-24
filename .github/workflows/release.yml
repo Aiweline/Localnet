@@ -351,13 +351,16 @@ jobs:
         run: |
           set -euo pipefail
           version="${{ needs.prepare.outputs.version }}"
-          previous_tag="$(git tag --sort=-v:refname | grep -Fxv "v${version}" | head -n 1 || true)"
-          if [[ -n "$previous_tag" ]]; then
-            changes="$(git log --format='- %s' "${previous_tag}..${GITHUB_SHA}")"
+          if git ls-files --error-unmatch "docs/releases/v${version}.md" >/dev/null 2>&1; then
+            cp "docs/releases/v${version}.md" release-notes.md
           else
-            changes="$(git log --format='- %s' -n 20 "$GITHUB_SHA")"
-          fi
-          cat > release-notes.md <<EOF
+            previous_tag="$(git tag --sort=-v:refname | grep -Fxv "v${version}" | head -n 1 || true)"
+            if [[ -n "$previous_tag" ]]; then
+              changes="$(git log --format='- %s' "${previous_tag}..${GITHUB_SHA}")"
+            else
+              changes="$(git log --format='- %s' -n 20 "$GITHUB_SHA")"
+            fi
+            cat > release-notes.md <<EOF
           ## Weline Localnet ${version}
 
           Windows 与 macOS 局域网私密聊天及文件直传工具。本版本由通过发布门禁的 main 提交自动构建。
@@ -379,6 +382,7 @@ jobs:
           Company: 成都阿玛云科技有限公司
           Contact: contact@amayum.com
           EOF
+          fi
 
       - name: Create or repair GitHub Release
         shell: bash
