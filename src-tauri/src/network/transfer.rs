@@ -12,8 +12,8 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use super::{
     resumable_transfer::{
-        is_recoverable_transport_error, open_resumable_partial, receive_acknowledged_chunks,
-        send_acknowledged_chunks, verify_committed_manifest,
+        is_recoverable_receive_error, is_recoverable_send_error, open_owned_resumable_partial,
+        receive_acknowledged_chunks, send_acknowledged_chunks, verify_committed_manifest,
     },
     runtime::{NetworkEvent, emit_event},
 };
@@ -25,7 +25,8 @@ use crate::{
     error::AppError,
     protocol::{FILE_PROTOCOL, FILE_PROTOCOL_V2, TransferStreamHeader},
     receive_paths::{
-        commit_without_overwrite, finalize_reserved_receive, remove_owned_reservation,
+        commit_without_overwrite, finalize_reserved_receive, finalize_reserved_receive_durable,
+        remove_owned_reservation,
     },
     storage::Storage,
     transfer_policy::{TRANSFER_CHUNK_BYTES, TransferProtocol},
@@ -87,10 +88,14 @@ pub fn spawn_outgoing_transfer(
     tauri::async_runtime::spawn(async move {
         let result = send_transfer(&mut control, peer_id, &transfer, &storage, &app_handle).await;
         if let Err(error) = result {
-            if let Err(persist_error) =
-                fail_transfer(&storage, &app_handle, transfer, error.to_string())
-            {
-                tracing::warn!(%persist_error, "failed to persist outgoing transfer failure");
+            if transfer.transfer_protocol == TransferProtocol::LegacyV1 as u8 {
+                if let Err(persist_error) =
+                    fail_transfer(&storage, &app_handle, transfer, error.to_string())
+                {
+                    tracing::warn!(%persist_error, "failed to persist outgoing transfer failure");
+                }
+            } else {
+                tracing::warn!(transfer_id = %transfer.transfer_id, %error, "resumable outgoing transfer stopped");
             }
         }
     });
@@ -283,6 +288,51 @@ async fn send_resumable_transfer(
     storage: &Storage,
     app_handle: &AppHandle,
 ) -> Result<(), AppError> {
+    let Some(transfer) =
+        claim_resumable_outgoing(storage, &transfer.transfer_id, &transfer.peer_id)?
+    else {
+        return Ok(());
+    };
+    let result =
+        send_claimed_resumable_transfer(control, peer_id, &transfer, storage, app_handle).await;
+    if let Err(error) = &result {
+        if persist_claimed_outgoing_error(storage, &transfer, error)? {
+            if let Some(updated) = storage.get_transfer(&transfer.transfer_id)? {
+                let terminal = updated.status == TransferStatus::Failed;
+                emit_event(
+                    app_handle,
+                    &NetworkEvent::TransferUpdated {
+                        transfer: updated.clone(),
+                    },
+                );
+                if terminal {
+                    let _ = storage.update_message_status(
+                        &updated.transfer_id,
+                        MessageStatus::Failed,
+                        updated.error.as_deref(),
+                    );
+                    emit_event(
+                        app_handle,
+                        &NetworkEvent::MessageStatusChanged {
+                            message_id: updated.transfer_id,
+                            status: MessageStatus::Failed,
+                            error: updated.error,
+                        },
+                    );
+                }
+            }
+        }
+    }
+    result
+}
+
+async fn send_claimed_resumable_transfer(
+    control: &mut libp2p_stream::Control,
+    peer_id: PeerId,
+    transfer: &TransferRecord,
+    storage: &Storage,
+    app_handle: &AppHandle,
+) -> Result<(), AppError> {
     let source_path = transfer
         .local_path
         .as_deref()
@@ -305,17 +355,106 @@ async fn send_resumable_transfer(
     stream.write_all(&header_size.to_be_bytes()).await?;
     stream.write_all(&header).await?;
 
+    let mut previous_offset = transfer.transferred_bytes;
     send_acknowledged_chunks(
         &mut stream,
         &source_path,
         transfer,
         &chunks,
         transfer.transferred_bytes,
-        |acknowledged_offset| update_progress(storage, app_handle, transfer, acknowledged_offset),
+        |acknowledged_offset| {
+            if !storage.commit_claimed_outgoing_progress(
+                &transfer.transfer_id,
+                &transfer.peer_id,
+                previous_offset,
+                acknowledged_offset,
+            )? {
+                return Err(AppError::Storage(
+                    "可恢复发送进度状态已变化，已停止旧传输回调".to_string(),
+                ));
+            }
+            previous_offset = acknowledged_offset;
+            if let Some(updated) = storage.get_transfer(&transfer.transfer_id)? {
+                emit_event(
+                    app_handle,
+                    &NetworkEvent::TransferUpdated { transfer: updated },
+                );
+            }
+            Ok(())
+        },
     )
     .await?;
-    stream.close().await?;
-    complete_outgoing(storage, app_handle, transfer.clone())
+    if !storage.try_complete_claimed_outgoing_transfer(&transfer.transfer_id, &transfer.peer_id)? {
+        return Err(AppError::Storage(
+            "可恢复发送完成状态已变化，未覆盖当前记录".to_string(),
+        ));
+    }
+    let completed = storage
+        .get_transfer(&transfer.transfer_id)?
+        .ok_or_else(|| AppError::Storage("完成的可恢复发送记录不存在".to_string()))?;
+    storage.update_message_status(&completed.transfer_id, MessageStatus::Delivered, None)?;
+    emit_event(
+        app_handle,
+        &NetworkEvent::TransferUpdated {
+            transfer: completed.clone(),
+        },
+    );
+    emit_event(
+        app_handle,
+        &NetworkEvent::MessageStatusChanged {
+            message_id: completed.transfer_id,
+            status: MessageStatus::Delivered,
+            error: None,
+        },
+    );
+    if let Err(error) = stream.close().await {
+        tracing::debug!(transfer_id = %transfer.transfer_id, %error, "ignored stream close after resumable send completion");
+    }
+    Ok(())
+}
+
+fn claim_resumable_outgoing(
+    storage: &Storage,
+    transfer_id: &str,
+    peer_id: &str,
+) -> Result<Option<TransferRecord>, AppError> {
+    if !storage.try_claim_outgoing_transfer(transfer_id, peer_id)? {
+        return Ok(None);
+    }
+    let transfer = storage
+        .get_transfer(transfer_id)?
+        .ok_or_else(|| AppError::Storage("已占用的可恢复发送记录不存在".to_string()))?;
+    if transfer.direction != Direction::Outgoing
+        || transfer.peer_id != peer_id
+        || transfer.transfer_protocol != TransferProtocol::ResumableV2 as u8
+        || transfer.status != TransferStatus::Transferring
+        || !transfer.send_claimed
+    {
+        return Err(AppError::Storage(
+            "可恢复发送占用状态与持久化记录不一致".to_string(),
+        ));
+    }
+    Ok(Some(transfer))
+}
+
+fn persist_claimed_outgoing_error(
+    storage: &Storage,
+    transfer: &TransferRecord,
+    error: &AppError,
+) -> Result<bool, AppError> {
+    if is_recoverable_send_error(error) {
+        storage.try_pause_claimed_outgoing_transfer(
+            &transfer.transfer_id,
+            &transfer.peer_id,
+            &error.to_string(),
+        )
+    } else {
+        storage.try_fail_claimed_outgoing_transfer(
+            &transfer.transfer_id,
+            &transfer.peer_id,
+            &error.to_string(),
+        )
+    }
 }
 
 async fn receive_transfer(
@@ -444,7 +583,7 @@ async fn receive_resumable_transfer(
     )
     .await;
     if let Err(error) = &result {
-        let changed = if is_recoverable_transport_error(error) {
+        let changed = if is_recoverable_receive_error(error) {
             storage.try_pause_claimed_incoming_transfer(
                 &transfer.transfer_id,
                 &transfer.peer_id,
@@ -489,11 +628,23 @@ async fn receive_resumable_body(
         .as_deref()
         .map(PathBuf::from)
         .ok_or_else(|| AppError::Permission("可恢复文件缺少部分文件路径".to_string()))?;
-    let partial_parent = partial
-        .parent()
-        .ok_or_else(|| AppError::InvalidInput("部分文件保存位置无效".to_string()))?;
-    tokio::fs::create_dir_all(partial_parent).await?;
-    let file = open_resumable_partial(&partial, start_offset).await?;
+    let reservation_token = transfer
+        .reservation_token
+        .as_deref()
+        .ok_or_else(|| AppError::Permission("可恢复接收缺少所有权凭据".to_string()))?;
+    if !transfer.destination_reserved {
+        return Err(AppError::Permission(
+            "可恢复接收缺少目标文件占位".to_string(),
+        ));
+    }
+    let file = open_owned_resumable_partial(
+        &partial,
+        &destination,
+        &transfer.transfer_id,
+        reservation_token,
+        start_offset,
+    )
+    .await?;
 
     let transfer_id = transfer.transfer_id.clone();
     let storage_for_finalize = storage.clone();
@@ -507,7 +658,7 @@ async fn receive_resumable_body(
         transfer,
         start_offset,
         |chunk, committed_bytes| {
-            storage.commit_received_chunk(&transfer_id, chunk, committed_bytes)
+            storage.commit_received_chunk(&transfer_id, &transfer.peer_id, chunk, committed_bytes)
         },
         || verify_committed_manifest(storage, transfer),
         move || async move {
@@ -522,24 +673,22 @@ async fn receive_resumable_body(
             let partial_for_commit = partial_for_finalize.clone();
             let destination_for_commit = destination_for_finalize.clone();
             let completed_path = tokio::task::spawn_blocking(move || {
-                if destination_reserved {
-                    let token = reservation_token.as_deref().ok_or_else(|| {
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, "接收文件占位凭据缺失")
-                    })?;
-                    finalize_reserved_receive(
-                        &partial_for_commit,
-                        &destination_for_commit,
-                        &file_name,
-                        &transfer_id,
-                        token,
-                    )
-                } else {
-                    commit_without_overwrite(&partial_for_commit, &destination_for_commit)?;
-                    Ok(crate::receive_paths::FinalizedReceive {
-                        path: destination_for_commit,
-                        reservation_released: true,
-                    })
+                if !destination_reserved {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "可恢复接收缺少目标文件占位",
+                    ));
                 }
+                let token = reservation_token.as_deref().ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "接收文件占位凭据缺失")
+                })?;
+                finalize_reserved_receive_durable(
+                    &partial_for_commit,
+                    &destination_for_commit,
+                    &file_name,
+                    &transfer_id,
+                    token,
+                )
             })
             .await
             .map_err(|error| AppError::Io(std::io::Error::other(error.to_string())))??;
@@ -734,6 +883,10 @@ fn complete_incoming(
                 "可恢复接收完成状态已变化，未覆盖当前记录".to_string(),
             ));
         }
+        storage.cleanup_completed_incoming_artifacts(&transfer.transfer_id)?;
+        transfer = storage
+            .get_transfer(&transfer.transfer_id)?
+            .ok_or_else(|| AppError::Storage("完成的可恢复接收记录不存在".to_string()))?;
     } else {
         storage.upsert_transfer(&transfer)?;
     }
@@ -804,5 +957,221 @@ fn cleanup_reservation(transfer: &mut TransferRecord) -> bool {
             );
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs, io,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
+    use futures::io::{AsyncRead, AsyncWrite};
+
+    use super::{
+        claim_resumable_outgoing, persist_claimed_outgoing_error, send_acknowledged_chunks,
+    };
+    use crate::{
+        domain::{Direction, TransferKind, TransferRecord, TransferStatus},
+        error::AppError,
+        storage::Storage,
+        transfer_manifest::build_manifest,
+        transfer_policy::{TRANSFER_CHUNK_BYTES, TransferProtocol},
+    };
+
+    struct DisconnectingStream;
+
+    impl AsyncRead for DisconnectingStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            _buffer: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(0))
+        }
+    }
+
+    impl AsyncWrite for DisconnectingStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            _buffer: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "real scripted transport disconnect",
+            )))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn outgoing_transfer(transfer_id: &str) -> TransferRecord {
+        TransferRecord {
+            transfer_id: transfer_id.to_string(),
+            peer_id: "peer-one".to_string(),
+            direction: Direction::Outgoing,
+            kind: TransferKind::File,
+            file_name: "report.bin".to_string(),
+            file_size: u64::from(TRANSFER_CHUNK_BYTES),
+            mime_type: "application/octet-stream".to_string(),
+            sha256: "0".repeat(64),
+            local_path: Some("C:\\fixtures\\report.bin".to_string()),
+            destination_reserved: false,
+            reservation_token: None,
+            transfer_protocol: TransferProtocol::ResumableV2 as u8,
+            chunk_size: TRANSFER_CHUNK_BYTES,
+            chunk_count: 1,
+            manifest_sha256: Some("0".repeat(64)),
+            partial_path: None,
+            source_modified_ns: Some(1),
+            send_claimed: false,
+            transferred_bytes: 0,
+            status: TransferStatus::Transferring,
+            error: None,
+            created_at: "2026-08-24T00:00:00.000Z".to_string(),
+            updated_at: "2026-08-24T00:00:00.000Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn live_v2_send_claims_before_work_and_recoverable_disconnect_pauses() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-live-v2-send-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&fixture).expect("create fixture");
+        let storage = Storage::open(&fixture.join("localnet.sqlite3")).expect("open storage");
+        storage
+            .upsert_transfer(&outgoing_transfer("recoverable-send"))
+            .expect("persist outgoing transfer");
+
+        let claimed = claim_resumable_outgoing(&storage, "recoverable-send", "peer-one")
+            .expect("claim live v2 send")
+            .expect("claim winner loads transfer");
+        assert!(claimed.send_claimed);
+        assert_eq!(claimed.status, TransferStatus::Transferring);
+
+        assert!(
+            persist_claimed_outgoing_error(
+                &storage,
+                &claimed,
+                &AppError::Network("connection reset".to_string()),
+            )
+            .expect("persist recoverable disconnect")
+        );
+        let paused = storage
+            .get_transfer("recoverable-send")
+            .expect("load paused send")
+            .expect("paused send exists");
+        assert_eq!(paused.status, TransferStatus::Paused);
+        assert!(!paused.send_claimed);
+        assert_eq!(paused.error.as_deref(), Some("connection reset"));
+
+        drop(storage);
+        fs::remove_dir_all(fixture).expect("remove fixture");
+    }
+
+    #[test]
+    fn live_v2_send_terminal_source_error_fails_and_cancelled_row_never_claims() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-live-v2-terminal-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&fixture).expect("create fixture");
+        let storage = Storage::open(&fixture.join("localnet.sqlite3")).expect("open storage");
+        let mut cancelled = outgoing_transfer("cancelled-send");
+        cancelled.status = TransferStatus::Cancelled;
+        storage
+            .upsert_transfer(&cancelled)
+            .expect("persist cancelled transfer");
+        assert!(
+            claim_resumable_outgoing(&storage, "cancelled-send", "peer-one")
+                .expect("attempt cancelled claim")
+                .is_none()
+        );
+
+        storage
+            .upsert_transfer(&outgoing_transfer("terminal-send"))
+            .expect("persist outgoing transfer");
+        let claimed = claim_resumable_outgoing(&storage, "terminal-send", "peer-one")
+            .expect("claim terminal test send")
+            .expect("claim winner loads transfer");
+        assert!(
+            persist_claimed_outgoing_error(
+                &storage,
+                &claimed,
+                &AppError::InvalidInput("source was truncated".to_string()),
+            )
+            .expect("persist terminal source failure")
+        );
+        let failed = storage
+            .get_transfer("terminal-send")
+            .expect("load failed send")
+            .expect("failed send exists");
+        assert_eq!(failed.status, TransferStatus::Failed);
+        assert!(!failed.send_claimed);
+
+        drop(storage);
+        fs::remove_dir_all(fixture).expect("remove fixture");
+    }
+
+    #[tokio::test]
+    async fn acknowledged_send_disconnect_pauses_the_claimed_database_row() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-acknowledged-send-disconnect-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&fixture).expect("create fixture");
+        let source = fixture.join("source.bin");
+        fs::write(&source, b"payload").expect("write source");
+        let manifest = build_manifest(&source, TRANSFER_CHUNK_BYTES).expect("build manifest");
+        let mut transfer = outgoing_transfer("disconnecting-send");
+        transfer.file_size = manifest.file_size;
+        transfer.sha256 = hex::encode(manifest.file_sha256);
+        transfer.local_path = Some(source.to_string_lossy().into_owned());
+        transfer.chunk_count = u32::try_from(manifest.chunks.len()).expect("small manifest");
+        transfer.manifest_sha256 = Some(hex::encode(manifest.manifest_sha256));
+        transfer.source_modified_ns = Some(manifest.source_modified_ns);
+        let storage = Storage::open(&fixture.join("localnet.sqlite3")).expect("open storage");
+        storage
+            .create_outgoing_transfer_with_manifest(&transfer, &manifest.chunks)
+            .expect("persist outgoing manifest");
+        let claimed = claim_resumable_outgoing(&storage, &transfer.transfer_id, &transfer.peer_id)
+            .expect("claim outgoing transfer")
+            .expect("claim wins");
+        let mut stream = DisconnectingStream;
+
+        let error =
+            send_acknowledged_chunks(&mut stream, &source, &claimed, &manifest.chunks, 0, |_| {
+                Ok(())
+            })
+            .await
+            .expect_err("transport disconnect must stop acknowledged send");
+        assert!(
+            matches!(error, AppError::Io(ref error) if error.kind() == io::ErrorKind::BrokenPipe)
+        );
+        assert!(
+            persist_claimed_outgoing_error(&storage, &claimed, &error)
+                .expect("persist disconnect outcome")
+        );
+        let paused = storage
+            .get_transfer(&transfer.transfer_id)
+            .expect("load paused transfer")
+            .expect("paused transfer exists");
+        assert_eq!(paused.status, TransferStatus::Paused);
+        assert!(!paused.send_claimed);
+        assert_eq!(paused.transferred_bytes, 0);
+
+        drop(storage);
+        fs::remove_dir_all(fixture).expect("remove fixture");
     }
 }

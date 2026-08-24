@@ -7,6 +7,7 @@ use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
 use crate::{
     domain::{Direction, TransferRecord},
     error::AppError,
+    receive_paths::resumable_partial_is_owned,
     storage::Storage,
     transfer_manifest::{
         TransferChunk, capture_source_snapshot, decode_sha256, expected_chunk_count,
@@ -192,7 +193,7 @@ pub(crate) async fn open_resumable_partial(
     committed_offset: u64,
 ) -> Result<tokio::fs::File, AppError> {
     let file = tokio::fs::OpenOptions::new()
-        .create(committed_offset == 0)
+        .create(false)
         .read(true)
         .write(true)
         .truncate(false)
@@ -209,6 +210,27 @@ pub(crate) async fn open_resumable_partial(
         file.sync_data().await?;
     }
     Ok(file)
+}
+
+pub(crate) async fn open_owned_resumable_partial(
+    partial_path: &Path,
+    destination: &Path,
+    transfer_id: &str,
+    reservation_token: &str,
+    committed_offset: u64,
+) -> Result<tokio::fs::File, AppError> {
+    if !partial_path.parent().is_some_and(|parent| parent.is_dir()) {
+        return Err(AppError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "接收目录或磁盘当前不可用",
+        )));
+    }
+    if !resumable_partial_is_owned(partial_path, destination, transfer_id, reservation_token)? {
+        return Err(AppError::Permission(
+            "可恢复部分文件缺少匹配的所有权凭据".to_string(),
+        ));
+    }
+    open_resumable_partial(partial_path, committed_offset).await
 }
 
 pub(crate) async fn send_acknowledged_chunks<S, P>(
@@ -237,14 +259,7 @@ where
         .get(start..)
         .ok_or_else(|| AppError::InvalidInput("恢复分块索引超出已保存清单范围".to_string()))?
     {
-        let payload_len = usize::try_from(chunk.length)
-            .map_err(|_| AppError::InvalidInput("源文件分块长度超出当前平台限制".to_string()))?;
-        let mut payload = Vec::new();
-        payload
-            .try_reserve_exact(payload_len)
-            .map_err(|_| AppError::InvalidInput("源文件分块缓冲区无法分配".to_string()))?;
-        payload.resize(payload_len, 0);
-        source.read_exact(&mut payload).await?;
+        let payload = read_source_chunk(&mut source, chunk.length).await?;
         let actual_sha256: [u8; 32] = Sha256::digest(&payload).into();
         if actual_sha256 != chunk.sha256 {
             return Err(AppError::InvalidInput(
@@ -512,7 +527,16 @@ fn validate_acknowledgement(
     Ok(())
 }
 
-pub(crate) fn is_recoverable_transport_error(error: &AppError) -> bool {
+pub(crate) fn is_recoverable_receive_error(error: &AppError) -> bool {
+    matches!(error, AppError::Io(error) if error.kind() == std::io::ErrorKind::NotFound)
+        || is_recoverable_stream_error(error)
+}
+
+pub(crate) fn is_recoverable_send_error(error: &AppError) -> bool {
+    is_recoverable_stream_error(error)
+}
+
+fn is_recoverable_stream_error(error: &AppError) -> bool {
     match error {
         AppError::Network(_) | AppError::OfflinePeer => true,
         AppError::Io(error) => matches!(
@@ -531,6 +555,26 @@ pub(crate) fn is_recoverable_transport_error(error: &AppError) -> bool {
         | AppError::NotFriend
         | AppError::IncompatibleProtocol
         | AppError::IntegrityFailure => false,
+    }
+}
+
+async fn read_source_chunk(
+    source: &mut tokio::fs::File,
+    chunk_length: u32,
+) -> Result<Vec<u8>, AppError> {
+    let payload_len = usize::try_from(chunk_length)
+        .map_err(|_| AppError::InvalidInput("源文件分块长度超出当前平台限制".to_string()))?;
+    let mut payload = Vec::new();
+    payload
+        .try_reserve_exact(payload_len)
+        .map_err(|_| AppError::InvalidInput("源文件分块缓冲区无法分配".to_string()))?;
+    payload.resize(payload_len, 0);
+    match source.read_exact(&mut payload).await {
+        Ok(_) => Ok(payload),
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Err(
+            AppError::InvalidInput("源文件在传输期间被截断或替换".to_string()),
+        ),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -556,14 +600,15 @@ mod tests {
     };
 
     use super::{
-        ChunkFrameHeader, DurableChunkWriter, is_recoverable_transport_error,
-        open_resumable_partial, read_chunk_frame, receive_acknowledged_chunks,
-        send_acknowledged_chunks, validate_resume_offset, verify_committed_manifest,
-        write_chunk_frame,
+        ChunkFrameHeader, DurableChunkWriter, is_recoverable_receive_error,
+        is_recoverable_send_error, open_owned_resumable_partial, open_resumable_partial,
+        read_chunk_frame, read_source_chunk, receive_acknowledged_chunks, send_acknowledged_chunks,
+        validate_resume_offset, verify_committed_manifest, write_chunk_frame,
     };
     use crate::{
         domain::{Direction, TransferKind, TransferRecord, TransferStatus},
         error::AppError,
+        receive_paths::{reserve_receive_path, reserve_resumable_partial},
         storage::Storage,
         transfer_manifest::{TransferManifest, build_manifest, manifest_root},
         transfer_policy::{TRANSFER_CHUNK_BYTES, TransferProtocol},
@@ -868,10 +913,10 @@ mod tests {
 
     #[test]
     fn transport_disconnect_errors_are_recoverable_for_resumable_transfers() {
-        assert!(is_recoverable_transport_error(&AppError::Network(
+        assert!(is_recoverable_receive_error(&AppError::Network(
             "connection closed".to_string()
         )));
-        assert!(is_recoverable_transport_error(&AppError::OfflinePeer));
+        assert!(is_recoverable_receive_error(&AppError::OfflinePeer));
         for kind in [
             io::ErrorKind::UnexpectedEof,
             io::ErrorKind::BrokenPipe,
@@ -880,27 +925,72 @@ mod tests {
             io::ErrorKind::NotConnected,
             io::ErrorKind::TimedOut,
         ] {
-            assert!(is_recoverable_transport_error(&AppError::Io(
-                io::Error::new(kind, "transport stopped")
-            )));
+            assert!(is_recoverable_receive_error(&AppError::Io(io::Error::new(
+                kind,
+                "transport stopped"
+            ))));
         }
     }
 
     #[test]
     fn integrity_source_identity_and_local_io_errors_are_terminal() {
-        assert!(!is_recoverable_transport_error(&AppError::IntegrityFailure));
-        assert!(!is_recoverable_transport_error(&AppError::InvalidInput(
+        assert!(!is_recoverable_receive_error(&AppError::IntegrityFailure));
+        assert!(!is_recoverable_receive_error(&AppError::InvalidInput(
             "源文件在传输前发生了变化".to_string()
         )));
-        assert!(!is_recoverable_transport_error(&AppError::Permission(
+        assert!(!is_recoverable_receive_error(&AppError::Permission(
             "peer identity mismatch".to_string()
         )));
-        assert!(!is_recoverable_transport_error(&AppError::Io(
-            io::Error::new(io::ErrorKind::NotFound, "source missing")
-        )));
-        assert!(!is_recoverable_transport_error(&AppError::Io(
+        assert!(!is_recoverable_send_error(&AppError::Io(io::Error::new(
+            io::ErrorKind::NotFound,
+            "source missing"
+        ))));
+        assert!(!is_recoverable_receive_error(&AppError::Io(
             io::Error::new(io::ErrorKind::InvalidData, "invalid local data")
         )));
+    }
+
+    #[tokio::test]
+    async fn missing_receive_media_is_recoverable_and_never_recreated() {
+        let fixture = fixture_directory("missing-receive-media");
+        std::fs::create_dir_all(&fixture).expect("create fixture");
+        let destination = fixture.join("report.bin");
+        reserve_receive_path(&destination, "transfer-one", "token-one")
+            .expect("reserve destination");
+        let partial = reserve_resumable_partial(&destination, "transfer-one", "token-one")
+            .expect("reserve partial");
+        std::fs::remove_dir_all(&fixture).expect("simulate removed destination media");
+
+        let error =
+            open_owned_resumable_partial(&partial, &destination, "transfer-one", "token-one", 0)
+                .await
+                .expect_err("missing media must pause rather than recreate");
+
+        assert!(is_recoverable_receive_error(&error));
+        assert!(!fixture.exists());
+    }
+
+    #[tokio::test]
+    async fn production_source_eof_is_terminal_while_network_eof_is_recoverable() {
+        let fixture = fixture_directory("source-eof-classification");
+        std::fs::create_dir_all(&fixture).expect("create fixture");
+        let source = fixture.join("source.bin");
+        std::fs::write(&source, b"short").expect("write truncated source");
+        let mut source_file = tokio::fs::File::open(&source)
+            .await
+            .expect("open truncated source");
+
+        let source_error = read_source_chunk(&mut source_file, 8)
+            .await
+            .expect_err("short source must fail exact production read");
+
+        assert_eq!(source_error.code(), "invalid_input");
+        assert!(!is_recoverable_send_error(&source_error));
+        assert!(is_recoverable_send_error(&AppError::Io(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "remote acknowledgement stream ended",
+        ))));
+        std::fs::remove_dir_all(fixture).expect("remove fixture");
     }
 
     #[test]
@@ -1417,7 +1507,17 @@ mod tests {
             .expect("persist incoming transfer");
         assert!(
             storage
-                .commit_received_chunk(&transfer.transfer_id, &manifest.chunks[0], resume_offset)
+                .try_claim_incoming_transfer(&transfer.transfer_id, &transfer.peer_id)
+                .expect("claim incoming transfer")
+        );
+        assert!(
+            storage
+                .commit_received_chunk(
+                    &transfer.transfer_id,
+                    &transfer.peer_id,
+                    &manifest.chunks[0],
+                    resume_offset,
+                )
                 .expect("commit prefix authority")
         );
         let resumed_transfer = storage
@@ -1443,7 +1543,12 @@ mod tests {
             &resumed_transfer,
             resume_offset,
             |chunk, committed| {
-                storage.commit_received_chunk(&transfer.transfer_id, chunk, committed)
+                storage.commit_received_chunk(
+                    &transfer.transfer_id,
+                    &transfer.peer_id,
+                    chunk,
+                    committed,
+                )
             },
             || verify_committed_manifest(&storage, &resumed_transfer),
             || async { Ok(()) },
@@ -1579,6 +1684,11 @@ mod tests {
         receiver_storage
             .upsert_transfer(&incoming)
             .expect("persist incoming transfer");
+        assert!(
+            receiver_storage
+                .try_claim_incoming_transfer(&incoming.transfer_id, &incoming.peer_id)
+                .expect("claim initial incoming transfer")
+        );
 
         let first_offset = u64::from(TRANSFER_CHUNK_BYTES);
         let resume_offset = first_offset * 2;
@@ -1613,7 +1723,12 @@ mod tests {
             &incoming,
             0,
             |chunk, committed| {
-                receiver_storage.commit_received_chunk(&incoming.transfer_id, chunk, committed)
+                receiver_storage.commit_received_chunk(
+                    &incoming.transfer_id,
+                    &incoming.peer_id,
+                    chunk,
+                    committed,
+                )
             },
             || Ok(()),
             || async { Ok(()) },
@@ -1631,6 +1746,20 @@ mod tests {
                 .expect("incoming transfer exists")
                 .transferred_bytes,
             resume_offset
+        );
+        assert!(
+            receiver_storage
+                .try_pause_claimed_incoming_transfer(
+                    &incoming.transfer_id,
+                    &incoming.peer_id,
+                    "scripted disconnect",
+                )
+                .expect("pause interrupted incoming transfer")
+        );
+        assert!(
+            receiver_storage
+                .try_claim_incoming_transfer(&incoming.transfer_id, &incoming.peer_id)
+                .expect("reclaim resumed incoming transfer")
         );
 
         let final_offset = manifest.file_size;
@@ -1666,7 +1795,12 @@ mod tests {
             &resumed_incoming,
             resume_offset,
             |chunk, committed| {
-                receiver_storage.commit_received_chunk(&incoming.transfer_id, chunk, committed)
+                receiver_storage.commit_received_chunk(
+                    &incoming.transfer_id,
+                    &incoming.peer_id,
+                    chunk,
+                    committed,
+                )
             },
             || verify_committed_manifest(&receiver_storage, &resumed_incoming),
             move || async move {
@@ -1739,6 +1873,11 @@ mod tests {
         receiver_storage
             .upsert_transfer(&incoming)
             .expect("persist incoming transfer");
+        assert!(
+            receiver_storage
+                .try_claim_incoming_transfer(&incoming.transfer_id, &incoming.peer_id)
+                .expect("claim initial incoming transfer")
+        );
         let first_offset = u64::from(TRANSFER_CHUNK_BYTES);
         let resume_offset = first_offset * 2;
         let two_frame_bytes = (40 + chunk_len) * 2;
@@ -1783,6 +1922,7 @@ mod tests {
                     |chunk, committed| {
                         receiver_storage_for_task.commit_received_chunk(
                             &incoming_for_receiver.transfer_id,
+                            &incoming_for_receiver.peer_id,
                             chunk,
                             committed,
                         )
@@ -1814,6 +1954,20 @@ mod tests {
             vec![first_offset, resume_offset]
         );
         assert!(!finalized_first_exchange.load(Ordering::SeqCst));
+        assert!(
+            receiver_storage
+                .try_pause_claimed_incoming_transfer(
+                    &incoming.transfer_id,
+                    &incoming.peer_id,
+                    "scripted disconnect",
+                )
+                .expect("pause interrupted incoming transfer")
+        );
+        assert!(
+            receiver_storage
+                .try_claim_incoming_transfer(&incoming.transfer_id, &incoming.peer_id)
+                .expect("reclaim resumed incoming transfer")
+        );
         let resumed_incoming = receiver_storage
             .get_transfer(&incoming.transfer_id)
             .expect("load receiver authority")
@@ -1869,6 +2023,7 @@ mod tests {
                     |chunk, committed| {
                         receiver_storage_for_task.commit_received_chunk(
                             &resumed_transfer_for_receiver.transfer_id,
+                            &resumed_transfer_for_receiver.peer_id,
                             chunk,
                             committed,
                         )

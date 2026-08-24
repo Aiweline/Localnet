@@ -7,6 +7,8 @@ use std::{
 use sha2::{Digest, Sha256};
 
 const RESERVATION_PREFIX: &str = "WELINE-LOCALNET-RESERVATION:";
+const PARTIAL_OWNERSHIP_PREFIX: &str = "WELINE-LOCALNET-PARTIAL:";
+const FINALIZATION_PREFIX: &str = "WELINE-LOCALNET-FINALIZATION:";
 
 pub struct FinalizedReceive {
     pub path: PathBuf,
@@ -168,7 +170,6 @@ pub fn resumable_partial_path(destination: &Path, transfer_id: &str) -> io::Resu
     let directory = destination
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "接收文件保存位置无效"))?;
-    let transfer_id = transfer_id.trim();
     if transfer_id.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -179,29 +180,166 @@ pub fn resumable_partial_path(destination: &Path, transfer_id: &str) -> io::Resu
     Ok(directory.join(format!(".weline-localnet-partial-{}.part", &digest[..24])))
 }
 
+pub fn reserve_resumable_partial(
+    destination: &Path,
+    transfer_id: &str,
+    reservation_token: &str,
+) -> io::Result<PathBuf> {
+    let partial = resumable_partial_path(destination, transfer_id)?;
+    let parent = partial
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "部分文件保存位置无效"))?;
+    if !parent.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "接收目录或磁盘当前不可用",
+        ));
+    }
+    if !reservation_is_owned(destination, transfer_id, reservation_token)? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "部分文件缺少匹配的目标文件占位凭据",
+        ));
+    }
+    if resumable_partial_is_owned(&partial, destination, transfer_id, reservation_token)? {
+        if partial.is_file() {
+            return Ok(partial);
+        }
+        create_empty_partial(&partial)?;
+        return Ok(partial);
+    }
+    let owner_path = partial_owner_sidecar_path(&partial)?;
+    if partial.try_exists()? || owner_path.try_exists()? {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "部分文件保存位置已被占用",
+        ));
+    }
+    write_new_marker(
+        &owner_path,
+        &partial_owner_payload(transfer_id, reservation_token),
+    )?;
+    match create_empty_partial(&partial) {
+        Ok(()) => Ok(partial),
+        Err(error) => {
+            if partial_owner_is_owned(&partial, transfer_id, reservation_token).unwrap_or(false) {
+                let _ = fs::remove_file(owner_path);
+            }
+            Err(error)
+        }
+    }
+}
+
+pub fn resumable_partial_is_owned(
+    partial: &Path,
+    destination: &Path,
+    transfer_id: &str,
+    reservation_token: &str,
+) -> io::Result<bool> {
+    if partial != resumable_partial_path(destination, transfer_id)? || partial == destination {
+        return Ok(false);
+    }
+    partial_owner_is_owned(partial, transfer_id, reservation_token)
+}
+
 pub fn remove_owned_partial(
     partial: &Path,
     destination: &Path,
     transfer_id: &str,
+    reservation_token: &str,
 ) -> io::Result<bool> {
-    let expected = resumable_partial_path(destination, transfer_id)?;
-    if partial != expected || partial == destination {
+    if !resumable_partial_is_owned(partial, destination, transfer_id, reservation_token)? {
         return Ok(false);
     }
     match fs::remove_file(partial) {
-        Ok(()) => Ok(true),
+        Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            if partial.parent().is_some_and(|parent| parent.is_dir()) {
-                Ok(true)
-            } else {
-                Err(io::Error::new(
+            if !partial.parent().is_some_and(|parent| parent.is_dir()) {
+                return Err(io::Error::new(
                     io::ErrorKind::NotFound,
                     "接收目录或磁盘当前不可用",
-                ))
+                ));
             }
         }
-        Err(error) => Err(error),
+        Err(error) => return Err(error),
     }
+    fs::remove_file(partial_owner_sidecar_path(partial)?)?;
+    Ok(true)
+}
+
+pub fn finalize_reserved_receive_durable(
+    partial: &Path,
+    reserved_destination: &Path,
+    file_name: &str,
+    transfer_id: &str,
+    reservation_token: &str,
+) -> io::Result<FinalizedReceive> {
+    finalize_reserved_receive_with_marker(
+        partial,
+        reserved_destination,
+        file_name,
+        transfer_id,
+        reservation_token,
+        true,
+    )
+}
+
+pub fn owned_finalized_receive_path(
+    reserved_destination: &Path,
+    transfer_id: &str,
+    reservation_token: &str,
+) -> io::Result<Option<PathBuf>> {
+    let marker_path = finalization_marker_path(reserved_destination, transfer_id)?;
+    let mut marker = match File::open(&marker_path) {
+        Ok(marker) => marker,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if marker_path.parent().is_some_and(|parent| parent.is_dir()) {
+                return Ok(None);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "接收目录或磁盘当前不可用",
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    if marker.metadata()?.len() > 8 * 1024 {
+        return Ok(None);
+    }
+    let mut payload = String::new();
+    marker.read_to_string(&mut payload)?;
+    let prefix = format!("{FINALIZATION_PREFIX}{transfer_id}:{reservation_token}\n");
+    let Some(file_name) = payload
+        .strip_prefix(&prefix)
+        .and_then(|value| value.strip_suffix('\n'))
+    else {
+        return Ok(None);
+    };
+    let file_name_path = Path::new(file_name);
+    if file_name.is_empty() || file_name_path.file_name() != Some(file_name_path.as_os_str()) {
+        return Ok(None);
+    }
+    let directory = reserved_destination
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "接收文件保存位置无效"))?;
+    let candidate = directory.join(file_name_path);
+    if !reservation_is_owned(&candidate, transfer_id, reservation_token)? {
+        return Ok(None);
+    }
+    Ok(Some(candidate))
+}
+
+pub fn remove_owned_finalization_marker(
+    reserved_destination: &Path,
+    transfer_id: &str,
+    reservation_token: &str,
+) -> io::Result<bool> {
+    if owned_finalized_receive_path(reserved_destination, transfer_id, reservation_token)?.is_none()
+    {
+        return Ok(false);
+    }
+    fs::remove_file(finalization_marker_path(reserved_destination, transfer_id)?)?;
+    Ok(true)
 }
 
 pub fn finalize_reserved_receive(
@@ -210,6 +348,24 @@ pub fn finalize_reserved_receive(
     file_name: &str,
     transfer_id: &str,
     reservation_token: &str,
+) -> io::Result<FinalizedReceive> {
+    finalize_reserved_receive_with_marker(
+        partial,
+        reserved_destination,
+        file_name,
+        transfer_id,
+        reservation_token,
+        false,
+    )
+}
+
+fn finalize_reserved_receive_with_marker(
+    partial: &Path,
+    reserved_destination: &Path,
+    file_name: &str,
+    transfer_id: &str,
+    reservation_token: &str,
+    retain_reservation: bool,
 ) -> io::Result<FinalizedReceive> {
     let directory = reserved_destination
         .parent()
@@ -231,17 +387,35 @@ pub fn finalize_reserved_receive(
             )?;
             continue;
         }
+        if retain_reservation {
+            write_finalization_marker(
+                reserved_destination,
+                &candidate,
+                transfer_id,
+                reservation_token,
+            )?;
+        }
         match commit_without_overwrite(partial, &candidate) {
             Ok(()) => {
-                let reservation_released =
+                let reservation_released = if retain_reservation {
+                    false
+                } else {
                     remove_owned_reservation(&candidate, transfer_id, reservation_token)
-                        .unwrap_or(false);
+                        .unwrap_or(false)
+                };
                 return Ok(FinalizedReceive {
                     path: candidate,
                     reservation_released,
                 });
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if retain_reservation {
+                    let _ = remove_owned_finalization_marker(
+                        reserved_destination,
+                        transfer_id,
+                        reservation_token,
+                    );
+                }
                 remove_owned_reservation(&candidate, transfer_id, reservation_token)?;
                 candidate = reserve_available_receive_path(
                     directory,
@@ -252,6 +426,117 @@ pub fn finalize_reserved_receive(
             }
             Err(error) => return Err(error),
         }
+    }
+}
+
+fn write_finalization_marker(
+    reserved_destination: &Path,
+    candidate: &Path,
+    transfer_id: &str,
+    reservation_token: &str,
+) -> io::Result<()> {
+    if let Some(existing) =
+        owned_finalized_receive_path(reserved_destination, transfer_id, reservation_token)?
+    {
+        return if existing == candidate {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "文件完成标记已指向其他保存位置",
+            ))
+        };
+    }
+    let file_name = candidate
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "接收文件名无效"))?;
+    let payload = format!("{FINALIZATION_PREFIX}{transfer_id}:{reservation_token}\n{file_name}\n");
+    write_new_marker(
+        &finalization_marker_path(reserved_destination, transfer_id)?,
+        payload.as_bytes(),
+    )
+}
+
+fn finalization_marker_path(destination: &Path, transfer_id: &str) -> io::Result<PathBuf> {
+    let directory = destination
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "接收文件保存位置无效"))?;
+    let digest = hex::encode(Sha256::digest(transfer_id.as_bytes()));
+    Ok(directory.join(format!(".weline-localnet-finalization-{}", &digest[..24])))
+}
+
+fn create_empty_partial(partial: &Path) -> io::Result<()> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(partial)?;
+    file.sync_all()
+}
+
+fn partial_owner_is_owned(
+    partial: &Path,
+    transfer_id: &str,
+    reservation_token: &str,
+) -> io::Result<bool> {
+    let owner_path = partial_owner_sidecar_path(partial)?;
+    let payload = partial_owner_payload(transfer_id, reservation_token);
+    marker_matches(&owner_path, &payload)
+}
+
+fn partial_owner_sidecar_path(partial: &Path) -> io::Result<PathBuf> {
+    let directory = partial
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "部分文件保存位置无效"))?;
+    let file_name = partial
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "部分文件名无效"))?;
+    Ok(directory.join(format!("{file_name}.owner")))
+}
+
+fn partial_owner_payload(transfer_id: &str, reservation_token: &str) -> Vec<u8> {
+    format!("{PARTIAL_OWNERSHIP_PREFIX}{transfer_id}:{reservation_token}\n").into_bytes()
+}
+
+fn write_new_marker(path: &Path, payload: &[u8]) -> io::Result<()> {
+    let mut marker = OpenOptions::new().write(true).create_new(true).open(path)?;
+    let result = marker
+        .write_all(payload)
+        .and_then(|_| marker.flush())
+        .and_then(|_| marker.sync_all());
+    drop(marker);
+    if let Err(error) = result {
+        let _ = fs::remove_file(path);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn marker_matches(path: &Path, payload: &[u8]) -> io::Result<bool> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if path.parent().is_some_and(|parent| parent.is_dir()) {
+                return Ok(false);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "接收目录或磁盘当前不可用",
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() != payload.len() as u64 {
+        return Ok(false);
+    }
+    let mut actual = vec![0_u8; payload.len()];
+    match file.read_exact(&mut actual) {
+        Ok(()) => Ok(actual == payload),
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(error) => Err(error),
     }
 }
 
@@ -362,8 +647,9 @@ mod tests {
 
     use super::{
         commit_without_overwrite, copy_without_overwrite, finalize_reserved_receive,
-        remove_owned_partial, remove_owned_reservation, reservation_is_owned,
-        reserve_available_receive_path, reserve_receive_path, resumable_partial_path,
+        finalize_reserved_receive_durable, remove_owned_partial, remove_owned_reservation,
+        reservation_is_owned, reserve_available_receive_path, reserve_receive_path,
+        reserve_resumable_partial, resumable_partial_is_owned, resumable_partial_path,
         safe_file_name,
     };
 
@@ -555,6 +841,45 @@ mod tests {
     }
 
     #[test]
+    fn whitespace_distinct_transfer_ids_have_distinct_partial_names() {
+        let directory = temporary_directory("partial-whitespace-identity");
+        let destination = directory.join("report.bin");
+
+        let plain = resumable_partial_path(&destination, "transfer-one")
+            .expect("derive plain transfer partial");
+        let spaced = resumable_partial_path(&destination, " transfer-one ")
+            .expect("derive whitespace-distinct transfer partial");
+
+        assert_ne!(plain, spaced);
+    }
+
+    #[test]
+    fn preexisting_deterministic_partial_is_never_claimed_or_truncated() {
+        let directory = temporary_directory("partial-preexisting-collision");
+        fs::create_dir_all(&directory).expect("create receive directory");
+        let destination = directory.join("report.bin");
+        reserve_receive_path(&destination, "transfer-one", "token-one")
+            .expect("reserve destination");
+        let partial = resumable_partial_path(&destination, "transfer-one")
+            .expect("derive deterministic partial");
+        fs::write(&partial, b"unrelated-user-data").expect("write unrelated deterministic file");
+
+        let error = reserve_resumable_partial(&destination, "transfer-one", "token-one")
+            .expect_err("pre-existing partial must reject ownership reservation");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read(&partial).expect("read preserved unrelated partial"),
+            b"unrelated-user-data"
+        );
+        assert!(
+            !resumable_partial_is_owned(&partial, &destination, "transfer-one", "token-one")
+                .expect("inspect rejected partial ownership")
+        );
+        fs::remove_dir_all(directory).expect("remove receive fixture");
+    }
+
+    #[test]
     fn owned_partial_cleanup_rejects_unrelated_paths_and_preserves_destination() {
         let directory = temporary_directory("owned-partial-cleanup");
         fs::create_dir_all(&directory).expect("create receive directory");
@@ -562,17 +887,22 @@ mod tests {
         let partial = resumable_partial_path(&destination, "transfer-one")
             .expect("derive deterministic partial path");
         let unrelated = directory.join("user-data.part");
+        reserve_receive_path(&destination, "transfer-one", "token-one")
+            .expect("reserve destination");
         fs::write(&destination, b"completed-or-user-data").expect("write destination");
+        let reserved = reserve_resumable_partial(&destination, "transfer-one", "token-one")
+            .expect("reserve exact partial ownership");
+        assert_eq!(reserved, partial);
         fs::write(&partial, b"owned-partial").expect("write owned partial");
         fs::write(&unrelated, b"unrelated").expect("write unrelated file");
 
         assert!(
-            !remove_owned_partial(&unrelated, &destination, "transfer-one")
+            !remove_owned_partial(&unrelated, &destination, "transfer-one", "token-one",)
                 .expect("reject unrelated cleanup")
         );
         assert!(partial.exists());
         assert!(
-            remove_owned_partial(&partial, &destination, "transfer-one")
+            remove_owned_partial(&partial, &destination, "transfer-one", "token-one",)
                 .expect("remove exact owned partial")
         );
         assert!(!partial.exists());
@@ -583,6 +913,39 @@ mod tests {
         assert_eq!(
             fs::read(&unrelated).expect("read unrelated file"),
             b"unrelated"
+        );
+        fs::remove_dir_all(directory).expect("remove receive fixture");
+    }
+
+    #[test]
+    fn durable_finalize_retains_owned_reservation_until_database_completion() {
+        let directory = temporary_directory("durable-finalize-marker");
+        fs::create_dir_all(&directory).expect("create receive directory");
+        let destination = directory.join("report.bin");
+        reserve_receive_path(&destination, "transfer-one", "token-one")
+            .expect("reserve destination");
+        let partial = reserve_resumable_partial(&destination, "transfer-one", "token-one")
+            .expect("reserve partial");
+        fs::write(&partial, b"complete-payload").expect("write complete partial");
+
+        let finalized = finalize_reserved_receive_durable(
+            &partial,
+            &destination,
+            "report.bin",
+            "transfer-one",
+            "token-one",
+        )
+        .expect("durably finalize receive");
+
+        assert_eq!(finalized.path, destination);
+        assert!(!finalized.reservation_released);
+        assert!(
+            reservation_is_owned(&finalized.path, "transfer-one", "token-one")
+                .expect("finalization marker remains owned")
+        );
+        assert_eq!(
+            fs::read(&finalized.path).expect("read finalized payload"),
+            b"complete-payload"
         );
         fs::remove_dir_all(directory).expect("remove receive fixture");
     }
