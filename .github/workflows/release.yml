@@ -36,6 +36,9 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
 
+      - name: Run presence regression test
+        run: node --test --experimental-strip-types tests/presence.test.ts
+
       - name: Validate synchronized versions
         id: version
         shell: bash

@@ -9,8 +9,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::{
     domain::{
         BootstrapSnapshot, ChatMessage, Direction, Friend, FriendRequest, FriendRequestStatus,
-        LocalProfile, MessageKind, MessageStatus, PeerSummary, Platform, TransferKind,
-        TransferPreferences, TransferRecord, TransferStatus,
+        LocalProfile, MessageKind, MessageStatus, PeerSummary, Platform, PresenceSnapshot,
+        TransferKind, TransferPreferences, TransferRecord, TransferStatus,
     },
     error::AppError,
     receive_paths::remove_owned_reservation,
@@ -506,6 +506,13 @@ impl Storage {
             friends: self.list_friends()?,
             messages: self.list_messages()?,
             transfers: self.list_transfers()?,
+        })
+    }
+
+    pub fn presence_snapshot(&self) -> Result<PresenceSnapshot, AppError> {
+        Ok(PresenceSnapshot {
+            peers: self.list_peers()?,
+            friends: self.list_friends()?,
         })
     }
 
