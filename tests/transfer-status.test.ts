@@ -57,6 +57,7 @@ test("keeps persisted network and unknown paused errors on the resumable waiting
     "connection timed out while reading transfer body",
     "UnexpectedEof while receiving stream",
     "BrokenPipe: peer offline",
+    "network permission denied",
     "opaque backend failure 472",
   ]) {
     const presentation = present({
@@ -76,10 +77,15 @@ test("keeps only volume and destination paused errors actionable", () => {
     "接收目录位于 NTFS 文件系统，可用空间不足：请选择可用空间更多的目录后重试",
     "接收目录位于 FAT32 文件系统，单个文件最大支持 4294967295 字节",
     "无法访问接收目录 E:\\Downloads：请选择可访问且可写入的目录后重试",
+    "无法写入接收目录 E:\\Downloads：请选择可写入的目录后重试",
     "接收目录或磁盘当前不可用",
     "Destination directory is unavailable; choose a writable folder and retry",
     "FAT32 volume does not support this file size",
     "insufficient free disk space on the destination volume",
+    "disk is full",
+    "filesystem permission denied",
+    "read-only volume",
+    "missing destination directory",
   ]) {
     const presentation = present({
       direction: "incoming",

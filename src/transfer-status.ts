@@ -76,11 +76,13 @@ function isActionableDestinationError(error: string): boolean {
   if (!error) return false;
 
   const normalized = error.toLowerCase();
-  if (/fat\s*32|\bmsdos\b/.test(normalized)) return true;
+  const filesystemLimit = /fat\s*32|\bmsdos\b/.test(normalized)
+    && /limit|size|file|maximum|too large|限制|过大|過大|大小|最大|文件/.test(normalized);
+  if (filesystemLimit) return true;
 
-  const destination = /磁盘|磁碟|卷|文件系统|文件系統|接收目录|接收目錄|目标目录|目標目錄|保存目录|保存目錄|目的地目录|目的地目錄|目标位置|目標位置|接收位置|destination|target directory|receive directory|receiving directory|disk|drive|volume|filesystem|file system/i;
-  const actionable = /可用空间|可用空間|空间不足|空間不足|可写|可寫|不可写|不可寫|不可用|无法访问|無法訪問|无法写入|無法寫入|无法识别|無法識別|只读|只讀|不可访问|不可訪問|not writable|unavailable|insufficient|free space|no space|read[- ]only|not found|cannot access|unable to access|cannot write|unable to write|unsupported|maximum file size|file size limit/i;
-  return destination.test(error) && actionable.test(error);
+  const destinationObject = /\b(?:disk|drive|volume|filesystem|file system|destination|directory|receive folder)\b|磁盘|磁碟|驱动器|驅動器|卷|文件系统|文件系統|目标|目標|保存目录|保存目錄|接收目录|接收目錄/i;
+  const actionableCondition = /\b(?:full|no space|insufficient|free space|permission denied|read[- ]only|not writable|unavailable|not found|missing|not ready|disconnected device|limit|too large)\b|空间不足|空間不足|已满|已滿|不可写|不可寫|权限|權限|只读|只讀|不可用|未找到|未就绪|未就緒|限制|过大|過大|无法访问|無法訪問|无法写入|無法寫入/i;
+  return destinationObject.test(normalized) && actionableCondition.test(normalized);
 }
 
 function normalizePausedError(error: string | undefined): string {
