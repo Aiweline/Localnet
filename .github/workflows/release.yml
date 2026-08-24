@@ -1,0 +1,411 @@
+name: Release Weline Localnet
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: "24"
+  PNPM_VERSION: "10.28.2"
+
+jobs:
+  prepare:
+    name: Check release version
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      should_release: ${{ steps.release.outputs.should_release }}
+    steps:
+      - name: Check out source and tags
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Validate synchronized versions
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/release-version.mjs --check
+          version="$(node -p "require('./package.json').version")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether this commit needs a release
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          tag="v$version"
+          app_changed=false
+
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            before="${{ github.event.before }}"
+            if [[ "$before" =~ ^0+$ ]] || ! git cat-file -e "$before^{commit}" 2>/dev/null; then
+              changed_files="$(git diff-tree --no-commit-id --name-only -r "$GITHUB_SHA")"
+            else
+              changed_files="$(git diff --name-only "$before" "$GITHUB_SHA")"
+            fi
+
+            echo "Changed files:"
+            printf '%s\n' "$changed_files"
+            while IFS= read -r file; do
+              if [[ "$file" =~ ^(\.cargo/|assets/|src/|src-tauri/|index\.html$|package\.json$|pnpm-lock\.yaml$|tsconfig(\..+)?\.json$|vite\.config\.ts$) ]]; then
+                app_changed=true
+                break
+              fi
+            done <<< "$changed_files"
+          fi
+
+          if git rev-parse --verify --quiet "$tag^{commit}" >/dev/null; then
+            tag_commit="$(git rev-list -n 1 "$tag")"
+            release_complete=false
+            release_json="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease,assets 2>/dev/null || true)"
+            if [[ -n "$release_json" ]]; then
+              expected_assets="$(printf '%s\n' \
+                "Weline_Localnet_${version}_SHA256SUMS.txt" \
+                "Weline_Localnet_${version}_universal.dmg" \
+                "Weline_Localnet_${version}_universal.dmg.sha256" \
+                "Weline_Localnet_${version}_x64-portable.exe" \
+                "Weline_Localnet_${version}_x64-setup.exe" | sort)"
+              actual_assets="$(jq -r '.assets[].name' <<< "$release_json" | sort)"
+              is_draft="$(jq -r '.isDraft' <<< "$release_json")"
+              is_prerelease="$(jq -r '.isPrerelease' <<< "$release_json")"
+              if [[ "$is_draft" == "false" && "$is_prerelease" == "false" && "$actual_assets" == "$expected_assets" ]]; then
+                release_complete=true
+              fi
+            fi
+
+            if [[ "$release_complete" == "false" && "$app_changed" == "true" && "$tag_commit" != "$GITHUB_SHA" ]]; then
+              echo "::error::Application files changed, but $tag already points to $tag_commit. Run pnpm release:version with a higher version before merging."
+              exit 1
+            elif [[ "$release_complete" == "false" ]]; then
+              echo "Release $tag is missing or incomplete; it will be rebuilt."
+              echo "should_release=true" >> "$GITHUB_OUTPUT"
+            elif [[ "$app_changed" == "true" ]]; then
+              echo "::error::Application files changed, but $tag is already published. Run pnpm release:version with a higher version before merging."
+              exit 1
+            else
+              echo "Release $tag is already complete and no application files changed."
+              echo "should_release=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "No tag exists for $tag; release build is required."
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  windows:
+    name: Build Windows x64
+    needs: prepare
+    if: needs.prepare.outputs.should_release == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Validate release version
+        run: pnpm release:check
+
+      - name: Run Rust library tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib --locked
+
+      - name: Build Windows installer
+        run: pnpm tauri build --bundles nsis
+
+      - name: Verify and collect Windows packages
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = "${{ needs.prepare.outputs.version }}"
+          $setups = @(Get-ChildItem -LiteralPath "src-tauri/target/release/bundle/nsis" -File -Filter "*_${version}_x64-setup.exe")
+          if ($setups.Count -ne 1) {
+            throw "Expected exactly one Windows setup package for $version; found $($setups.Count)"
+          }
+
+          $portable = Get-Item -LiteralPath "src-tauri/target/release/localnet.exe"
+          if ($setups[0].VersionInfo.ProductVersion -ne $version) {
+            throw "Setup version mismatch: $($setups[0].VersionInfo.ProductVersion)"
+          }
+          if ($portable.VersionInfo.ProductVersion -ne $version) {
+            throw "Portable version mismatch: $($portable.VersionInfo.ProductVersion)"
+          }
+
+          New-Item -ItemType Directory -Path "release/windows" -Force | Out-Null
+          $setupOutput = "release/windows/Weline_Localnet_${version}_x64-setup.exe"
+          $portableOutput = "release/windows/Weline_Localnet_${version}_x64-portable.exe"
+          Copy-Item -LiteralPath $setups[0].FullName -Destination $setupOutput
+          Copy-Item -LiteralPath $portable.FullName -Destination $portableOutput
+
+          $setupHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $setupOutput).Hash.ToLowerInvariant()
+          $portableHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $portableOutput).Hash.ToLowerInvariant()
+          $lines = @(
+            "$setupHash  Weline_Localnet_${version}_x64-setup.exe",
+            "$portableHash  Weline_Localnet_${version}_x64-portable.exe"
+          )
+          [System.IO.File]::WriteAllLines(
+            "release/windows/Weline_Localnet_${version}_SHA256SUMS.txt",
+            $lines,
+            [System.Text.UTF8Encoding]::new($false)
+          )
+
+      - name: Upload Windows packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: weline-localnet-windows-${{ needs.prepare.outputs.version }}
+          path: release/windows/*
+          if-no-files-found: error
+          retention-days: 14
+
+  macos:
+    name: Build macOS universal
+    needs: prepare
+    if: needs.prepare.outputs.should_release == 'true'
+    runs-on: macos-14
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Set up Rust targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Validate release version
+        run: pnpm release:check
+
+      - name: Run Rust library tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib --locked
+
+      - name: Build universal DMG
+        run: pnpm tauri build --target universal-apple-darwin --bundles dmg
+
+      - name: Verify macOS bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.prepare.outputs.version }}"
+          dmg_path="$(find src-tauri/target/universal-apple-darwin/release/bundle/dmg -maxdepth 1 -name '*.dmg' -print -quit)"
+          test -n "$dmg_path"
+          mount_dir="$(mktemp -d)"
+          hdiutil attach "$dmg_path" -readonly -nobrowse -mountpoint "$mount_dir"
+          trap 'hdiutil detach "$mount_dir" >/dev/null 2>&1 || true; rmdir "$mount_dir" >/dev/null 2>&1 || true' EXIT
+          app_path="$(find "$mount_dir" -maxdepth 2 -name '*.app' -print -quit)"
+          test -n "$app_path"
+          bundle_version="$(plutil -extract CFBundleShortVersionString raw "$app_path/Contents/Info.plist")"
+          local_network_description="$(plutil -extract NSLocalNetworkUsageDescription raw "$app_path/Contents/Info.plist")"
+          bonjour_service="$(plutil -extract NSBonjourServices.0 raw "$app_path/Contents/Info.plist")"
+          binary_path="$(find "$app_path/Contents/MacOS" -maxdepth 1 -type f -perm -111 -print -quit)"
+          test -n "$binary_path"
+          archs="$(lipo -archs "$binary_path")"
+          echo "Verified DMG: $dmg_path"
+          echo "Bundle version: $bundle_version"
+          echo "Local Network description: $local_network_description"
+          echo "Bonjour service: $bonjour_service"
+          echo "Executable architectures: $archs"
+          test "$bundle_version" = "$version"
+          test -n "$local_network_description"
+          test "$bonjour_service" = "_p2p._udp"
+          [[ "$archs" == *arm64* ]]
+          [[ "$archs" == *x86_64* ]]
+
+      - name: Collect macOS package and checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.prepare.outputs.version }}"
+          mkdir -p release/macos
+          dmg_path="$(find src-tauri/target/universal-apple-darwin/release/bundle/dmg -maxdepth 1 -name '*.dmg' -print -quit)"
+          test -n "$dmg_path"
+          output="release/macos/Weline_Localnet_${version}_universal.dmg"
+          cp "$dmg_path" "$output"
+          (
+            cd release/macos
+            shasum -a 256 "Weline_Localnet_${version}_universal.dmg" > "Weline_Localnet_${version}_universal.dmg.sha256"
+          )
+
+      - name: Upload macOS packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: weline-localnet-macos-${{ needs.prepare.outputs.version }}
+          path: release/macos/*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish GitHub Release
+    needs:
+      - prepare
+      - windows
+      - macos
+    if: needs.prepare.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - name: Check out source and tags
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download Windows packages
+        uses: actions/download-artifact@v4
+        with:
+          name: weline-localnet-windows-${{ needs.prepare.outputs.version }}
+          path: release-assets
+
+      - name: Download macOS packages
+        uses: actions/download-artifact@v4
+        with:
+          name: weline-localnet-macos-${{ needs.prepare.outputs.version }}
+          path: release-assets
+
+      - name: Verify release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.prepare.outputs.version }}"
+          expected="$(printf '%s\n' \
+            "Weline_Localnet_${version}_SHA256SUMS.txt" \
+            "Weline_Localnet_${version}_universal.dmg" \
+            "Weline_Localnet_${version}_universal.dmg.sha256" \
+            "Weline_Localnet_${version}_x64-portable.exe" \
+            "Weline_Localnet_${version}_x64-setup.exe" | sort)"
+          actual="$(find release-assets -maxdepth 1 -type f -printf '%f\n' | sort)"
+          if [[ "$actual" != "$expected" ]]; then
+            echo "Expected assets:"
+            printf '%s\n' "$expected"
+            echo "Actual assets:"
+            printf '%s\n' "$actual"
+            exit 1
+          fi
+
+          (
+            cd release-assets
+            sha256sum -c "Weline_Localnet_${version}_SHA256SUMS.txt"
+            expected_mac="$(awk '{print $1}' "Weline_Localnet_${version}_universal.dmg.sha256")"
+            actual_mac="$(sha256sum "Weline_Localnet_${version}_universal.dmg" | awk '{print $1}')"
+            test "$actual_mac" = "$expected_mac"
+          )
+
+      - name: Build bilingual release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.prepare.outputs.version }}"
+          previous_tag="$(git tag --sort=-v:refname | grep -Fxv "v${version}" | head -n 1 || true)"
+          if [[ -n "$previous_tag" ]]; then
+            changes="$(git log --format='- %s' "${previous_tag}..${GITHUB_SHA}")"
+          else
+            changes="$(git log --format='- %s' -n 20 "$GITHUB_SHA")"
+          fi
+          cat > release-notes.md <<EOF
+          ## Weline Localnet ${version}
+
+          Windows 与 macOS 局域网私密聊天及文件直传工具。本版本由通过发布门禁的 main 提交自动构建。
+
+          ### 变更
+
+          ${changes}
+
+          ### 下载
+
+          - Windows x64 安装版与便携版
+          - macOS Universal DMG（Apple Silicon + Intel）
+          - SHA-256 完整性校验文件
+
+          ---
+
+          Weline Localnet is a private peer-to-peer LAN messenger and file-transfer app for Windows and macOS. This release was built automatically from a gated main-branch commit.
+
+          Company: 成都阿玛云科技有限公司
+          Contact: contact@amayum.com
+          EOF
+
+      - name: Create or repair GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${{ needs.prepare.outputs.version }}"
+          tag="v${version}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            while IFS= read -r asset; do
+              case "$asset" in
+                "Weline_Localnet_${version}_SHA256SUMS.txt"|\
+                "Weline_Localnet_${version}_universal.dmg"|\
+                "Weline_Localnet_${version}_universal.dmg.sha256"|\
+                "Weline_Localnet_${version}_x64-portable.exe"|\
+                "Weline_Localnet_${version}_x64-setup.exe") ;;
+                *) gh release delete-asset "$tag" "$asset" --repo "$GITHUB_REPOSITORY" --yes ;;
+              esac
+            done < <(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+            gh release upload "$tag" release-assets/* --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Weline Localnet v${version}" \
+              --notes-file release-notes.md \
+              --draft=false \
+              --prerelease=false \
+              --latest
+          else
+            gh release create "$tag" release-assets/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "Weline Localnet v${version}" \
+              --notes-file release-notes.md \
+              --latest
+          fi
