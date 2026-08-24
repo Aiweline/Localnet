@@ -42,6 +42,13 @@ async fn receive_mdns(local_peer: PeerId, sender: mpsc::Sender<DiscoveryEvent>) 
         ));
     }
     let socket = bind_receiver(&interfaces)?;
+    tracing::debug!(
+        interfaces = ?interfaces
+            .iter()
+            .map(|interface| format!("{}={}", interface.name, interface.ip))
+            .collect::<Vec<_>>(),
+        "Windows mDNS compatibility receiver started"
+    );
     let mut query_interval = time::interval(QUERY_INTERVAL);
     query_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut buffer = [0_u8; MAX_DNS_PACKET_BYTES + 1];
@@ -58,7 +65,11 @@ async fn receive_mdns(local_peer: PeerId, sender: mpsc::Sender<DiscoveryEvent>) 
                 let SocketAddr::V4(source) = source else {
                     continue;
                 };
-                for (peer_id, address) in parse_peer_hints(&buffer[..length], *source.ip(), local_peer) {
+                tracing::trace!(source = %source, length, "mDNS packet received");
+                let hints = parse_peer_hints(&buffer[..length], *source.ip(), local_peer);
+                tracing::trace!(source = %source, hints = hints.len(), "mDNS packet parsed");
+                for (peer_id, address) in hints {
+                    tracing::debug!(%peer_id, %address, source = %source, "mDNS peer hint accepted");
                     if sender
                         .send(DiscoveryEvent::PeerHint {
                             peer_id,
@@ -130,6 +141,12 @@ async fn send_queries(interfaces: &[LanInterface]) {
                 address = %interface.ip,
                 %error,
                 "mDNS compatibility query failed"
+            );
+        } else {
+            tracing::trace!(
+                interface = %interface.name,
+                address = %interface.ip,
+                "mDNS compatibility query sent"
             );
         }
     }
