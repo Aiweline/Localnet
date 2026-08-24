@@ -42,9 +42,9 @@ The beacon task refreshes interface enumeration periodically so Wi-Fi changes, E
 
 ### Windows
 
-The NSIS installer runs per-machine and adds one program-scoped inbound firewall rule for the installed `Localnet.exe`. The rule is limited to remote addresses in `LocalSubnet` and applies to the active Windows profile, including a home LAN incorrectly classified as Public. Uninstall removes only that named Localnet rule.
+The NSIS installer runs for the current user and never requests elevation during installation. It does not run localized `netsh` output through the NSIS log, which avoids mojibake on non-English Windows systems. Windows may still show its native firewall consent once when Weline Chat first accepts inbound LAN traffic; this is a first-run network permission, not an installer permission.
 
-The portable executable is not allowed to silently elevate itself. It remains useful when the user has already allowed it through the firewall; the supported automatic path is the installer.
+The portable executable follows the same first-run network permission behavior. Neither packaging path silently elevates itself.
 
 ### macOS
 
@@ -71,7 +71,7 @@ No new setup field is required. Nearby users continue to appear in the existing 
 2. A valid beacon or probe response produces an authenticated libp2p dial hint and a completed Hello exposes the peer.
 3. Malformed, public-source, self, duplicate, and expired beacons are safely ignored or cleaned up.
 4. Existing mDNS discovery still works.
-5. Windows NSIS installs and removes the `LocalSubnet` firewall rule.
+5. Windows NSIS installs without UAC; Windows owns any first-run firewall consent.
 6. The macOS app bundle contains the Local Network usage description and `_p2p._udp` declaration.
 7. With mDNS disabled, two isolated desktop identities still discover one another, add a friend, exchange text, and transfer a file whose received SHA-256 matches the source.
 8. Windows and universal macOS 0.1.3 packages build successfully.

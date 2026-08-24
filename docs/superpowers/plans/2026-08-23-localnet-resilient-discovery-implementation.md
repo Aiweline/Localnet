@@ -61,19 +61,17 @@
 
 **Files:**
 - Create: `src-tauri/Info.plist`
-- Create: `src-tauri/windows/hooks.nsh`
 - Modify: `src-tauri/tauri.conf.json`
 - Modify: `src/main.tsx`
 
 **Interfaces:**
 - Produces: macOS Local Network prompt metadata.
-- Produces: NSIS install/uninstall firewall rule named `Localnet LAN Discovery`.
+- Produces: current-user NSIS packaging that does not request elevation.
 
 - [ ] Add `NSLocalNetworkUsageDescription` and `_p2p._udp` to the macOS plist.
-- [ ] Configure NSIS `perMachine` plus installer hooks.
-- [ ] In the post-install hook, replace only the named program rule and limit inbound remote addresses to `LocalSubnet`; in pre-uninstall, remove only that rule.
+- [ ] Configure NSIS `currentUser` without installer hooks or localized system-command logging.
 - [ ] Add delayed empty-state guidance for Windows Firewall and macOS Local Network permission.
-- [ ] Verify `pnpm typecheck`, `pnpm build`, Tauri config parsing, generated bundle plist, and NSIS hook execution in an isolated install/uninstall cycle.
+- [ ] Verify `pnpm typecheck`, `pnpm build`, Tauri config parsing, generated bundle plist, and the NSIS `asInvoker` manifest.
 
 ### Task 4: Version, packages, and end-to-end acceptance
 
@@ -89,7 +87,7 @@
 
 - [ ] Bump all application versions to `0.1.3` and make workflow artifact naming derive from that version.
 - [ ] Run `pnpm typecheck`, `pnpm build`, `cargo check`, and `git diff --check`.
-- [ ] Install Windows 0.1.3, verify the LocalSubnet firewall rule has neither literal `$` characters nor a malformed program path, and launch the installed executable.
+- [ ] Install Windows 0.1.3, verify the application launches without installer UAC, and accept only Windows' separate first-run LAN firewall prompt if it appears.
 - [ ] Run two isolated Windows instances with mDNS disabled while physical and virtual private interfaces remain active; confirm the UDP path alone completes discovery, friend request, text, image, and file transfer. Do not mutate the host's default route. Treat the user's real Win-to-Mac TUN environment as the final cross-machine acceptance.
 - [ ] Push the scoped branch, build the universal macOS DMG, download it, and verify SHA-256.
 - [ ] Inspect the DMG app bundle's merged Info.plist on the macOS runner before upload.

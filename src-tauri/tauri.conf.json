@@ -41,8 +41,19 @@
         "silent": true
       },
       "nsis": {
-        "installMode": "perMachine",
-        "installerHooks": "./windows/hooks.nsh"
+        "installMode": "currentUser",
+        "languages": [
+          "English",
+          "SimpChinese",
+          "Spanish",
+          "French",
+          "German",
+          "PortugueseBR",
+          "Russian",
+          "Japanese",
+          "Korean",
+          "Arabic"
+        ]
       }
     },
     "macOS": {

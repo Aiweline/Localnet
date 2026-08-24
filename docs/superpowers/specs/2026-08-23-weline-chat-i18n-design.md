@@ -141,9 +141,7 @@ Input validation and expected application errors receive stable codes. Unexpecte
 
 The NSIS bundle enables the Tauri/NSIS language identifiers corresponding to the ten supported locales. NSIS follows the operating-system installer language and falls back to English.
 
-The custom firewall setup hook uses NSIS `LangString` values for all ten languages, including success, failure, elevation, LocalSubnet scope, and uninstall cleanup messages. The firewall rule name remains a stable nonlocalized identifier so upgrades and uninstall can find the existing rule regardless of installer language.
-
-The current per-machine installation mode, program-scoped inbound rule, legacy rule cleanup, install directory, and product identity remain unchanged.
+There is no custom firewall setup hook. The installer runs for the current user, does not request elevation, and does not stream localized system-command output into the NSIS log. Windows owns the separate first-run firewall consent when inbound LAN traffic requires it.
 
 ## macOS bundle localization
 
@@ -197,7 +195,7 @@ The locale preference is a new settings row only. Rollback to 0.1.2 safely ignor
 6. Arabic uses RTL layout without clipping, reversed media, or broken mixed-direction message content.
 7. German, French, and Russian labels fit or wrap correctly at the minimum supported window size.
 8. Every expected Rust/Tauri application failure visible in the webview is represented by a stable code that all catalogs can translate.
-9. Windows NSIS contains all ten installer languages, and the custom firewall hook has translations for all user-visible messages.
+9. Windows NSIS contains all ten installer languages and installs for the current user without requesting UAC.
 10. The macOS app bundle contains all ten localized `InfoPlist.strings` resources and a valid localized Local Network purpose string.
 11. Windows and universal macOS packages build successfully as version 0.1.4.
 12. Real two-device smoke checks confirm both default mDNS and mDNS-disabled UDP fallback discovery still work after the internationalization changes, with TUN enabled and disabled.
