@@ -42,6 +42,7 @@
       },
       "nsis": {
         "installMode": "currentUser",
+        "installerIcon": "icons/icon.ico",
         "installerHooks": "windows/installer-hooks.nsh",
         "languages": [
           "English",
