@@ -785,9 +785,10 @@ impl Storage {
         let staged = transaction.execute(
             "INSERT INTO transfer_cleanup
                (transfer_id, destination, partial_path, reservation_token,
-                destination_reserved, transfer_protocol, status)
+                destination_reserved, transfer_protocol, status, cleanup_token)
              SELECT t.transfer_id, t.local_path, t.partial_path, t.reservation_token,
-                    t.destination_reserved, t.transfer_protocol, 'awaitingAcceptance'
+                    t.destination_reserved, t.transfer_protocol, 'awaitingAcceptance',
+                    lower(hex(randomblob(16)))
              FROM transfers t
              JOIN incoming_transfer_decisions d ON d.transfer_id = t.transfer_id
              WHERE t.transfer_id = ?1 AND t.peer_id = ?2 AND d.decision_token = ?3
@@ -1304,15 +1305,17 @@ impl Storage {
         let staged = transaction.execute(
             "INSERT INTO transfer_cleanup
                (transfer_id, destination, partial_path, reservation_token,
-                destination_reserved, transfer_protocol, status)
-             VALUES (?1, ?4, ?7, ?6, ?5, ?3, 'awaitingAcceptance')
+                destination_reserved, transfer_protocol, status, cleanup_token)
+             VALUES (?1, ?4, ?7, ?6, ?5, ?3, 'awaitingAcceptance',
+                     lower(hex(randomblob(16))))
              ON CONFLICT(transfer_id) DO UPDATE SET
                destination = excluded.destination,
                partial_path = COALESCE(excluded.partial_path, transfer_cleanup.partial_path),
                reservation_token = excluded.reservation_token,
                destination_reserved = excluded.destination_reserved,
                transfer_protocol = excluded.transfer_protocol,
-               status = excluded.status
+               status = excluded.status,
+               cleanup_token = excluded.cleanup_token
              WHERE transfer_cleanup.destination IS excluded.destination
                AND transfer_cleanup.reservation_token IS excluded.reservation_token
                AND transfer_cleanup.transfer_protocol = excluded.transfer_protocol",
@@ -1446,8 +1449,9 @@ impl Storage {
         let staged = transaction.execute(
             "INSERT INTO transfer_cleanup
                (transfer_id, destination, partial_path, reservation_token,
-                destination_reserved, transfer_protocol, status)
-             VALUES (?1, ?4, ?7, ?6, ?5, ?3, 'awaitingAcceptance')
+                destination_reserved, transfer_protocol, status, cleanup_token)
+             VALUES (?1, ?4, ?7, ?6, ?5, ?3, 'awaitingAcceptance',
+                     lower(hex(randomblob(16))))
              ON CONFLICT(transfer_id) DO NOTHING",
             params![
                 transfer.transfer_id,
@@ -1975,7 +1979,8 @@ impl Storage {
                reservation_token TEXT,
                destination_reserved INTEGER NOT NULL,
                transfer_protocol INTEGER NOT NULL,
-               status TEXT NOT NULL
+               status TEXT NOT NULL,
+               cleanup_token TEXT NOT NULL
              );
              CREATE TABLE IF NOT EXISTS incoming_transfer_decisions (
                transfer_id TEXT PRIMARY KEY NOT NULL,
@@ -2026,6 +2031,25 @@ impl Storage {
                 [],
             )?;
         }
+        let has_cleanup_token: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('transfer_cleanup')
+             WHERE name = 'cleanup_token'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_cleanup_token == 0 {
+            transaction.execute(
+                "ALTER TABLE transfer_cleanup
+                 ADD COLUMN cleanup_token TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
+        transaction.execute(
+            "UPDATE transfer_cleanup
+             SET cleanup_token = lower(hex(randomblob(16)))
+             WHERE cleanup_token = ''",
+            [],
+        )?;
         let has_transfer_protocol: i64 = transaction.query_row(
             "SELECT COUNT(*) FROM pragma_table_info('transfers')
              WHERE name = 'transfer_protocol'",
@@ -2604,6 +2628,7 @@ impl Storage {
                         destination_reserved: row.get(4)?,
                         transfer_protocol: row.get(5)?,
                         status: row.get(6)?,
+                        cleanup_token: None,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?
@@ -2639,6 +2664,7 @@ impl Storage {
                             destination_reserved: row.get(4)?,
                             transfer_protocol: row.get(5)?,
                             status: row.get(6)?,
+                            cleanup_token: None,
                         })
                     },
                 )
@@ -2674,7 +2700,10 @@ impl Storage {
         let terminal = matches!(record.status.as_str(), "cancelled" | "failed");
         if terminal {
             self.stage_terminal_cleanup(record)?;
-            self.cleanup_pending_terminal_artifact(record)?;
+            let staged = self
+                .pending_terminal_cleanup(&record.transfer_id)?
+                .ok_or_else(|| AppError::Storage("终态清理记录在提交后消失".to_string()))?;
+            self.cleanup_pending_terminal_artifact(&staged)?;
             return Ok(());
         }
         let mut finalized_destination = None;
@@ -2867,8 +2896,8 @@ impl Storage {
         transaction.execute(
             "INSERT INTO transfer_cleanup
                (transfer_id, destination, partial_path, reservation_token,
-                destination_reserved, transfer_protocol, status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                destination_reserved, transfer_protocol, status, cleanup_token)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, lower(hex(randomblob(16))))
              ON CONFLICT(transfer_id) DO NOTHING",
             params![
                 record.transfer_id,
@@ -2924,7 +2953,7 @@ impl Storage {
             let connection = self.connection()?;
             let mut statement = connection.prepare(
                 "SELECT transfer_id, destination, partial_path, reservation_token,
-                        destination_reserved, transfer_protocol, status
+                        destination_reserved, transfer_protocol, status, cleanup_token
                  FROM transfer_cleanup",
             )?;
             statement
@@ -2937,6 +2966,7 @@ impl Storage {
                         destination_reserved: row.get(4)?,
                         transfer_protocol: row.get(5)?,
                         status: row.get(6)?,
+                        cleanup_token: Some(row.get(7)?),
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?
@@ -2964,7 +2994,7 @@ impl Storage {
         self.connection()?
             .query_row(
                 "SELECT transfer_id, destination, partial_path, reservation_token,
-                        destination_reserved, transfer_protocol, status
+                        destination_reserved, transfer_protocol, status, cleanup_token
                  FROM transfer_cleanup WHERE transfer_id = ?1",
                 [transfer_id],
                 |row| {
@@ -2976,6 +3006,7 @@ impl Storage {
                         destination_reserved: row.get(4)?,
                         transfer_protocol: row.get(5)?,
                         status: row.get(6)?,
+                        cleanup_token: Some(row.get(7)?),
                     })
                 },
             )
@@ -2987,6 +3018,17 @@ impl Storage {
         &self,
         record: &OwnedArtifactRecord,
     ) -> Result<(), AppError> {
+        self.cleanup_pending_terminal_artifact_with_hook(record, || {})
+    }
+
+    fn cleanup_pending_terminal_artifact_with_hook<F>(
+        &self,
+        record: &OwnedArtifactRecord,
+        after_filesystem_cleanup: F,
+    ) -> Result<(), AppError>
+    where
+        F: FnOnce(),
+    {
         let mut finalized_destination = None;
         let mut journal_reservations = Vec::new();
         if let (Some(destination), Some(token)) = (
@@ -3042,9 +3084,15 @@ impl Storage {
             }
             remove_owned_finalization_marker(destination, &record.transfer_id, token)?;
         }
+        after_filesystem_cleanup();
+        let cleanup_token = record
+            .cleanup_token
+            .as_deref()
+            .ok_or_else(|| AppError::Storage("待清理文件缺少稳定的清理代次凭据".to_string()))?;
         self.connection()?.execute(
-            "DELETE FROM transfer_cleanup WHERE transfer_id = ?1",
-            [&record.transfer_id],
+            "DELETE FROM transfer_cleanup
+             WHERE transfer_id = ?1 AND cleanup_token = ?2",
+            params![record.transfer_id, cleanup_token],
         )?;
         Ok(())
     }
@@ -3086,7 +3134,7 @@ struct PartialRecoveryRecord {
     reservation_token: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct OwnedArtifactRecord {
     transfer_id: String,
     destination: Option<PathBuf>,
@@ -3095,6 +3143,7 @@ struct OwnedArtifactRecord {
     destination_reserved: bool,
     transfer_protocol: i64,
     status: String,
+    cleanup_token: Option<String>,
 }
 
 fn truncate_file_and_sync(file: &fs::File, length: u64) -> Result<(), AppError> {
@@ -6657,6 +6706,7 @@ mod tests {
             destination_reserved: true,
             transfer_protocol: 2,
             status: "failed".to_string(),
+            cleanup_token: None,
         };
         storage
             .stage_terminal_cleanup(&record)
@@ -6698,6 +6748,140 @@ mod tests {
 
         drop(storage);
         fs::remove_dir_all(fixture).expect("remove fixture");
+    }
+
+    #[test]
+    fn stale_cleanup_completion_cannot_delete_a_replacement_tombstone() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-cleanup-generation-race-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&fixture).expect("create cleanup generation fixture");
+        let database = fixture.join("localnet.sqlite3");
+        let storage = Storage::open(&database).expect("open storage");
+        let transfer_id = "cleanup-generation-race";
+        let destination = fixture.join("report.bin");
+        let old_token = "old-reservation-token";
+        let new_token = "new-reservation-token";
+        reserve_receive_path(&destination, transfer_id, old_token)
+            .expect("reserve old owned destination");
+        {
+            let connection = storage.connection().expect("insert terminal transfer");
+            connection
+                .execute(
+                    "INSERT INTO transfers
+                       (transfer_id, peer_id, direction, kind, file_name, file_size, mime_type,
+                        sha256, local_path, destination_reserved, reservation_token,
+                        transfer_protocol, transferred_bytes, status, created_at, updated_at)
+                     VALUES (?1, 'peer-one', 'incoming', 'file', 'report.bin', 4,
+                             'application/octet-stream', ?2, ?3, 1, ?4, 2, 0,
+                             'failed', ?5, ?5)",
+                    rusqlite::params![
+                        transfer_id,
+                        "0".repeat(64),
+                        destination.to_string_lossy(),
+                        old_token,
+                        "2026-08-25T00:00:00.000Z",
+                    ],
+                )
+                .expect("insert terminal transfer");
+        }
+        let old_record = OwnedArtifactRecord {
+            transfer_id: transfer_id.to_string(),
+            destination: Some(destination.clone()),
+            partial: None,
+            reservation_token: Some(old_token.to_string()),
+            destination_reserved: true,
+            transfer_protocol: 2,
+            status: "failed".to_string(),
+            cleanup_token: None,
+        };
+        storage
+            .stage_terminal_cleanup(&old_record)
+            .expect("stage old cleanup generation");
+        let old_record = storage
+            .pending_terminal_cleanup(transfer_id)
+            .expect("load old cleanup generation")
+            .expect("old cleanup exists");
+        let old_generation = old_record
+            .cleanup_token
+            .clone()
+            .expect("old cleanup has a generation token");
+        let filesystem_done = Arc::new(Barrier::new(2));
+        let replacement_ready = Arc::new(Barrier::new(2));
+        let drainer = storage.clone();
+        let drainer_filesystem_done = filesystem_done.clone();
+        let drainer_replacement_ready = replacement_ready.clone();
+        let drain_thread = thread::spawn(move || {
+            drainer
+                .cleanup_pending_terminal_artifact_with_hook(&old_record, || {
+                    drainer_filesystem_done.wait();
+                    drainer_replacement_ready.wait();
+                })
+                .expect("stale drainer completes harmlessly");
+        });
+
+        filesystem_done.wait();
+        let replacement_connection =
+            Connection::open(&database).expect("open independent replacement cleanup connection");
+        assert_eq!(
+            replacement_connection
+                .execute(
+                    "DELETE FROM transfer_cleanup
+                     WHERE transfer_id = ?1 AND cleanup_token = ?2",
+                    rusqlite::params![transfer_id, old_generation],
+                )
+                .expect("retire old cleanup generation"),
+            1
+        );
+        reserve_receive_path(&destination, transfer_id, new_token)
+            .expect("reserve replacement owned destination");
+        replacement_connection
+            .execute(
+                "INSERT INTO transfer_cleanup
+                   (transfer_id, destination, partial_path, reservation_token,
+                    destination_reserved, transfer_protocol, status, cleanup_token)
+                 VALUES (?1, ?2, NULL, ?3, 1, 2, 'awaitingAcceptance', ?4)",
+                rusqlite::params![
+                    transfer_id,
+                    destination.to_string_lossy(),
+                    new_token,
+                    "replacement-cleanup-generation",
+                ],
+            )
+            .expect("insert replacement cleanup generation");
+        drop(replacement_connection);
+        replacement_ready.wait();
+        drain_thread.join().expect("join stale cleanup drainer");
+
+        let replacement = storage
+            .pending_terminal_cleanup(transfer_id)
+            .expect("reload replacement cleanup")
+            .expect("stale completion preserves replacement tombstone");
+        assert_eq!(
+            replacement.cleanup_token.as_deref(),
+            Some("replacement-cleanup-generation")
+        );
+        assert!(
+            reservation_is_owned(&destination, transfer_id, new_token)
+                .expect("replacement reservation identity remains owned")
+        );
+        storage
+            .cleanup_pending_terminal_artifact(&replacement)
+            .expect("later exact drainer removes replacement generation");
+        assert!(
+            storage
+                .pending_terminal_cleanup(transfer_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !reservation_is_owned(&destination, transfer_id, new_token)
+                .expect("replacement reservation is cleaned exactly")
+        );
+
+        drop(storage);
+        fs::remove_dir_all(fixture).expect("remove cleanup generation fixture");
     }
 
     #[cfg(any(windows, target_os = "macos"))]
@@ -6810,6 +6994,7 @@ mod tests {
             destination_reserved: true,
             transfer_protocol: 2,
             status: "failed".to_string(),
+            cleanup_token: None,
         };
         storage
             .stage_terminal_cleanup(&record)
@@ -6881,6 +7066,7 @@ mod tests {
             destination_reserved: true,
             transfer_protocol: 2,
             status: "failed".to_string(),
+            cleanup_token: None,
         };
         storage
             .stage_terminal_cleanup(&record)
@@ -6950,6 +7136,7 @@ mod tests {
             destination_reserved: true,
             transfer_protocol: 2,
             status: "failed".to_string(),
+            cleanup_token: None,
         };
         storage
             .stage_terminal_cleanup(&record)
@@ -7025,6 +7212,7 @@ mod tests {
             destination_reserved: true,
             transfer_protocol: 2,
             status: "failed".to_string(),
+            cleanup_token: None,
         };
         storage.stage_terminal_cleanup(&record).unwrap();
         fs::remove_file(&partial).expect("remove originally owned inode");

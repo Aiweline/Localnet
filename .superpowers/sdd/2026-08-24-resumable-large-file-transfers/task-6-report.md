@@ -131,3 +131,32 @@ This section supersedes the earlier compatibility statement that v1 skipped pref
 - Ownership: tombstones can be updated only for the same destination/token/protocol identity; unrelated or later ownership is never overwritten. New receive claims cannot coexist with a cleanup tombstone, and stale decision tokens cannot roll back a fresh acceptance.
 - Settings/resume: the settings-disable/nickname paths remain probe-free; v1/v2 preflight and the authoritative post-claim resume-offset/body boundary from round 1 remain covered and unchanged.
 - No known Task 6 blocker. Libp2p's synchronous `send_request` returns an outbound ID rather than a `Result`; the production handler's injected submission closure tests the failure boundary, while actual asynchronous rejection/outbound failure use the same durable token rollback. Task 7 reconnect query/scheduler work remains out of scope.
+
+## Review fix round 3 — 2026-08-25
+
+### Implementation and files
+
+- `src-tauri/src/network/runtime.rs`: tests now enter the actual manual `handle_command(ResolveTransfer)` and automatic `handle_inbound_request(TransferOffer)` production handlers. The runtime's control-send, event-emission, and Windows swarm/app-handle edges are injectable only under `cfg(test)`; durable SQLite transitions, request-ID pending map, completion channel, timeout command, and response/failure handlers are the production implementations.
+- `src-tauri/src/network/runtime.rs` and `src-tauri/src/network/transfer.rs`: the 35-second start timeout now re-enters the runtime through `ExpireIncomingDecision`. The handler retires only the matching request-map entry and rolls back only the matching durable decision token, so body claim versus timeout has one winner and late response/failure cannot affect a newer acceptance.
+- `src-tauri/src/storage.rs`: every cleanup tombstone has a migrated, non-empty `cleanup_token` generation. Filesystem cleanup remains reservation/identity-gated, while SQL completion deletes only `(transfer_id, cleanup_token)`. Any conflict update receives a fresh generation, so a stale drainer cannot retire a replaced/updated snapshot.
+- `src-tauri/src/network/mod.rs` and `src-tauri/src/identity.rs`: document and lint-scope the test-only transport layout that avoids loading Windows swarm DLL entry points while retaining the exact handler code.
+
+### Genuine RED → GREEN evidence
+
+1. Production handler RED: `cargo test --manifest-path src-tauri/Cargo.toml --lib production_manual_handler_submission_failure -- --nocapture` failed at `production_manual_handler_submission_failure_rolls_back_and_emits_corrected_state`: the durable row was `AwaitingAcceptance`, but no corrected `TransferUpdated` event existed. GREEN: the actual command failure path now emits that persisted awaiting row before completing the caller; manual local validation sends zero requests, success records one request before event/completion, and injected submission failure leaves no pending request or active state.
+2. Cleanup-generation RED: temporarily restoring transfer-ID-only completion made `stale_cleanup_completion_cannot_delete_a_replacement_tombstone` fail at `stale completion preserves replacement tombstone`. GREEN: exact generation CAS passes the separate-connection/barrier interleave; the replacement tombstone/reservation survives the stale completion, then a later exact drainer removes both.
+3. Additional GREEN production-path coverage invokes automatic offer handling, outbound accepted/rejected/failure handlers, and the runtime timeout command. It verifies automatic success/fallback event ordering, exact-token rollback, body-claim/timeout single-winner behavior, and a late old response losing to a newer acceptance.
+
+### Exact final verification
+
+- Focused production runtime coverage — PASS, 15 tests selected by `production_`; stale cleanup barrier — PASS, 1 test.
+- `cargo test --manifest-path src-tauri/Cargo.toml --locked` with `CARGO_TARGET_DIR=G:\codex-localnet-target` — PASS, 170 library tests, 0 binary tests, 0 doc tests; only the informational Windows import-library linker message.
+- `cargo check --manifest-path src-tauri/Cargo.toml --locked` and `cargo check --manifest-path src-tauri/Cargo.toml --release --locked` — PASS without compiler warnings.
+- `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check`, `git diff --check`, and `pnpm release:check` — PASS; synchronized release version `0.1.7`.
+
+### Self-review and concerns
+
+- Decision ordering: exact local CAS and durable token precede the single transport submission; request-ID registration precedes active event/completion. Synchronous injected submission failure durably rolls back first. Accepted response only retires its request ID; rejection, outbound failure, and timeout use the explicit durable token state machine.
+- Cleanup race: the drainer operates on one immutable tombstone generation. Its filesystem removals remain token/inode-gated, its SQL completion is generation-CASed, and conflict updates rotate the generation. A replacement is therefore either untouched or remains durably tracked for later exact cleanup.
+- Preserved behavior: round-1 v1 preflight, post-claim authoritative resume offset/preflight, Task 5 ownership/CAS/finalization, cleanup-pending reacceptance gate, and settings-disable/nickname paths are unchanged. Task 7 reconnect query scheduling remains out of scope.
+- No known Task 6 blocker. The test runtime deliberately excludes Windows swarm/AppHandle storage because constructing or dropping a test swarm on this host fails at loader startup; tests still invoke the production handlers and state machine, with only transport/event edges substituted.

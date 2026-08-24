@@ -38,7 +38,6 @@ const BUFFER_SIZE: usize = 64 * 1024;
 const PROGRESS_BYTES: u64 = 1024 * 1024;
 const MAX_HEADER_BYTES: usize = 8 * 1024;
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-const INCOMING_START_TIMEOUT: Duration = Duration::from_secs(35);
 
 trait ResumableIo: AsyncRead + AsyncWrite + Unpin + Send {}
 
@@ -125,58 +124,6 @@ pub fn spawn_outgoing_transfer(
             }
         }
     });
-}
-
-pub fn spawn_incoming_start_timeout(
-    transfer_id: String,
-    decision_token: String,
-    storage: Storage,
-    app_handle: AppHandle,
-) {
-    tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(INCOMING_START_TIMEOUT).await;
-        let result = fail_pending_incoming_decision(
-            &transfer_id,
-            &decision_token,
-            &storage,
-            &app_handle,
-            "对方未在限定时间内开始传输，请重新确认接收".to_string(),
-        );
-        if let Err(error) = result {
-            tracing::warn!(%transfer_id, %error, "failed to expire unstarted incoming transfer");
-        }
-    });
-}
-
-pub fn fail_pending_incoming_decision(
-    transfer_id: &str,
-    decision_token: &str,
-    storage: &Storage,
-    app_handle: &AppHandle,
-    message: String,
-) -> Result<(), AppError> {
-    let Some(candidate) = storage.get_transfer(transfer_id)? else {
-        return Ok(());
-    };
-    if let Some(updated) = storage.rollback_pending_incoming_decision(
-        transfer_id,
-        &candidate.peer_id,
-        decision_token,
-        &message,
-    )? {
-        emit_event(
-            app_handle,
-            &NetworkEvent::TransferUpdated { transfer: updated },
-        );
-        emit_event(
-            app_handle,
-            &NetworkEvent::NetworkError {
-                code: "transfer.receive_not_started".to_string(),
-                message,
-            },
-        );
-    }
-    Ok(())
 }
 
 pub(crate) fn return_pending_incoming_decision_to_manual(

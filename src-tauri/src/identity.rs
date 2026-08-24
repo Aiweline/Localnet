@@ -19,6 +19,7 @@ pub struct LocalIdentity {
     peer_id: PeerId,
 }
 
+#[cfg_attr(test, allow(dead_code))]
 impl LocalIdentity {
     pub fn load_or_create(app_data_dir: &Path, use_keyring: bool) -> Result<Self, AppError> {
         fs::create_dir_all(app_data_dir)?;

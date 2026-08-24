@@ -45,6 +45,7 @@ use crate::{
 const EVENT_NAME: &str = "localnet://event";
 const FRIEND_REQUEST_LIMIT: usize = 5;
 const FRIEND_REQUEST_WINDOW: Duration = Duration::from_secs(60);
+const INCOMING_START_TIMEOUT: Duration = Duration::from_secs(35);
 
 #[derive(Debug, Clone)]
 pub enum NetworkCommand {
@@ -66,6 +67,10 @@ pub enum NetworkCommand {
     CancelTransfer {
         peer_id: String,
         transfer_id: String,
+    },
+    ExpireIncomingDecision {
+        transfer_id: String,
+        decision_token: String,
     },
 }
 
@@ -137,6 +142,7 @@ fn complete_transfer_decision(
     }
 }
 
+#[cfg(not(test))]
 pub fn spawn_network(
     identity: LocalIdentity,
     profile: LocalProfile,
@@ -145,6 +151,7 @@ pub fn spawn_network(
     default_receive_directory: PathBuf,
 ) -> NetworkHandle {
     let (sender, receiver) = mpsc::channel(128);
+    let runtime_sender = sender.downgrade();
     tauri::async_runtime::spawn(async move {
         if let Err(error) = NetworkRuntime::run(
             identity,
@@ -153,6 +160,7 @@ pub fn spawn_network(
             app_handle.clone(),
             default_receive_directory,
             receiver,
+            runtime_sender,
         )
         .await
         {
@@ -166,6 +174,18 @@ pub fn spawn_network(
             tracing::error!(error = %error, "Weline Localnet network runtime stopped");
         }
     });
+    NetworkHandle { sender }
+}
+
+#[cfg(test)]
+pub fn spawn_network(
+    _identity: LocalIdentity,
+    _profile: LocalProfile,
+    _storage: Storage,
+    _app_handle: AppHandle,
+    _default_receive_directory: PathBuf,
+) -> NetworkHandle {
+    let (sender, _receiver) = mpsc::channel(1);
     NetworkHandle { sender }
 }
 
@@ -190,25 +210,51 @@ enum PendingAction {
     TransferCancel,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum PendingRequestId {
+    Network(request_response::OutboundRequestId),
+    #[cfg(test)]
+    Test(u64),
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TestControlTransport {
+    next_request_id: u64,
+    fail_next: Option<String>,
+    requests: Vec<(PeerId, ControlRequest)>,
+}
+
 struct NetworkRuntime {
     local_profile: LocalProfile,
     storage: Storage,
+    #[cfg(not(test))]
     app_handle: AppHandle,
     default_receive_directory: PathBuf,
+    #[cfg(not(test))]
     swarm: Swarm<LocalnetBehaviour>,
+    #[cfg(not(test))]
     stream_control: libp2p_stream::Control,
     receiver: mpsc::Receiver<NetworkCommand>,
+    command_sender: mpsc::WeakSender<NetworkCommand>,
     discovery_receiver: mpsc::Receiver<DiscoveryEvent>,
     listen_port_sender: watch::Sender<Option<u16>>,
-    pending: HashMap<request_response::OutboundRequestId, PendingAction>,
+    pending: HashMap<PendingRequestId, PendingAction>,
     mdns_addresses: HashMap<PeerId, HashSet<Multiaddr>>,
     beacon_addresses: HashMap<PeerId, HashMap<Multiaddr, Instant>>,
     active_connections: HashMap<PeerId, usize>,
     friend_request_times: HashMap<PeerId, VecDeque<Instant>>,
     mdns_enabled: bool,
+    #[cfg(test)]
+    test_control_transport: Option<TestControlTransport>,
+    #[cfg(test)]
+    test_events: Mutex<Vec<NetworkEvent>>,
+    #[cfg(test)]
+    test_order: Mutex<Vec<&'static str>>,
 }
 
 impl NetworkRuntime {
+    #[cfg(not(test))]
     async fn run(
         identity: LocalIdentity,
         profile: LocalProfile,
@@ -216,6 +262,7 @@ impl NetworkRuntime {
         app_handle: AppHandle,
         default_receive_directory: PathBuf,
         receiver: mpsc::Receiver<NetworkCommand>,
+        command_sender: mpsc::WeakSender<NetworkCommand>,
     ) -> Result<(), AppError> {
         let keypair = identity.keypair();
         let peer_id = identity.peer_id();
@@ -256,6 +303,7 @@ impl NetworkRuntime {
             swarm,
             stream_control,
             receiver,
+            command_sender,
             discovery_receiver,
             listen_port_sender,
             pending: HashMap::new(),
@@ -264,10 +312,17 @@ impl NetworkRuntime {
             active_connections: HashMap::new(),
             friend_request_times: HashMap::new(),
             mdns_enabled,
+            #[cfg(test)]
+            test_control_transport: None,
+            #[cfg(test)]
+            test_events: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            test_order: Mutex::new(Vec::new()),
         };
         runtime.event_loop().await
     }
 
+    #[cfg(not(test))]
     async fn event_loop(&mut self) -> Result<(), AppError> {
         let mut discovery_cleanup = tokio::time::interval(Duration::from_secs(1));
         discovery_cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -307,13 +362,13 @@ impl NetworkRuntime {
                 let peer_id = parse_peer_id(&request.peer_id)?;
                 self.ensure_connected(&peer_id)?;
                 let request_id = request.request_id.clone();
-                let outbound_id = self.swarm.behaviour_mut().control.send_request(
-                    &peer_id,
+                let outbound_id = self.send_control_request(
+                    peer_id,
                     ControlRequest::FriendRequest {
                         request_id: request.request_id,
                         nickname: self.local_profile.nickname.clone(),
                     },
-                );
+                )?;
                 self.pending
                     .insert(outbound_id, PendingAction::FriendRequest { request_id });
             }
@@ -324,14 +379,14 @@ impl NetworkRuntime {
             } => {
                 let peer_id = parse_peer_id(&peer_id)?;
                 self.ensure_connected(&peer_id)?;
-                let outbound_id = self.swarm.behaviour_mut().control.send_request(
-                    &peer_id,
+                let outbound_id = self.send_control_request(
+                    peer_id,
                     ControlRequest::FriendDecision {
                         request_id,
                         accepted,
                         nickname: self.local_profile.nickname.clone(),
                     },
-                );
+                )?;
                 self.pending
                     .insert(outbound_id, PendingAction::FriendDecision);
             }
@@ -339,14 +394,14 @@ impl NetworkRuntime {
                 let peer_id = parse_peer_id(&message.peer_id)?;
                 self.ensure_connected(&peer_id)?;
                 let message_id = message.message_id.clone();
-                let outbound_id = self.swarm.behaviour_mut().control.send_request(
-                    &peer_id,
+                let outbound_id = self.send_control_request(
+                    peer_id,
                     ControlRequest::TextMessage {
                         message_id: message.message_id,
                         sent_at: message.created_at,
                         body: message.body.unwrap_or_default(),
                     },
-                );
+                )?;
                 self.pending
                     .insert(outbound_id, PendingAction::Text { message_id });
             }
@@ -354,8 +409,8 @@ impl NetworkRuntime {
                 let peer_id = parse_peer_id(&transfer.peer_id)?;
                 self.ensure_connected(&peer_id)?;
                 let transfer_id = transfer.transfer_id.clone();
-                let outbound_id = self.swarm.behaviour_mut().control.send_request(
-                    &peer_id,
+                let outbound_id = self.send_control_request(
+                    peer_id,
                     ControlRequest::TransferOffer {
                         offer: TransferOffer {
                             transfer_id: transfer.transfer_id,
@@ -370,7 +425,7 @@ impl NetworkRuntime {
                             manifest_sha256: transfer.manifest_sha256,
                         },
                     },
-                );
+                )?;
                 self.pending
                     .insert(outbound_id, PendingAction::TransferOffer { transfer_id });
             }
@@ -389,22 +444,20 @@ impl NetworkRuntime {
                     &transfer_id,
                     accepted,
                     || {
-                        Ok(self.swarm.behaviour_mut().control.send_request(
-                            &peer_id,
+                        self.send_control_request(
+                            peer_id,
                             ControlRequest::TransferDecision {
                                 transfer_id: transfer_id.clone(),
                                 accepted,
                             },
-                        ))
+                        )
                     },
                 )?;
-                self.pending.insert(
+                self.insert_pending_transfer_decision(
                     submission.request_id,
-                    PendingAction::TransferDecision {
-                        transfer_id: transfer_id.clone(),
-                        accepted,
-                        decision_token: submission.decision_token.clone(),
-                    },
+                    transfer_id.clone(),
+                    accepted,
+                    submission.decision_token.clone(),
                 );
                 if accepted {
                     let submitted = submission
@@ -416,13 +469,10 @@ impl NetworkRuntime {
                     self.emit(NetworkEvent::TransferUpdated {
                         transfer: submitted,
                     });
-                    transfer::spawn_incoming_start_timeout(
-                        transfer_id,
-                        decision_token,
-                        self.storage.clone(),
-                        self.app_handle.clone(),
-                    );
+                    self.spawn_incoming_start_timeout(transfer_id, decision_token);
                 }
+                #[cfg(test)]
+                self.record_test_order("completion");
                 complete_transfer_decision(&completion, Ok(()));
             }
             NetworkCommand::CancelTransfer {
@@ -431,13 +481,28 @@ impl NetworkRuntime {
             } => {
                 let peer_id = parse_peer_id(&peer_id)?;
                 self.ensure_connected(&peer_id)?;
-                let outbound_id = self
-                    .swarm
-                    .behaviour_mut()
-                    .control
-                    .send_request(&peer_id, ControlRequest::TransferCancel { transfer_id });
+                let outbound_id = self.send_control_request(
+                    peer_id,
+                    ControlRequest::TransferCancel { transfer_id },
+                )?;
                 self.pending
                     .insert(outbound_id, PendingAction::TransferCancel);
+            }
+            NetworkCommand::ExpireIncomingDecision {
+                transfer_id,
+                decision_token,
+            } => {
+                self.pending.retain(|_, action| {
+                    !matches!(
+                        action,
+                        PendingAction::TransferDecision {
+                            transfer_id: pending_transfer_id,
+                            accepted: true,
+                            decision_token: Some(pending_token),
+                        } if pending_transfer_id == &transfer_id && pending_token == &decision_token
+                    )
+                });
+                self.handle_incoming_start_timeout(&transfer_id, &decision_token)?;
             }
         }
         Ok(())
@@ -463,7 +528,6 @@ impl NetworkRuntime {
                 completion,
                 ..
             } => {
-                complete_transfer_decision(completion, Err(error.to_string()));
                 let compensation = if *accepted {
                     if self
                         .storage
@@ -473,11 +537,19 @@ impl NetworkRuntime {
                         Ok(None)
                     } else {
                         let message = format!("接收确认未提交，请重新确认：{error}");
-                        transfer::return_pending_incoming_decision_to_manual(
-                            transfer_id,
-                            &self.storage,
-                            message,
-                        )
+                        match self.storage.get_transfer(transfer_id)? {
+                            Some(current)
+                                if current.direction == Direction::Incoming
+                                    && current.status == TransferStatus::AwaitingAcceptance =>
+                            {
+                                Ok(Some(current))
+                            }
+                            _ => transfer::return_pending_incoming_decision_to_manual(
+                                transfer_id,
+                                &self.storage,
+                                message,
+                            ),
+                        }
                     }
                 } else {
                     Ok(None)
@@ -485,15 +557,20 @@ impl NetworkRuntime {
                 if let Some(transfer) = compensation? {
                     self.emit(NetworkEvent::TransferUpdated { transfer });
                 }
+                #[cfg(test)]
+                self.record_test_order("completion");
+                complete_transfer_decision(completion, Err(error.to_string()));
             }
             NetworkCommand::SetProfile(_)
             | NetworkCommand::SendFriendRequest(_)
             | NetworkCommand::ResolveFriendRequest { .. }
-            | NetworkCommand::CancelTransfer { .. } => {}
+            | NetworkCommand::CancelTransfer { .. }
+            | NetworkCommand::ExpireIncomingDecision { .. } => {}
         }
         Ok(())
     }
 
+    #[cfg(not(test))]
     fn handle_swarm_event(
         &mut self,
         event: SwarmEvent<LocalnetBehaviourEvent>,
@@ -546,7 +623,8 @@ impl NetworkRuntime {
                         capabilities: vec![FILE_RESUME_V2_CAPABILITY.to_string()],
                     },
                 );
-                self.pending.insert(outbound_id, PendingAction::Hello);
+                self.pending
+                    .insert(PendingRequestId::Network(outbound_id), PendingAction::Hello);
             }
             SwarmEvent::ConnectionClosed { peer_id, .. } => {
                 if let Some(count) = self.active_connections.get_mut(&peer_id) {
@@ -577,6 +655,7 @@ impl NetworkRuntime {
         Ok(())
     }
 
+    #[cfg(not(test))]
     fn handle_discovery_event(&mut self, event: DiscoveryEvent) -> Result<(), AppError> {
         match event {
             DiscoveryEvent::PeerHint {
@@ -602,17 +681,20 @@ impl NetworkRuntime {
         Ok(())
     }
 
+    #[cfg(not(test))]
     fn dial_discovered_peer(&mut self, peer_id: PeerId, address: Multiaddr, source: &'static str) {
-        self.swarm.add_peer_address(peer_id, address.clone());
+        let swarm = &mut self.swarm;
+        swarm.add_peer_address(peer_id, address.clone());
         let options = DialOpts::peer_id(peer_id)
             .condition(PeerCondition::DisconnectedAndNotDialing)
             .addresses(vec![address])
             .build();
-        if let Err(error) = self.swarm.dial(options) {
+        if let Err(error) = swarm.dial(options) {
             tracing::trace!(peer_id = %peer_id, source, error = %error, "peer dial deferred");
         }
     }
 
+    #[cfg(not(test))]
     fn expire_beacon_addresses(&mut self) -> Result<(), AppError> {
         let now = Instant::now();
         let mut expired_peers = Vec::new();
@@ -631,6 +713,7 @@ impl NetworkRuntime {
         Ok(())
     }
 
+    #[cfg(not(test))]
     fn handle_control_event(
         &mut self,
         event: request_response::Event<ControlRequest, ControlResponse>,
@@ -659,11 +742,15 @@ impl NetworkRuntime {
                 request_response::Message::Response {
                     request_id,
                     response,
-                } => self.handle_outbound_response(peer, request_id, response)?,
+                } => self.handle_outbound_response(
+                    peer,
+                    PendingRequestId::Network(request_id),
+                    response,
+                )?,
             },
             request_response::Event::OutboundFailure {
                 request_id, error, ..
-            } => self.handle_outbound_failure(request_id, error)?,
+            } => self.handle_outbound_failure(PendingRequestId::Network(request_id), error)?,
             request_response::Event::InboundFailure { peer, error, .. } => {
                 tracing::warn!(peer_id = %peer, %error, "inbound control request failed");
             }
@@ -836,13 +923,13 @@ impl NetworkRuntime {
                         &transfer.transfer_id,
                         true,
                         || {
-                            Ok(self.swarm.behaviour_mut().control.send_request(
-                                &peer_id,
+                            self.send_control_request(
+                                peer_id,
                                 ControlRequest::TransferDecision {
                                     transfer_id: transfer.transfer_id.clone(),
                                     accepted: true,
                                 },
-                            ))
+                            )
                         },
                     ) {
                         Ok(submission) => {
@@ -853,22 +940,18 @@ impl NetworkRuntime {
                             let submitted = submission
                                 .transfer
                                 .expect("automatic acceptance is locally prepared");
-                            self.pending.insert(
+                            self.insert_pending_transfer_decision(
                                 submission.request_id,
-                                PendingAction::TransferDecision {
-                                    transfer_id: submitted.transfer_id.clone(),
-                                    accepted: true,
-                                    decision_token: Some(decision_token.clone()),
-                                },
+                                submitted.transfer_id.clone(),
+                                true,
+                                Some(decision_token.clone()),
                             );
                             self.emit(NetworkEvent::TransferUpdated {
                                 transfer: submitted.clone(),
                             });
-                            transfer::spawn_incoming_start_timeout(
+                            self.spawn_incoming_start_timeout(
                                 submitted.transfer_id,
                                 decision_token,
-                                self.storage.clone(),
-                                self.app_handle.clone(),
                             );
                         }
                         Err(error) => {
@@ -953,6 +1036,7 @@ impl NetworkRuntime {
                     self.emit(NetworkEvent::TransferUpdated {
                         transfer: transfer.clone(),
                     });
+                    #[cfg(not(test))]
                     transfer::spawn_outgoing_transfer(
                         self.stream_control.clone(),
                         peer_id,
@@ -1029,7 +1113,7 @@ impl NetworkRuntime {
     fn handle_outbound_response(
         &mut self,
         peer_id: PeerId,
-        request_id: request_response::OutboundRequestId,
+        request_id: PendingRequestId,
         response: ControlResponse,
     ) -> Result<(), AppError> {
         let Some(action) = self.pending.remove(&request_id) else {
@@ -1084,11 +1168,9 @@ impl NetworkRuntime {
                 },
                 ControlResponse::Rejected { message, .. },
             ) => {
-                transfer::fail_pending_incoming_decision(
+                self.fail_pending_incoming_decision(
                     &transfer_id,
                     &decision_token,
-                    &self.storage,
-                    &self.app_handle,
                     format!("接收确认未送达，请重新确认：{message}"),
                 )?;
             }
@@ -1099,7 +1181,7 @@ impl NetworkRuntime {
 
     fn handle_outbound_failure(
         &mut self,
-        request_id: request_response::OutboundRequestId,
+        request_id: PendingRequestId,
         error: request_response::OutboundFailure,
     ) -> Result<(), AppError> {
         let Some(action) = self.pending.remove(&request_id) else {
@@ -1125,11 +1207,9 @@ impl NetworkRuntime {
                 accepted: true,
                 decision_token: Some(decision_token),
             } => {
-                transfer::fail_pending_incoming_decision(
+                self.fail_pending_incoming_decision(
                     &transfer_id,
                     &decision_token,
-                    &self.storage,
-                    &self.app_handle,
                     format!("接收确认发送失败，请重新确认：{error}"),
                 )?;
             }
@@ -1194,8 +1274,127 @@ impl NetworkRuntime {
         Ok(())
     }
 
+    fn send_control_request(
+        &mut self,
+        peer_id: PeerId,
+        request: ControlRequest,
+    ) -> Result<PendingRequestId, AppError> {
+        #[cfg(test)]
+        if let Some(transport) = self.test_control_transport.as_mut() {
+            self.test_order
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push("send_request");
+            transport.requests.push((peer_id, request));
+            if let Some(message) = transport.fail_next.take() {
+                return Err(AppError::Network(message));
+            }
+            transport.next_request_id += 1;
+            return Ok(PendingRequestId::Test(transport.next_request_id));
+        }
+
+        #[cfg(test)]
+        return Err(AppError::Network(
+            "test runtime control transport is unavailable".to_string(),
+        ));
+
+        #[cfg(not(test))]
+        {
+            let request_id = self
+                .swarm
+                .behaviour_mut()
+                .control
+                .send_request(&peer_id, request);
+            Ok(PendingRequestId::Network(request_id))
+        }
+    }
+
+    fn insert_pending_transfer_decision(
+        &mut self,
+        request_id: PendingRequestId,
+        transfer_id: String,
+        accepted: bool,
+        decision_token: Option<String>,
+    ) {
+        self.pending.insert(
+            request_id,
+            PendingAction::TransferDecision {
+                transfer_id,
+                accepted,
+                decision_token,
+            },
+        );
+        #[cfg(test)]
+        self.record_test_order("pending_registered");
+    }
+
+    fn spawn_incoming_start_timeout(&self, transfer_id: String, decision_token: String) {
+        #[cfg(test)]
+        {
+            let _ = (transfer_id, decision_token);
+        }
+        #[cfg(not(test))]
+        {
+            let sender = self.command_sender.clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(INCOMING_START_TIMEOUT).await;
+                let Some(sender) = sender.upgrade() else {
+                    return;
+                };
+                if let Err(error) = sender
+                    .send(NetworkCommand::ExpireIncomingDecision {
+                        transfer_id: transfer_id.clone(),
+                        decision_token,
+                    })
+                    .await
+                {
+                    tracing::warn!(%transfer_id, %error, "failed to enqueue incoming transfer timeout");
+                }
+            });
+        }
+    }
+
+    fn fail_pending_incoming_decision(
+        &self,
+        transfer_id: &str,
+        decision_token: &str,
+        message: String,
+    ) -> Result<(), AppError> {
+        let Some(candidate) = self.storage.get_transfer(transfer_id)? else {
+            return Ok(());
+        };
+        if let Some(updated) = self.storage.rollback_pending_incoming_decision(
+            transfer_id,
+            &candidate.peer_id,
+            decision_token,
+            &message,
+        )? {
+            self.emit(NetworkEvent::TransferUpdated { transfer: updated });
+            self.emit(NetworkEvent::NetworkError {
+                code: "transfer.receive_not_started".to_string(),
+                message,
+            });
+        }
+        Ok(())
+    }
+
+    fn handle_incoming_start_timeout(
+        &self,
+        transfer_id: &str,
+        decision_token: &str,
+    ) -> Result<(), AppError> {
+        self.fail_pending_incoming_decision(
+            transfer_id,
+            decision_token,
+            "对方未在限定时间内开始传输，请重新确认接收".to_string(),
+        )
+    }
+
     fn ensure_connected(&self, peer_id: &PeerId) -> Result<(), AppError> {
-        if self.swarm.is_connected(peer_id) {
+        let connected = self.active_connections.get(peer_id).copied().unwrap_or(0) > 0;
+        #[cfg(not(test))]
+        let connected = connected || self.swarm.is_connected(peer_id);
+        if connected {
             Ok(())
         } else {
             Err(AppError::OfflinePeer)
@@ -1274,15 +1473,39 @@ impl NetworkRuntime {
     }
 
     fn emit(&self, event: NetworkEvent) {
-        if matches!(&event, NetworkEvent::FriendRequestReceived { .. }) {
-            if let Some(window) = self.app_handle.get_webview_window("main") {
-                if let Err(error) = window.request_user_attention(Some(UserAttentionType::Critical))
-                {
-                    tracing::debug!(%error, "unable to request attention for incoming friend request");
+        #[cfg(test)]
+        {
+            self.test_order
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push("event");
+            self.test_events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(event.clone());
+            return;
+        }
+        #[cfg(not(test))]
+        {
+            if matches!(&event, NetworkEvent::FriendRequestReceived { .. }) {
+                if let Some(window) = self.app_handle.get_webview_window("main") {
+                    if let Err(error) =
+                        window.request_user_attention(Some(UserAttentionType::Critical))
+                    {
+                        tracing::debug!(%error, "unable to request attention for incoming friend request");
+                    }
                 }
             }
+            emit_event(&self.app_handle, &event);
         }
-        emit_event(&self.app_handle, &event);
+    }
+
+    #[cfg(test)]
+    fn record_test_order(&self, step: &'static str) {
+        self.test_order
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(step);
     }
 }
 
@@ -1651,15 +1874,27 @@ fn compensate_automatic_acceptance_setup(
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, fs, path::PathBuf};
+    use std::{
+        cell::Cell,
+        collections::HashMap,
+        fs,
+        path::PathBuf,
+        sync::{Arc, Mutex},
+    };
+
+    use tokio::sync::{mpsc, oneshot, watch};
 
     use super::{
-        AcceptedSubmissionOutcome, NetworkRuntime, automatic_receive_path,
+        AcceptedSubmissionOutcome, NetworkCommand, NetworkEvent, NetworkRuntime, PendingAction,
+        PendingRequestId, TestControlTransport, automatic_receive_path,
         finalize_accepted_transfer_submission, persist_incoming_offer_with_preflight,
         persist_incoming_offer_with_preflight_and_accept, validate_transfer_offer,
     };
     use crate::{
-        domain::{TransferKind, TransferPreferences, TransferStatus},
+        domain::{
+            Direction, Friend, FriendRequest, FriendRequestStatus, LocalProfile, PROTOCOL_VERSION,
+            Platform, TransferKind, TransferPreferences, TransferStatus, now_rfc3339,
+        },
         error::AppError,
         protocol::TransferOffer,
         receive_paths::{preflight_receive_directory, reservation_is_owned, reserve_receive_path},
@@ -1724,6 +1959,595 @@ mod tests {
             .get_transfer(&offer.transfer_id)
             .expect("reload manual acceptance")
             .expect("manual acceptance exists")
+    }
+
+    fn production_test_runtime(
+        storage: Storage,
+        directory: &std::path::Path,
+        remote_peer: libp2p::PeerId,
+    ) -> NetworkRuntime {
+        let local_peer = deterministic_peer_id(1);
+        let (command_sender, receiver) = mpsc::channel(1);
+        let (_discovery_sender, discovery_receiver) = mpsc::channel(1);
+        let (listen_port_sender, _listen_port_receiver) = watch::channel(None);
+        let mut active_connections = HashMap::new();
+        active_connections.insert(remote_peer, 1);
+        NetworkRuntime {
+            local_profile: LocalProfile {
+                peer_id: local_peer.to_string(),
+                nickname: "Runtime Test".to_string(),
+                platform: Platform::current(),
+                protocol_version: PROTOCOL_VERSION,
+            },
+            storage,
+            default_receive_directory: directory.to_path_buf(),
+            receiver,
+            command_sender: command_sender.downgrade(),
+            discovery_receiver,
+            listen_port_sender,
+            pending: HashMap::new(),
+            mdns_addresses: HashMap::new(),
+            beacon_addresses: HashMap::new(),
+            active_connections,
+            friend_request_times: HashMap::new(),
+            mdns_enabled: false,
+            test_control_transport: Some(TestControlTransport::default()),
+            test_events: Mutex::new(Vec::new()),
+            test_order: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn deterministic_peer_id(marker: u8) -> libp2p::PeerId {
+        let mut bytes = vec![0, 36, 8, 1, 18, 32];
+        bytes.extend([marker; 32]);
+        libp2p::PeerId::from_bytes(&bytes).expect("valid deterministic ed25519 peer id")
+    }
+
+    fn add_runtime_friend(storage: &Storage, peer_id: &str) {
+        let now = now_rfc3339();
+        let request = FriendRequest {
+            request_id: uuid::Uuid::now_v7().to_string(),
+            peer_id: peer_id.to_string(),
+            nickname: "Remote Test".to_string(),
+            direction: Direction::Incoming,
+            status: FriendRequestStatus::Pending,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        storage
+            .put_friend_request(&request)
+            .expect("put friend request");
+        storage
+            .resolve_friend_request(
+                &request.request_id,
+                FriendRequestStatus::Accepted,
+                Some(&Friend {
+                    peer_id: peer_id.to_string(),
+                    nickname: "Remote Test".to_string(),
+                    platform: Platform::current(),
+                    online: true,
+                    added_at: now.clone(),
+                    last_seen: now.clone(),
+                }),
+                &now,
+            )
+            .expect("accept runtime friend");
+    }
+
+    fn reprepare_manual_runtime_acceptance(
+        directory: &std::path::Path,
+        storage: &Storage,
+        transfer_id: &str,
+    ) -> crate::domain::TransferRecord {
+        storage
+            .drain_incoming_cleanup_before_acceptance(transfer_id)
+            .expect("drain prior exact cleanup");
+        let mut transfer = storage
+            .get_transfer(transfer_id)
+            .expect("reload transfer for reacceptance")
+            .expect("transfer exists for reacceptance");
+        let token = uuid::Uuid::now_v7().to_string();
+        let destination = directory.join(format!("reaccept-{token}.bin"));
+        reserve_receive_path(&destination, transfer_id, &token)
+            .expect("reserve reacceptance destination");
+        transfer.local_path = Some(destination.to_string_lossy().into_owned());
+        transfer.destination_reserved = true;
+        transfer.reservation_token = Some(token);
+        transfer.status = TransferStatus::Transferring;
+        transfer.error = None;
+        assert!(
+            storage
+                .try_accept_incoming_transfer(&transfer)
+                .expect("persist reacceptance")
+        );
+        storage
+            .get_transfer(transfer_id)
+            .expect("reload reacceptance")
+            .expect("reacceptance exists")
+    }
+
+    fn transfer_completion() -> (
+        super::TransferDecisionCompletion,
+        oneshot::Receiver<Result<(), String>>,
+    ) {
+        let (sender, receiver) = oneshot::channel();
+        (Arc::new(Mutex::new(Some(sender))), receiver)
+    }
+
+    #[test]
+    fn production_manual_handler_registers_request_before_event_and_completion() {
+        let (directory, storage, _) = automatic_fixture("production-manual-success");
+        let remote_peer = deterministic_peer_id(2);
+        let offer = v2_offer();
+        prepare_manual_runtime_acceptance(&directory, &storage, &remote_peer.to_string(), &offer);
+        let mut runtime = production_test_runtime(storage.clone(), &directory, remote_peer);
+        let (completion, mut completed) = transfer_completion();
+
+        runtime
+            .handle_command(NetworkCommand::ResolveTransfer {
+                peer_id: remote_peer.to_string(),
+                transfer_id: offer.transfer_id.clone(),
+                accepted: true,
+                completion: Some(completion),
+            })
+            .expect("actual manual handler submits acceptance");
+
+        let transport = runtime.test_control_transport.as_ref().unwrap();
+        assert_eq!(transport.requests.len(), 1);
+        assert!(matches!(
+            transport.requests.first(),
+            Some((peer, crate::protocol::ControlRequest::TransferDecision {
+                transfer_id,
+                accepted: true,
+            })) if *peer == remote_peer && transfer_id == &offer.transfer_id
+        ));
+        assert!(matches!(
+            runtime.pending.get(&PendingRequestId::Test(1)),
+            Some(PendingAction::TransferDecision { accepted: true, .. })
+        ));
+        assert_eq!(completed.try_recv(), Ok(Ok(())));
+        assert_eq!(
+            *runtime.test_order.lock().unwrap(),
+            vec!["send_request", "pending_registered", "event", "completion"]
+        );
+        let events = runtime.test_events.lock().unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [NetworkEvent::TransferUpdated { transfer }]
+                if transfer.status == TransferStatus::Transferring
+        ));
+        drop(events);
+        runtime
+            .handle_outbound_response(
+                remote_peer,
+                PendingRequestId::Test(1),
+                crate::protocol::ControlResponse::Accepted,
+            )
+            .expect("accepted response retires the exact pending request");
+        assert!(runtime.pending.is_empty());
+        assert_eq!(
+            storage
+                .get_transfer(&offer.transfer_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            TransferStatus::Transferring
+        );
+        drop(runtime);
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove production manual fixture");
+    }
+
+    #[test]
+    fn production_manual_handler_local_validation_failure_sends_nothing_and_completes_error() {
+        let (directory, storage, mut preferences) =
+            automatic_fixture("production-manual-local-failure");
+        preferences.auto_receive_files = false;
+        let remote_peer = deterministic_peer_id(3);
+        let offer = v2_offer();
+        persist_incoming_offer_with_preflight(
+            &storage,
+            &remote_peer.to_string(),
+            &offer,
+            &preferences,
+            &|_, _, _| Ok(()),
+        )
+        .expect("persist awaiting transfer");
+        let mut runtime = production_test_runtime(storage.clone(), &directory, remote_peer);
+        let (completion, mut completed) = transfer_completion();
+        let command = NetworkCommand::ResolveTransfer {
+            peer_id: remote_peer.to_string(),
+            transfer_id: offer.transfer_id.clone(),
+            accepted: true,
+            completion: Some(completion),
+        };
+
+        let error = runtime
+            .handle_command(command.clone())
+            .expect_err("actual handler rejects unprepared acceptance");
+        runtime
+            .handle_command_failure(&command, &error)
+            .expect("actual failure handler completes command");
+
+        assert!(
+            runtime
+                .test_control_transport
+                .as_ref()
+                .unwrap()
+                .requests
+                .is_empty()
+        );
+        assert!(completed.try_recv().unwrap().is_err());
+        assert!(runtime.pending.is_empty());
+        assert_eq!(
+            storage
+                .get_transfer(&offer.transfer_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            TransferStatus::AwaitingAcceptance
+        );
+        drop(runtime);
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove local failure fixture");
+    }
+
+    #[test]
+    fn production_manual_handler_submission_failure_rolls_back_and_emits_corrected_state() {
+        let (directory, storage, _) = automatic_fixture("production-manual-send-failure");
+        let remote_peer = deterministic_peer_id(4);
+        let offer = v2_offer();
+        prepare_manual_runtime_acceptance(&directory, &storage, &remote_peer.to_string(), &offer);
+        let mut runtime = production_test_runtime(storage.clone(), &directory, remote_peer);
+        runtime.test_control_transport.as_mut().unwrap().fail_next =
+            Some("injected send_request failure".to_string());
+        let (completion, mut completed) = transfer_completion();
+        let command = NetworkCommand::ResolveTransfer {
+            peer_id: remote_peer.to_string(),
+            transfer_id: offer.transfer_id.clone(),
+            accepted: true,
+            completion: Some(completion),
+        };
+
+        let error = runtime
+            .handle_command(command.clone())
+            .expect_err("actual send injection fails");
+        runtime
+            .handle_command_failure(&command, &error)
+            .expect("actual failure handler compensates");
+
+        assert_eq!(
+            runtime
+                .test_control_transport
+                .as_ref()
+                .unwrap()
+                .requests
+                .len(),
+            1
+        );
+        assert!(runtime.pending.is_empty());
+        assert!(completed.try_recv().unwrap().is_err());
+        let reverted = storage.get_transfer(&offer.transfer_id).unwrap().unwrap();
+        assert_eq!(reverted.status, TransferStatus::AwaitingAcceptance);
+        let events = runtime.test_events.lock().unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            NetworkEvent::TransferUpdated { transfer }
+                if transfer.status == TransferStatus::AwaitingAcceptance
+        )));
+        drop(events);
+        drop(runtime);
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove production send failure fixture");
+    }
+
+    #[test]
+    fn production_automatic_offer_handler_submits_once_after_pending_registration() {
+        let (directory, storage, preferences) = automatic_fixture("production-auto-success");
+        storage
+            .save_transfer_preferences(&preferences)
+            .expect("enable automatic receive");
+        let remote_peer = deterministic_peer_id(5);
+        add_runtime_friend(&storage, &remote_peer.to_string());
+        let offer = v2_offer();
+        let mut runtime = production_test_runtime(storage.clone(), &directory, remote_peer);
+
+        let response = runtime
+            .handle_inbound_request(
+                remote_peer,
+                crate::protocol::ControlRequest::TransferOffer {
+                    offer: offer.clone(),
+                },
+            )
+            .expect("actual automatic offer handler accepts");
+
+        assert!(matches!(
+            response,
+            crate::protocol::ControlResponse::Accepted
+        ));
+        assert_eq!(
+            runtime
+                .test_control_transport
+                .as_ref()
+                .unwrap()
+                .requests
+                .len(),
+            1
+        );
+        assert!(matches!(
+            runtime.pending.get(&PendingRequestId::Test(1)),
+            Some(PendingAction::TransferDecision { accepted: true, .. })
+        ));
+        assert_eq!(
+            *runtime.test_order.lock().unwrap(),
+            vec!["send_request", "pending_registered", "event"]
+        );
+        assert_eq!(
+            storage
+                .get_transfer(&offer.transfer_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            TransferStatus::Transferring
+        );
+        drop(runtime);
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove automatic success fixture");
+    }
+
+    #[test]
+    fn production_automatic_offer_submission_failure_emits_only_durable_fallback() {
+        let (directory, storage, preferences) = automatic_fixture("production-auto-send-failure");
+        storage
+            .save_transfer_preferences(&preferences)
+            .expect("enable automatic receive");
+        let remote_peer = deterministic_peer_id(6);
+        add_runtime_friend(&storage, &remote_peer.to_string());
+        let offer = v2_offer();
+        let mut runtime = production_test_runtime(storage.clone(), &directory, remote_peer);
+        runtime.test_control_transport.as_mut().unwrap().fail_next =
+            Some("automatic send_request injection".to_string());
+
+        let response = runtime
+            .handle_inbound_request(
+                remote_peer,
+                crate::protocol::ControlRequest::TransferOffer {
+                    offer: offer.clone(),
+                },
+            )
+            .expect("offer response remains accepted for manual fallback");
+
+        assert!(matches!(
+            response,
+            crate::protocol::ControlResponse::Accepted
+        ));
+        assert!(runtime.pending.is_empty());
+        assert_eq!(
+            storage
+                .get_transfer(&offer.transfer_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            TransferStatus::AwaitingAcceptance
+        );
+        let events = runtime.test_events.lock().unwrap();
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            NetworkEvent::TransferUpdated { transfer }
+                if transfer.status == TransferStatus::Transferring
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            NetworkEvent::TransferUpdated { transfer }
+                if transfer.status == TransferStatus::AwaitingAcceptance
+        )));
+        drop(events);
+        drop(runtime);
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove automatic failure fixture");
+    }
+
+    #[test]
+    fn production_outbound_rejection_rolls_back_the_registered_decision_token() {
+        let (directory, storage, _) = automatic_fixture("production-outbound-rejection");
+        let remote_peer = deterministic_peer_id(7);
+        let offer = v2_offer();
+        prepare_manual_runtime_acceptance(&directory, &storage, &remote_peer.to_string(), &offer);
+        let mut runtime = production_test_runtime(storage.clone(), &directory, remote_peer);
+        runtime
+            .handle_command(NetworkCommand::ResolveTransfer {
+                peer_id: remote_peer.to_string(),
+                transfer_id: offer.transfer_id.clone(),
+                accepted: true,
+                completion: None,
+            })
+            .expect("submit pending acceptance");
+        runtime.test_events.lock().unwrap().clear();
+
+        runtime
+            .handle_outbound_response(
+                remote_peer,
+                PendingRequestId::Test(1),
+                crate::protocol::ControlResponse::Rejected {
+                    code: "remote_rejected".to_string(),
+                    message: "remote rejected decision".to_string(),
+                },
+            )
+            .expect("actual response handler compensates rejection");
+
+        assert!(runtime.pending.is_empty());
+        assert_eq!(
+            storage
+                .get_transfer(&offer.transfer_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            TransferStatus::AwaitingAcceptance
+        );
+        let events = runtime.test_events.lock().unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [NetworkEvent::TransferUpdated { transfer }, NetworkEvent::NetworkError { .. }]
+                if transfer.status == TransferStatus::AwaitingAcceptance
+        ));
+        drop(events);
+        drop(runtime);
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove rejection fixture");
+    }
+
+    #[test]
+    fn production_start_timeout_and_body_claim_have_one_exact_token_winner() {
+        let (directory, storage, _) = automatic_fixture("production-timeout-claim-race");
+        let remote_peer = deterministic_peer_id(8);
+        let offer = v2_offer();
+        let accepted = prepare_manual_runtime_acceptance(
+            &directory,
+            &storage,
+            &remote_peer.to_string(),
+            &offer,
+        );
+        let mut runtime = production_test_runtime(storage.clone(), &directory, remote_peer);
+        runtime
+            .handle_command(NetworkCommand::ResolveTransfer {
+                peer_id: remote_peer.to_string(),
+                transfer_id: offer.transfer_id.clone(),
+                accepted: true,
+                completion: None,
+            })
+            .expect("submit acceptance before body race");
+        let decision_token = match runtime.pending.get(&PendingRequestId::Test(1)) {
+            Some(PendingAction::TransferDecision {
+                decision_token: Some(token),
+                ..
+            }) => token.clone(),
+            other => panic!("missing exact pending decision: {other:?}"),
+        };
+        runtime.test_events.lock().unwrap().clear();
+
+        assert!(
+            storage
+                .try_claim_incoming_transfer(&offer.transfer_id, &accepted.peer_id)
+                .expect("body claim wins")
+        );
+        runtime
+            .handle_command(NetworkCommand::ExpireIncomingDecision {
+                transfer_id: offer.transfer_id.clone(),
+                decision_token,
+            })
+            .expect("late start timeout loses harmlessly");
+
+        assert_eq!(
+            storage
+                .get_transfer(&offer.transfer_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            TransferStatus::Transferring
+        );
+        assert!(runtime.test_events.lock().unwrap().is_empty());
+        assert!(
+            storage
+                .try_pause_claimed_incoming_transfer(
+                    &offer.transfer_id,
+                    &accepted.peer_id,
+                    "test cleanup",
+                )
+                .unwrap()
+        );
+        drop(runtime);
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove timeout claim fixture");
+    }
+
+    #[test]
+    fn production_late_response_cannot_roll_back_a_newer_acceptance() {
+        let (directory, storage, _) = automatic_fixture("production-late-response-token");
+        let remote_peer = deterministic_peer_id(9);
+        let offer = v2_offer();
+        prepare_manual_runtime_acceptance(&directory, &storage, &remote_peer.to_string(), &offer);
+        let mut runtime = production_test_runtime(storage.clone(), &directory, remote_peer);
+        runtime
+            .handle_command(NetworkCommand::ResolveTransfer {
+                peer_id: remote_peer.to_string(),
+                transfer_id: offer.transfer_id.clone(),
+                accepted: true,
+                completion: None,
+            })
+            .expect("submit old acceptance");
+        let old_token = match runtime.pending.get(&PendingRequestId::Test(1)) {
+            Some(PendingAction::TransferDecision {
+                decision_token: Some(token),
+                ..
+            }) => token.clone(),
+            other => panic!("missing old decision: {other:?}"),
+        };
+        runtime
+            .handle_command(NetworkCommand::ExpireIncomingDecision {
+                transfer_id: offer.transfer_id.clone(),
+                decision_token: old_token,
+            })
+            .expect("old timeout rolls back old decision");
+        reprepare_manual_runtime_acceptance(&directory, &storage, &offer.transfer_id);
+        runtime
+            .handle_command(NetworkCommand::ResolveTransfer {
+                peer_id: remote_peer.to_string(),
+                transfer_id: offer.transfer_id.clone(),
+                accepted: true,
+                completion: None,
+            })
+            .expect("submit newer acceptance");
+        let new_token = match runtime.pending.get(&PendingRequestId::Test(2)) {
+            Some(PendingAction::TransferDecision {
+                decision_token: Some(token),
+                ..
+            }) => token.clone(),
+            other => panic!("missing new decision: {other:?}"),
+        };
+
+        runtime
+            .handle_outbound_response(
+                remote_peer,
+                PendingRequestId::Test(1),
+                crate::protocol::ControlResponse::Rejected {
+                    code: "late_old_response".to_string(),
+                    message: "late old rejection".to_string(),
+                },
+            )
+            .expect("late old response loses exact-token CAS");
+
+        assert_eq!(
+            storage
+                .pending_incoming_decision_token(&offer.transfer_id)
+                .unwrap()
+                .as_deref(),
+            Some(new_token.as_str())
+        );
+        assert_eq!(
+            storage
+                .get_transfer(&offer.transfer_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            TransferStatus::Transferring
+        );
+        runtime
+            .handle_outbound_failure(
+                PendingRequestId::Test(2),
+                libp2p::request_response::OutboundFailure::ConnectionClosed,
+            )
+            .expect("new exact outbound failure rolls back newer acceptance");
+        assert_eq!(
+            storage
+                .get_transfer(&offer.transfer_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            TransferStatus::AwaitingAcceptance
+        );
+        drop(runtime);
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove late response fixture");
     }
 
     #[test]
