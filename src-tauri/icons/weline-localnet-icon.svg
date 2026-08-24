@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="Weline Localnet">
+  <defs>
+    <linearGradient id="background" x1="128" y1="96" x2="896" y2="928" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#251d58" />
+      <stop offset="0.55" stop-color="#4939ca" />
+      <stop offset="1" stop-color="#6252e8" />
+    </linearGradient>
+    <radialGradient id="glow" cx="0" cy="0" r="1" gradientTransform="translate(760 250) rotate(132) scale(570)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#8b7dff" stop-opacity="0.28" />
+      <stop offset="1" stop-color="#8b7dff" stop-opacity="0" />
+    </radialGradient>
+  </defs>
+
+  <rect x="32" y="32" width="960" height="960" rx="224" fill="url(#background)" />
+  <rect x="32" y="32" width="960" height="960" rx="224" fill="url(#glow)" />
+
+  <path
+    d="M 246 320 L 396 712 Q 410 749 432 712 L 512 518 L 592 712 Q 614 749 628 712 L 778 320"
+    fill="none"
+    stroke="#ffffff"
+    stroke-width="76"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+
+  <circle cx="246" cy="320" r="45" fill="#23b991" />
+  <circle cx="778" cy="320" r="45" fill="#23b991" />
+</svg>
