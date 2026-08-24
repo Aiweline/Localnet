@@ -76,6 +76,9 @@ pub enum NetworkEvent {
     FriendRequestReceived {
         request: FriendRequest,
     },
+    FriendRequestDelivered {
+        request_id: String,
+    },
     FriendRequestResolved {
         request: FriendRequest,
         friend: Option<Friend>,
@@ -837,6 +840,9 @@ impl NetworkRuntime {
             (PendingAction::Text { message_id }, ControlResponse::Accepted) => {
                 self.set_message_status(&message_id, MessageStatus::Delivered, None)?;
             }
+            (PendingAction::FriendRequest { request_id }, ControlResponse::Accepted) => {
+                self.emit(NetworkEvent::FriendRequestDelivered { request_id });
+            }
             (PendingAction::Text { message_id }, ControlResponse::Rejected { message, .. }) => {
                 self.set_message_status(&message_id, MessageStatus::Failed, Some(message))?;
             }
@@ -850,10 +856,11 @@ impl NetworkRuntime {
                 PendingAction::FriendRequest { request_id },
                 ControlResponse::Rejected { message, .. },
             ) => {
-                self.emit(NetworkEvent::NetworkError {
-                    code: "friend_request_rejected".to_string(),
-                    message: format!("好友申请 {request_id} 未送达：{message}"),
-                });
+                self.fail_friend_request(
+                    &request_id,
+                    "friend_request_rejected",
+                    format!("好友申请未送达：{message}"),
+                )?;
             }
             (PendingAction::Hello, ControlResponse::Rejected { message, .. }) => {
                 self.emit(NetworkEvent::NetworkError {
@@ -880,10 +887,11 @@ impl NetworkRuntime {
                 self.set_message_status(&message_id, MessageStatus::Failed, Some(message))?;
             }
             PendingAction::FriendRequest { request_id } => {
-                self.emit(NetworkEvent::NetworkError {
-                    code: "friend_request_failed".to_string(),
-                    message: format!("好友申请 {request_id} 发送失败，请稍后重试"),
-                });
+                self.fail_friend_request(
+                    &request_id,
+                    "friend_request_failed",
+                    "好友申请发送失败，请确认对方在线后重试".to_string(),
+                )?;
             }
             PendingAction::TransferOffer { transfer_id } => {
                 self.set_transfer_failed(&transfer_id, message)?;
@@ -1001,6 +1009,21 @@ impl NetworkRuntime {
         self.storage
             .update_message_status(transfer_id, MessageStatus::Failed, Some(&error))?;
         self.emit(NetworkEvent::TransferUpdated { transfer });
+        Ok(())
+    }
+
+    fn fail_friend_request(
+        &self,
+        request_id: &str,
+        code: &str,
+        message: String,
+    ) -> Result<(), AppError> {
+        self.storage
+            .remove_pending_outgoing_friend_request(request_id)?;
+        self.emit(NetworkEvent::NetworkError {
+            code: code.to_string(),
+            message,
+        });
         Ok(())
     }
 

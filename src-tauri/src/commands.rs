@@ -75,9 +75,15 @@ pub fn send_friend_request(
         updated_at: now,
     };
     state.storage.put_friend_request(&request)?;
-    state
+    if let Err(error) = state
         .network()?
-        .try_send(NetworkCommand::SendFriendRequest(request.clone()))?;
+        .try_send(NetworkCommand::SendFriendRequest(request.clone()))
+    {
+        state
+            .storage
+            .remove_pending_outgoing_friend_request(&request.request_id)?;
+        return Err(error);
+    }
     Ok(request)
 }
 

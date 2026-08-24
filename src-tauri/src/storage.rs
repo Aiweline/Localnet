@@ -141,6 +141,19 @@ impl Storage {
         }))
     }
 
+    pub fn remove_pending_outgoing_friend_request(
+        &self,
+        request_id: &str,
+    ) -> Result<bool, AppError> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "DELETE FROM friend_requests
+             WHERE request_id = ?1 AND direction = 'outgoing' AND status = 'pending'",
+            [request_id],
+        )?;
+        Ok(changed == 1)
+    }
+
     pub fn resolve_friend_request(
         &self,
         request_id: &str,
