@@ -57,7 +57,7 @@ pub fn run() {
                 Err(error) => {
                     app.dialog()
                         .message(error.to_string())
-                        .title("Weline Chat 无法启动")
+                        .title("Weline Localnet 无法启动")
                         .kind(MessageDialogKind::Error)
                         .blocking_show();
                     Err(Box::new(error))
@@ -66,11 +66,11 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             if matches!(event, WindowEvent::CloseRequested { .. }) {
-                tracing::info!(window = window.label(), "Weline Chat window closing");
+                tracing::info!(window = window.label(), "Weline Localnet window closing");
             }
         })
         .run(tauri::generate_context!())
-        .expect("failed to run Weline Chat");
+        .expect("failed to run Weline Localnet");
 }
 
 fn initialize_state<R: tauri::Runtime>(
@@ -93,7 +93,7 @@ fn resolve_app_data_dir<R: tauri::Runtime>(
     }
 
     app.path().app_data_dir().map_err(|error| {
-        error::AppError::Storage(format!("无法定位 Weline Chat 应用数据目录：{error}"))
+        error::AppError::Storage(format!("无法定位 Weline Localnet 应用数据目录：{error}"))
     })
 }
 

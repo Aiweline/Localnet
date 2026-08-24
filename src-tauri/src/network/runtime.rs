@@ -139,7 +139,7 @@ pub fn spawn_network(
                     message: error.to_string(),
                 },
             );
-            tracing::error!(error = %error, "Weline Chat network runtime stopped");
+            tracing::error!(error = %error, "Weline Localnet network runtime stopped");
         }
     });
     NetworkHandle { sender }
@@ -213,7 +213,7 @@ impl NetworkRuntime {
         let mdns_enabled =
             !(cfg!(debug_assertions) && std::env::var_os("LOCALNET_DISABLE_MDNS").is_some());
 
-        tracing::info!(peer_id = %peer_id, mdns_enabled, "Weline Chat network runtime started");
+        tracing::info!(peer_id = %peer_id, mdns_enabled, "Weline Localnet network runtime started");
         let mut runtime = Self {
             local_profile: profile,
             storage,
@@ -457,7 +457,7 @@ impl NetworkRuntime {
                 self.mark_offline_if_unreachable(peer_id)?;
             }
             SwarmEvent::NewListenAddr { address, .. } => {
-                tracing::info!(%address, "Weline Chat listening");
+                tracing::info!(%address, "Weline Localnet listening");
                 if let Some(port) = address.iter().find_map(|protocol| match protocol {
                     Protocol::Tcp(port) => Some(port),
                     _ => None,
@@ -1048,7 +1048,7 @@ fn parse_peer_id(value: &str) -> Result<PeerId, AppError> {
 
 pub(super) fn emit_event(app_handle: &AppHandle, event: &NetworkEvent) {
     if let Err(error) = app_handle.emit(EVENT_NAME, event) {
-        tracing::warn!(%error, "failed to emit Weline Chat event");
+        tracing::warn!(%error, "failed to emit Weline Localnet event");
     }
 }
 

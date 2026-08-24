@@ -41,7 +41,7 @@ impl AppState {
             return Ok(());
         };
         let mut network = self.network.lock().map_err(|_| {
-            AppError::Network("网络服务状态异常，请重新启动 Weline Chat".to_string())
+            AppError::Network("网络服务状态异常，请重新启动 Weline Localnet".to_string())
         })?;
         if let Some(handle) = network.as_ref() {
             handle.try_send(NetworkCommand::SetProfile(profile))?;
@@ -60,7 +60,9 @@ impl AppState {
     pub fn network(&self) -> Result<NetworkHandle, AppError> {
         self.network
             .lock()
-            .map_err(|_| AppError::Network("网络服务状态异常，请重新启动 Weline Chat".to_string()))?
+            .map_err(|_| {
+                AppError::Network("网络服务状态异常，请重新启动 Weline Localnet".to_string())
+            })?
             .clone()
             .ok_or_else(|| AppError::Network("请先设置昵称，再使用局域网功能".to_string()))
     }

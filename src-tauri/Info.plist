@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
   <key>NSLocalNetworkUsageDescription</key>
-  <string>Weline Chat 需要访问本地网络，以发现同一局域网中的用户并直接传输消息和文件。</string>
+  <string>Weline Localnet 需要访问本地网络，以发现同一局域网中的用户并直接传输消息和文件。</string>
   <key>NSBonjourServices</key>
   <array>
     <string>_p2p._udp</string>

@@ -72,14 +72,14 @@ jobs:
           mkdir -p release/macos
           dmg_path="$(find src-tauri/target/universal-apple-darwin/release/bundle/dmg -maxdepth 1 -name '*.dmg' -print -quit)"
           test -n "$dmg_path"
-          output="release/macos/Weline_Chat_${version}_universal.dmg"
+          output="release/macos/Weline_Localnet_${version}_universal.dmg"
           cp "$dmg_path" "$output"
           shasum -a 256 "$output" > "$output.sha256"
 
       - name: Upload macOS package
         uses: actions/upload-artifact@v4
         with:
-          name: localnet-macos-universal
+          name: weline-localnet-macos-universal
           path: release/macos/*
           if-no-files-found: error
           retention-days: 14

@@ -25,7 +25,7 @@ impl LocalnetBehaviour {
             .map_err(|error| AppError::Network(format!("无法启动局域网自动发现：{error}")))?;
         let identify = identify::Behaviour::new(
             identify::Config::new("/localnet/identify/1".to_string(), public_key)
-                .with_agent_version(format!("Weline Chat/{}", env!("CARGO_PKG_VERSION")))
+                .with_agent_version(format!("Weline Localnet/{}", env!("CARGO_PKG_VERSION")))
                 .with_interval(Duration::from_secs(60)),
         );
         let codec = request_response::cbor::codec::Codec::default()
