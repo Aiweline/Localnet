@@ -1,0 +1,51 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
+
+test("reconciles an online friend even when the presence event was missed", async () => {
+  const presenceModule = await import("../src/presence.ts").catch(() => ({}));
+  assert.equal(
+    typeof presenceModule.startSnapshotReconciliation,
+    "function",
+    "presence reconciliation must be available",
+  );
+  assert.equal(
+    typeof presenceModule.mergePresenceSnapshot,
+    "function",
+    "the production presence snapshot merge must be testable",
+  );
+
+  const messages = [{ messageId: "message-1", body: "still here" }];
+  const transfers = [{ transferId: "transfer-1", status: "completed" }];
+  let visibleSnapshot = {
+    peers: [{ peerId: "mac-peer", online: false }],
+    friends: [{ peerId: "mac-peer", nickname: "Mac", online: false }],
+    messages,
+    transfers,
+  };
+  let backendPresence = {
+    peers: [{ peerId: "mac-peer", online: false }],
+    friends: [{ peerId: "mac-peer", nickname: "Mac", online: false }],
+  };
+  let refreshCount = 0;
+  const stop = presenceModule.startSnapshotReconciliation(async () => {
+    refreshCount += 1;
+    visibleSnapshot = presenceModule.mergePresenceSnapshot(visibleSnapshot, backendPresence);
+  }, 10);
+
+  backendPresence = {
+    peers: [{ peerId: "mac-peer", online: true }],
+    friends: [{ peerId: "mac-peer", nickname: "Mac", online: true }],
+  };
+  try {
+    await delay(45);
+  } finally {
+    stop();
+  }
+
+  assert.ok(refreshCount > 0, "the authoritative snapshot should be refreshed");
+  assert.equal(visibleSnapshot.friends[0].online, true);
+  assert.equal(visibleSnapshot.friends[0].peerId, "mac-peer");
+  assert.strictEqual(visibleSnapshot.messages, messages);
+  assert.strictEqual(visibleSnapshot.transfers, transfers);
+});

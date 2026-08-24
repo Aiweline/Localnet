@@ -14,8 +14,8 @@ use crate::{
     domain::{
         BootstrapSnapshot, ChatMessage, Direction, Friend, FriendRequest, FriendRequestStatus,
         LocalProfile, MAX_FILE_BYTES, MessageKind, MessageStatus, PROTOCOL_VERSION, Platform,
-        TransferKind, TransferPreferences, TransferRecord, TransferStatus, now_rfc3339,
-        validate_nickname, validate_text,
+        PresenceSnapshot, TransferKind, TransferPreferences, TransferRecord, TransferStatus,
+        now_rfc3339, validate_nickname, validate_text,
     },
     error::AppError,
     network::NetworkCommand,
@@ -29,6 +29,11 @@ pub fn bootstrap(state: State<'_, AppState>) -> Result<BootstrapSnapshot, AppErr
         state.local_profile()?,
         state.default_receive_directory.as_path(),
     )
+}
+
+#[tauri::command]
+pub fn presence(state: State<'_, AppState>) -> Result<PresenceSnapshot, AppError> {
+    state.storage.presence_snapshot()
 }
 
 #[tauri::command]

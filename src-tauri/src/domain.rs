@@ -190,6 +190,13 @@ pub struct TransferPreferences {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PresenceSnapshot {
+    pub peers: Vec<PeerSummary>,
+    pub friends: Vec<Friend>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BootstrapSnapshot {
     pub local_profile: Option<LocalProfile>,
     pub transfer_preferences: TransferPreferences,

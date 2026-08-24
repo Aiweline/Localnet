@@ -1,7 +1,7 @@
 {
   "name": "localnet",
   "private": true,
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "Weline Localnet is a private peer-to-peer LAN messenger and file transfer app for Windows and macOS.",
   "author": "成都阿玛云科技有限公司 <contact@amayum.com>",
   "homepage": "https://github.com/Aiweline/Localnet",
@@ -16,6 +16,7 @@
     "typecheck": "tsc -b --pretty false",
     "tauri": "tauri",
     "check": "pnpm typecheck && pnpm build",
+    "test:presence": "node --test --experimental-strip-types tests/presence.test.ts",
     "release:check": "node scripts/release-version.mjs --check",
     "release:version": "node scripts/release-version.mjs"
   },

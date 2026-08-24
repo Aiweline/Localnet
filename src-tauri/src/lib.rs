@@ -36,6 +36,7 @@ pub fn run() {
     builder
         .invoke_handler(tauri::generate_handler![
             commands::bootstrap,
+            commands::presence,
             commands::complete_onboarding,
             commands::update_nickname,
             commands::update_settings,

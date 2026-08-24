@@ -12,6 +12,7 @@ import {
   Monitor, Paperclip, RefreshCw, Search, Send, Settings2, ShieldCheck, UserPlus,
   UsersRound, Wifi, WifiOff, X,
 } from "lucide-react";
+import { mergePresenceSnapshot, startSnapshotReconciliation } from "./presence";
 import "./styles.css";
 
 type Platform = "windows" | "macos" | "unknown";
@@ -29,6 +30,7 @@ interface Friend { peerId: string; nickname: string; platform: Platform; online:
 interface ChatMessage { messageId: string; peerId: string; direction: Direction; kind: MessageKind; body?: string; localPath?: string; fileName?: string; fileSize?: number; status: MessageStatus; error?: string; createdAt: string }
 interface TransferRecord { transferId: string; peerId: string; direction: Direction; kind: TransferKind; fileName: string; fileSize: number; mimeType: string; sha256: string; localPath?: string; transferredBytes: number; status: TransferStatus; error?: string; createdAt: string; updatedAt: string }
 interface TransferPreferences { autoReceiveFiles: boolean; receiveDirectory: string }
+interface PresenceSnapshot { peers: PeerSummary[]; friends: Friend[] }
 interface BootstrapSnapshot { localProfile: LocalProfile | null; transferPreferences: TransferPreferences; peers: PeerSummary[]; friendRequests: FriendRequest[]; friends: Friend[]; messages: ChatMessage[]; transfers: TransferRecord[] }
 interface ToastState { tone: "success" | "error" | "info"; message: string }
 type NetworkEvent =
@@ -78,6 +80,11 @@ function App() {
     refreshTimer.current = window.setTimeout(() => void refresh(), 80);
   }, [refresh]);
 
+  const reconcilePresence = useCallback(async () => {
+    const presence = await invoke<PresenceSnapshot>("presence");
+    setSnapshot((current) => mergePresenceSnapshot(current, presence));
+  }, []);
+
   const handleNetworkEvent = useCallback((event: NetworkEvent) => {
     scheduleRefresh();
     switch (event.type) {
@@ -118,6 +125,8 @@ function App() {
       if (refreshTimer.current !== null) window.clearTimeout(refreshTimer.current);
     };
   }, [handleNetworkEvent, refresh]);
+
+  useEffect(() => startSnapshotReconciliation(reconcilePresence), [reconcilePresence]);
 
   useEffect(() => {
     let active = true;
