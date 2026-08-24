@@ -126,6 +126,58 @@ pub fn spawn_outgoing_transfer(
     });
 }
 
+pub fn spawn_claimed_outgoing_resumable_transfer(
+    mut control: libp2p_stream::Control,
+    peer_id: PeerId,
+    transfer: TransferRecord,
+    storage: Storage,
+    app_handle: AppHandle,
+) {
+    tauri::async_runtime::spawn(async move {
+        let opener = ResumableStreamOpener::Network(&mut control, peer_id);
+        let mut publish = |event| emit_event(&app_handle, &event);
+        let result =
+            send_claimed_resumable_transfer(opener, &transfer, &storage, &mut publish).await;
+        if let Err(error) = result {
+            match persist_claimed_outgoing_error(&storage, &transfer, &error) {
+                Ok(true) => {
+                    if let Ok(Some(updated)) = storage.get_transfer(&transfer.transfer_id) {
+                        let terminal = updated.status == TransferStatus::Failed;
+                        publish(NetworkEvent::TransferUpdated {
+                            transfer: updated.clone(),
+                        });
+                        if terminal {
+                            let _ = storage.update_message_status(
+                                &updated.transfer_id,
+                                MessageStatus::Failed,
+                                updated.error.as_deref(),
+                            );
+                            publish(NetworkEvent::MessageStatusChanged {
+                                message_id: updated.transfer_id,
+                                status: MessageStatus::Failed,
+                                error: updated.error,
+                            });
+                        }
+                    }
+                }
+                Ok(false) => {}
+                Err(persist_error) => {
+                    tracing::warn!(
+                        transfer_id = %transfer.transfer_id,
+                        %persist_error,
+                        "failed to persist claimed resumable send failure"
+                    );
+                }
+            }
+            tracing::warn!(
+                transfer_id = %transfer.transfer_id,
+                %error,
+                "claimed resumable outgoing transfer stopped"
+            );
+        }
+    });
+}
+
 pub(crate) fn return_pending_incoming_decision_to_manual(
     transfer_id: &str,
     storage: &Storage,
@@ -389,7 +441,7 @@ fn claim_resumable_outgoing(
     Ok(Some(transfer))
 }
 
-fn persist_claimed_outgoing_error(
+pub(super) fn persist_claimed_outgoing_error(
     storage: &Storage,
     transfer: &TransferRecord,
     error: &AppError,

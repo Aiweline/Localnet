@@ -623,7 +623,10 @@ pub(crate) fn verify_committed_manifest(
     Ok(())
 }
 
-fn verify_source_snapshot(source_path: &Path, transfer: &TransferRecord) -> Result<(), AppError> {
+pub(super) fn verify_source_snapshot(
+    source_path: &Path,
+    transfer: &TransferRecord,
+) -> Result<(), AppError> {
     let expected_modified_ns = transfer
         .source_modified_ns
         .ok_or_else(|| AppError::InvalidInput("缺少源文件修改时间快照".to_string()))?;

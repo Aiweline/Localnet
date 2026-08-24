@@ -51,6 +51,13 @@ pub struct TransferStreamHeader {
     pub chunk_size: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TransferResumeState {
+    Receiving,
+    Completed,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum ControlRequest {
@@ -85,21 +92,80 @@ pub enum ControlRequest {
     TransferCancel {
         transfer_id: String,
     },
+    TransferResumeQuery {
+        transfer_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum ControlResponse {
     Accepted,
-    Rejected { code: String, message: String },
-    Hello { payload: HelloPayload },
+    Rejected {
+        code: String,
+        message: String,
+    },
+    Hello {
+        payload: HelloPayload,
+    },
+    TransferResume {
+        transfer_id: String,
+        state: TransferResumeState,
+        committed_bytes: u64,
+    },
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ControlRequest, ControlResponse, FILE_PROTOCOL, FILE_PROTOCOL_V2, TransferStreamHeader,
+        ControlRequest, ControlResponse, FILE_PROTOCOL, FILE_PROTOCOL_V2, TransferResumeState,
+        TransferStreamHeader,
     };
+
+    #[test]
+    fn resume_query_and_typed_response_round_trip_without_control_response_ambiguity() {
+        let query = ControlRequest::TransferResumeQuery {
+            transfer_id: "resume-transfer".to_string(),
+        };
+        let response = ControlResponse::TransferResume {
+            transfer_id: "resume-transfer".to_string(),
+            state: TransferResumeState::Receiving,
+            committed_bytes: 8_388_608,
+        };
+
+        let decoded_query: ControlRequest =
+            serde_json::from_slice(&serde_json::to_vec(&query).expect("encode resume query"))
+                .expect("decode resume query");
+        let decoded_response: ControlResponse =
+            serde_json::from_slice(&serde_json::to_vec(&response).expect("encode resume response"))
+                .expect("decode resume response");
+
+        assert!(matches!(
+            decoded_query,
+            ControlRequest::TransferResumeQuery { transfer_id }
+                if transfer_id == "resume-transfer"
+        ));
+        assert!(matches!(
+            decoded_response,
+            ControlResponse::TransferResume {
+                transfer_id,
+                state: TransferResumeState::Receiving,
+                committed_bytes: 8_388_608,
+            } if transfer_id == "resume-transfer"
+        ));
+
+        let completed: ControlResponse = serde_json::from_str(
+            r#"{"type":"transferResume","transfer_id":"resume-transfer","state":"completed","committed_bytes":8388608}"#,
+        )
+        .expect("decode completed resume response");
+        assert!(matches!(
+            completed,
+            ControlResponse::TransferResume {
+                state: TransferResumeState::Completed,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn legacy_hello_messages_default_capabilities_to_empty() {

@@ -33,7 +33,10 @@ use crate::{
     },
     error::AppError,
     identity::LocalIdentity,
-    protocol::{ControlRequest, ControlResponse, FILE_PROTOCOL, HelloPayload, TransferOffer},
+    protocol::{
+        ControlRequest, ControlResponse, FILE_PROTOCOL, FILE_PROTOCOL_V2, HelloPayload,
+        TransferOffer, TransferResumeState,
+    },
     receive_paths::{
         preflight_receive_directory, remove_owned_reservation, reserve_available_receive_path,
     },
@@ -75,6 +78,24 @@ pub enum NetworkCommand {
 }
 
 pub type TransferDecisionCompletion = Arc<Mutex<Option<oneshot::Sender<Result<(), String>>>>>;
+
+fn accept_file_protocol_streams(
+    control: &mut libp2p_stream::Control,
+) -> Result<
+    (
+        libp2p_stream::IncomingStreams,
+        libp2p_stream::IncomingStreams,
+    ),
+    AppError,
+> {
+    let legacy = control
+        .accept(StreamProtocol::new(FILE_PROTOCOL))
+        .map_err(|error| AppError::Network(format!("无法注册旧版文件接收协议：{error}")))?;
+    let resumable = control
+        .accept(StreamProtocol::new(FILE_PROTOCOL_V2))
+        .map_err(|error| AppError::Network(format!("无法注册可恢复文件接收协议：{error}")))?;
+    Ok((legacy, resumable))
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
@@ -208,6 +229,11 @@ enum PendingAction {
         decision_token: Option<String>,
     },
     TransferCancel,
+    TransferResume {
+        peer_id: String,
+        transfer_id: String,
+        expected_bytes: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -251,6 +277,8 @@ struct NetworkRuntime {
     test_events: Mutex<Vec<NetworkEvent>>,
     #[cfg(test)]
     test_order: Mutex<Vec<&'static str>>,
+    #[cfg(test)]
+    test_outgoing_starts: Mutex<Vec<(PeerId, TransferRecord)>>,
 }
 
 impl NetworkRuntime {
@@ -282,10 +310,14 @@ impl NetworkRuntime {
             })
             .build();
         let mut stream_control = swarm.behaviour().stream.new_control();
-        let incoming_streams = stream_control
-            .accept(StreamProtocol::new(FILE_PROTOCOL))
-            .map_err(|error| AppError::Network(format!("无法注册文件接收协议：{error}")))?;
-        transfer::spawn_incoming_transfers(incoming_streams, storage.clone(), app_handle.clone());
+        let (incoming_legacy, incoming_resumable) =
+            accept_file_protocol_streams(&mut stream_control)?;
+        transfer::spawn_incoming_transfers(incoming_legacy, storage.clone(), app_handle.clone());
+        transfer::spawn_incoming_resumable_transfers(
+            incoming_resumable,
+            storage.clone(),
+            app_handle.clone(),
+        );
         swarm
             .listen_on("/ip4/0.0.0.0/tcp/0".parse().expect("static listen address"))
             .map_err(|error| AppError::Network(format!("无法监听局域网端口：{error}")))?;
@@ -318,6 +350,8 @@ impl NetworkRuntime {
             test_events: Mutex::new(Vec::new()),
             #[cfg(test)]
             test_order: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            test_outgoing_starts: Mutex::new(Vec::new()),
         };
         runtime.event_loop().await
     }
@@ -1107,6 +1141,41 @@ impl NetworkRuntime {
                 self.emit(NetworkEvent::TransferUpdated { transfer });
                 Ok(ControlResponse::Accepted)
             }
+            ControlRequest::TransferResumeQuery { transfer_id } => {
+                self.ensure_friend(&peer_id)?;
+                let unauthorized = || AppError::Permission("该可恢复文件传输不可恢复".to_string());
+                let transfer = self
+                    .storage
+                    .get_transfer(&transfer_id)?
+                    .ok_or_else(unauthorized)?;
+                if transfer.peer_id != peer_id.to_string()
+                    || transfer.direction != Direction::Incoming
+                    || transfer.transfer_protocol != 2
+                {
+                    return Err(unauthorized());
+                }
+                super::resumable_transfer::validate_resume_offset(
+                    transfer.file_size,
+                    transfer.chunk_size,
+                    transfer.transferred_bytes,
+                )?;
+                let state = match transfer.status {
+                    TransferStatus::Paused | TransferStatus::Transferring => {
+                        TransferResumeState::Receiving
+                    }
+                    TransferStatus::Completed
+                        if transfer.transferred_bytes == transfer.file_size =>
+                    {
+                        TransferResumeState::Completed
+                    }
+                    _ => return Err(unauthorized()),
+                };
+                Ok(ControlResponse::TransferResume {
+                    transfer_id,
+                    state,
+                    committed_bytes: transfer.transferred_bytes,
+                })
+            }
         }
     }
 
@@ -1174,6 +1243,42 @@ impl NetworkRuntime {
                     format!("接收确认未送达，请重新确认：{message}"),
                 )?;
             }
+            (
+                PendingAction::TransferResume {
+                    peer_id: expected_peer,
+                    transfer_id: expected_transfer,
+                    expected_bytes,
+                },
+                ControlResponse::TransferResume {
+                    transfer_id,
+                    state,
+                    committed_bytes,
+                },
+            ) => {
+                if let Err(error) = self.handle_transfer_resume_response(
+                    peer_id,
+                    &expected_peer,
+                    &expected_transfer,
+                    expected_bytes,
+                    &transfer_id,
+                    state,
+                    committed_bytes,
+                ) {
+                    self.emit(NetworkEvent::NetworkError {
+                        code: error.code().to_string(),
+                        message: format!("恢复文件传输失败，将等待下次安全重试：{error}"),
+                    });
+                }
+            }
+            (
+                PendingAction::TransferResume { transfer_id, .. },
+                ControlResponse::Rejected { message, .. },
+            ) => {
+                self.emit(NetworkEvent::NetworkError {
+                    code: "transfer.resume_rejected".to_string(),
+                    message: format!("对方拒绝恢复文件 {transfer_id}：{message}"),
+                });
+            }
             _ => {}
         }
         Ok(())
@@ -1223,7 +1328,8 @@ impl NetworkRuntime {
                 decision_token: None,
                 ..
             }
-            | PendingAction::TransferCancel => {
+            | PendingAction::TransferCancel
+            | PendingAction::TransferResume { .. } => {
                 tracing::debug!(%error, "control request failed");
             }
         }
@@ -1231,7 +1337,7 @@ impl NetworkRuntime {
     }
 
     fn record_hello(
-        &self,
+        &mut self,
         peer_id: PeerId,
         version: u16,
         nickname: String,
@@ -1248,8 +1354,249 @@ impl NetworkRuntime {
             last_seen: now_rfc3339(),
         };
         self.storage.upsert_peer(&peer)?;
+        let supports_resume = peer
+            .capabilities
+            .iter()
+            .any(|capability| capability == FILE_RESUME_V2_CAPABILITY);
         self.emit(NetworkEvent::PeerDiscovered { peer });
+        if supports_resume && self.storage.is_friend(&peer_id.to_string())? {
+            self.resume_outgoing_for_peer(peer_id)?;
+        }
         Ok(())
+    }
+
+    fn resume_outgoing_for_peer(&mut self, peer_id: PeerId) -> Result<(), AppError> {
+        let peer_id_text = peer_id.to_string();
+        if !self.storage.is_friend(&peer_id_text)?
+            || !self.peer_supports_resumable_transfers(&peer_id_text)?
+        {
+            return Ok(());
+        }
+
+        for transfer in self.storage.list_resumable_outgoing(&peer_id_text)? {
+            let already_pending = self.pending.values().any(|action| {
+                matches!(
+                    action,
+                    PendingAction::TransferResume {
+                        peer_id: pending_peer,
+                        transfer_id: pending_transfer,
+                        ..
+                    } if pending_peer == &peer_id_text
+                        && pending_transfer == &transfer.transfer_id
+                )
+            });
+            if already_pending {
+                continue;
+            }
+            let transfer_id = transfer.transfer_id.clone();
+            match self.send_control_request(
+                peer_id,
+                ControlRequest::TransferResumeQuery {
+                    transfer_id: transfer_id.clone(),
+                },
+            ) {
+                Ok(request_id) => {
+                    self.pending.insert(
+                        request_id,
+                        PendingAction::TransferResume {
+                            peer_id: peer_id_text.clone(),
+                            transfer_id,
+                            expected_bytes: transfer.transferred_bytes,
+                        },
+                    );
+                }
+                Err(error) => {
+                    self.emit(NetworkEvent::NetworkError {
+                        code: error.code().to_string(),
+                        message: format!("查询可恢复文件进度失败，将在下次连接时重试：{error}"),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn peer_supports_resumable_transfers(&self, peer_id: &str) -> Result<bool, AppError> {
+        Ok(self.storage.get_peer(peer_id)?.is_some_and(|peer| {
+            peer.capabilities
+                .iter()
+                .any(|capability| capability == FILE_RESUME_V2_CAPABILITY)
+        }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn handle_transfer_resume_response(
+        &self,
+        response_peer: PeerId,
+        expected_peer: &str,
+        expected_transfer_id: &str,
+        expected_bytes: u64,
+        response_transfer_id: &str,
+        state: TransferResumeState,
+        committed_bytes: u64,
+    ) -> Result<(), AppError> {
+        let response_peer_text = response_peer.to_string();
+        if response_peer_text != expected_peer || response_transfer_id != expected_transfer_id {
+            return Ok(());
+        }
+        if !self.storage.is_friend(expected_peer)?
+            || !self.peer_supports_resumable_transfers(expected_peer)?
+        {
+            return Ok(());
+        }
+        let Some(candidate) = self.storage.get_transfer(expected_transfer_id)? else {
+            return Ok(());
+        };
+        if candidate.peer_id != expected_peer
+            || candidate.direction != Direction::Outgoing
+            || candidate.transfer_protocol != 2
+            || candidate.status != TransferStatus::Paused
+            || candidate.send_claimed
+            || candidate.transferred_bytes != expected_bytes
+        {
+            return Ok(());
+        }
+
+        super::resumable_transfer::validate_resume_offset(
+            candidate.file_size,
+            candidate.chunk_size,
+            committed_bytes,
+        )?;
+        if state == TransferResumeState::Completed && committed_bytes != candidate.file_size {
+            return Err(AppError::InvalidInput(
+                "接收方完成状态未返回完整文件偏移量".to_string(),
+            ));
+        }
+        if !self
+            .storage
+            .try_claim_outgoing_transfer(expected_transfer_id, expected_peer)?
+        {
+            return Ok(());
+        }
+        let claimed = self
+            .storage
+            .get_transfer(expected_transfer_id)?
+            .ok_or_else(|| AppError::Storage("已占用的可恢复发送记录不存在".to_string()))?;
+        let result =
+            self.continue_claimed_resume(response_peer, claimed.clone(), state, committed_bytes);
+        if let Err(error) = &result {
+            if transfer::persist_claimed_outgoing_error(&self.storage, &claimed, error)? {
+                self.publish_claimed_resume_failure(expected_transfer_id)?;
+            }
+        }
+        result
+    }
+
+    fn continue_claimed_resume(
+        &self,
+        peer_id: PeerId,
+        mut claimed: TransferRecord,
+        state: TransferResumeState,
+        committed_bytes: u64,
+    ) -> Result<(), AppError> {
+        if claimed.direction != Direction::Outgoing
+            || claimed.transfer_protocol != 2
+            || claimed.status != TransferStatus::Transferring
+            || !claimed.send_claimed
+        {
+            return Err(AppError::Storage(
+                "可恢复发送占用状态与响应不一致".to_string(),
+            ));
+        }
+        if state == TransferResumeState::Completed {
+            if !self
+                .storage
+                .try_complete_claimed_outgoing_transfer(&claimed.transfer_id, &claimed.peer_id)?
+            {
+                return Err(AppError::Storage(
+                    "接收方已完成，但本地发送完成状态已变化".to_string(),
+                ));
+            }
+            let completed = self
+                .storage
+                .get_transfer(&claimed.transfer_id)?
+                .ok_or_else(|| AppError::Storage("完成的可恢复发送记录不存在".to_string()))?;
+            self.storage.update_message_status(
+                &completed.transfer_id,
+                MessageStatus::Delivered,
+                None,
+            )?;
+            self.emit(NetworkEvent::TransferUpdated {
+                transfer: completed.clone(),
+            });
+            self.emit(NetworkEvent::MessageStatusChanged {
+                message_id: completed.transfer_id,
+                status: MessageStatus::Delivered,
+                error: None,
+            });
+            return Ok(());
+        }
+
+        if committed_bytes != claimed.transferred_bytes {
+            if !self.storage.commit_claimed_outgoing_progress(
+                &claimed.transfer_id,
+                &claimed.peer_id,
+                claimed.transferred_bytes,
+                committed_bytes,
+            )? {
+                return Err(AppError::Storage(
+                    "无法采用接收方已提交的恢复偏移量".to_string(),
+                ));
+            }
+            claimed = self
+                .storage
+                .get_transfer(&claimed.transfer_id)?
+                .ok_or_else(|| AppError::Storage("更新后的可恢复发送记录不存在".to_string()))?;
+        }
+        let source_path = claimed
+            .local_path
+            .as_deref()
+            .map(PathBuf::from)
+            .ok_or_else(|| AppError::InvalidInput("可恢复发送缺少源文件路径".to_string()))?;
+        super::resumable_transfer::verify_source_snapshot(&source_path, &claimed)?;
+        self.start_claimed_outgoing_transfer(peer_id, claimed);
+        Ok(())
+    }
+
+    fn publish_claimed_resume_failure(&self, transfer_id: &str) -> Result<(), AppError> {
+        let Some(updated) = self.storage.get_transfer(transfer_id)? else {
+            return Ok(());
+        };
+        let terminal = updated.status == TransferStatus::Failed;
+        self.emit(NetworkEvent::TransferUpdated {
+            transfer: updated.clone(),
+        });
+        if terminal {
+            self.storage.update_message_status(
+                &updated.transfer_id,
+                MessageStatus::Failed,
+                updated.error.as_deref(),
+            )?;
+            self.emit(NetworkEvent::MessageStatusChanged {
+                message_id: updated.transfer_id,
+                status: MessageStatus::Failed,
+                error: updated.error,
+            });
+        }
+        Ok(())
+    }
+
+    fn start_claimed_outgoing_transfer(&self, peer_id: PeerId, transfer: TransferRecord) {
+        #[cfg(test)]
+        {
+            self.test_outgoing_starts
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((peer_id, transfer));
+        }
+        #[cfg(not(test))]
+        transfer::spawn_claimed_outgoing_resumable_transfer(
+            self.stream_control.clone(),
+            peer_id,
+            transfer,
+            self.storage.clone(),
+            self.app_handle.clone(),
+        );
     }
 
     fn mark_offline_if_unreachable(&self, peer_id: PeerId) -> Result<(), AppError> {
@@ -1886,19 +2233,22 @@ mod tests {
 
     use super::{
         AcceptedSubmissionOutcome, NetworkCommand, NetworkEvent, NetworkRuntime, PendingAction,
-        PendingRequestId, TestControlTransport, automatic_receive_path,
-        finalize_accepted_transfer_submission, persist_incoming_offer_with_preflight,
-        persist_incoming_offer_with_preflight_and_accept, validate_transfer_offer,
+        PendingRequestId, TestControlTransport, accept_file_protocol_streams,
+        automatic_receive_path, finalize_accepted_transfer_submission,
+        persist_incoming_offer_with_preflight, persist_incoming_offer_with_preflight_and_accept,
+        validate_transfer_offer,
     };
     use crate::{
         domain::{
-            Direction, Friend, FriendRequest, FriendRequestStatus, LocalProfile, PROTOCOL_VERSION,
-            Platform, TransferKind, TransferPreferences, TransferStatus, now_rfc3339,
+            ChatMessage, Direction, Friend, FriendRequest, FriendRequestStatus, LocalProfile,
+            MessageKind, MessageStatus, PROTOCOL_VERSION, Platform, TransferKind,
+            TransferPreferences, TransferRecord, TransferStatus, now_rfc3339,
         },
         error::AppError,
-        protocol::TransferOffer,
+        protocol::{ControlRequest, ControlResponse, TransferOffer, TransferResumeState},
         receive_paths::{preflight_receive_directory, reservation_is_owned, reserve_receive_path},
         storage::{IncomingAcceptancePhase, Storage},
+        transfer_manifest::build_manifest,
         transfer_policy::{TRANSFER_CHUNK_BYTES, TransferProtocol},
         volume_preflight::{VolumeSnapshot, validate_volume},
     };
@@ -1906,6 +2256,30 @@ mod tests {
     const MIB: u64 = 1024 * 1024;
     const GIB: u64 = 1024 * MIB;
     const DESTINATION_RESERVE_BYTES: u64 = 64 * MIB;
+
+    #[test]
+    fn production_file_acceptors_register_v1_and_v2_independently() {
+        let behaviour = libp2p_stream::Behaviour::new();
+        let mut control = behaviour.new_control();
+
+        let (_legacy, _resumable) =
+            accept_file_protocol_streams(&mut control).expect("register both file protocols");
+
+        assert!(
+            control
+                .accept(libp2p::StreamProtocol::new(crate::protocol::FILE_PROTOCOL))
+                .is_err(),
+            "v1 must already have its own acceptor"
+        );
+        assert!(
+            control
+                .accept(libp2p::StreamProtocol::new(
+                    crate::protocol::FILE_PROTOCOL_V2,
+                ))
+                .is_err(),
+            "v2 must already have its own acceptor"
+        );
+    }
 
     fn automatic_fixture(name: &str) -> (PathBuf, Storage, TransferPreferences) {
         let directory = std::env::temp_dir().join(format!(
@@ -1994,6 +2368,7 @@ mod tests {
             test_control_transport: Some(TestControlTransport::default()),
             test_events: Mutex::new(Vec::new()),
             test_order: Mutex::new(Vec::new()),
+            test_outgoing_starts: Mutex::new(Vec::new()),
         }
     }
 
@@ -2032,6 +2407,974 @@ mod tests {
                 &now,
             )
             .expect("accept runtime friend");
+    }
+
+    fn resume_record(
+        transfer_id: &str,
+        peer_id: &str,
+        direction: Direction,
+        transfer_protocol: u8,
+        status: TransferStatus,
+        transferred_bytes: u64,
+    ) -> TransferRecord {
+        let file_size = u64::from(TRANSFER_CHUNK_BYTES) * 2;
+        let now = now_rfc3339();
+        TransferRecord {
+            transfer_id: transfer_id.to_string(),
+            peer_id: peer_id.to_string(),
+            direction,
+            kind: TransferKind::File,
+            file_name: "resume.bin".to_string(),
+            file_size,
+            mime_type: "application/octet-stream".to_string(),
+            sha256: "0".repeat(64),
+            local_path: None,
+            destination_reserved: false,
+            reservation_token: None,
+            transfer_protocol,
+            chunk_size: if transfer_protocol == TransferProtocol::ResumableV2 as u8 {
+                TRANSFER_CHUNK_BYTES
+            } else {
+                0
+            },
+            chunk_count: if transfer_protocol == TransferProtocol::ResumableV2 as u8 {
+                2
+            } else {
+                0
+            },
+            manifest_sha256: (transfer_protocol == TransferProtocol::ResumableV2 as u8)
+                .then(|| "1".repeat(64)),
+            partial_path: None,
+            source_modified_ns: None,
+            send_claimed: false,
+            transferred_bytes,
+            status,
+            error: None,
+            created_at: now.clone(),
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn production_resume_query_reports_receiver_authoritative_receiving_state() {
+        let (directory, storage, _) = automatic_fixture("resume-query-receiving");
+        let remote_peer = deterministic_peer_id(40);
+        add_runtime_friend(&storage, &remote_peer.to_string());
+        let transfer_id = uuid::Uuid::now_v7().to_string();
+        let committed_bytes = u64::from(TRANSFER_CHUNK_BYTES);
+        storage
+            .upsert_transfer(&resume_record(
+                &transfer_id,
+                &remote_peer.to_string(),
+                Direction::Incoming,
+                TransferProtocol::ResumableV2 as u8,
+                TransferStatus::Paused,
+                committed_bytes,
+            ))
+            .expect("persist paused incoming transfer");
+        let mut runtime = production_test_runtime(storage.clone(), &directory, remote_peer);
+
+        let response = runtime
+            .handle_inbound_request(
+                remote_peer,
+                ControlRequest::TransferResumeQuery {
+                    transfer_id: transfer_id.clone(),
+                },
+            )
+            .expect("authorized paused transfer returns resume state");
+
+        assert!(matches!(
+            response,
+            ControlResponse::TransferResume {
+                transfer_id: response_id,
+                state: TransferResumeState::Receiving,
+                committed_bytes: response_bytes,
+            } if response_id == transfer_id && response_bytes == committed_bytes
+        ));
+        drop(runtime);
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove receiving query fixture");
+    }
+
+    #[test]
+    fn production_resume_query_reports_completed_only_at_exact_file_size() {
+        let (directory, storage, _) = automatic_fixture("resume-query-completed");
+        let remote_peer = deterministic_peer_id(41);
+        add_runtime_friend(&storage, &remote_peer.to_string());
+        let transfer_id = uuid::Uuid::now_v7().to_string();
+        let mut completed = resume_record(
+            &transfer_id,
+            &remote_peer.to_string(),
+            Direction::Incoming,
+            TransferProtocol::ResumableV2 as u8,
+            TransferStatus::Completed,
+            0,
+        );
+        completed.transferred_bytes = completed.file_size;
+        storage
+            .upsert_transfer(&completed)
+            .expect("persist completed incoming transfer");
+        let mut runtime = production_test_runtime(storage.clone(), &directory, remote_peer);
+
+        let response = runtime
+            .handle_inbound_request(
+                remote_peer,
+                ControlRequest::TransferResumeQuery {
+                    transfer_id: transfer_id.clone(),
+                },
+            )
+            .expect("authorized completed transfer returns completed state");
+
+        assert!(matches!(
+            response,
+            ControlResponse::TransferResume {
+                transfer_id: response_id,
+                state: TransferResumeState::Completed,
+                committed_bytes,
+            } if response_id == transfer_id && committed_bytes == completed.file_size
+        ));
+        drop(runtime);
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove completed query fixture");
+    }
+
+    #[test]
+    fn production_resume_query_rejects_non_friend_before_transfer_lookup() {
+        let (directory, storage, _) = automatic_fixture("resume-query-non-friend");
+        let remote_peer = deterministic_peer_id(42);
+        let mut runtime = production_test_runtime(storage.clone(), &directory, remote_peer);
+
+        let error = runtime
+            .handle_inbound_request(
+                remote_peer,
+                ControlRequest::TransferResumeQuery {
+                    transfer_id: uuid::Uuid::now_v7().to_string(),
+                },
+            )
+            .expect_err("non-friend resume query must be rejected");
+
+        assert_eq!(error.code(), "not_friend");
+        drop(runtime);
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove non-friend query fixture");
+    }
+
+    #[test]
+    fn production_resume_query_uses_one_non_leaking_rejection_for_unauthorized_rows() {
+        let (directory, storage, _) = automatic_fixture("resume-query-unauthorized");
+        let owner_peer = deterministic_peer_id(43);
+        let querying_peer = deterministic_peer_id(44);
+        add_runtime_friend(&storage, &querying_peer.to_string());
+        let cases = [
+            resume_record(
+                &uuid::Uuid::now_v7().to_string(),
+                &owner_peer.to_string(),
+                Direction::Incoming,
+                TransferProtocol::ResumableV2 as u8,
+                TransferStatus::Paused,
+                0,
+            ),
+            resume_record(
+                &uuid::Uuid::now_v7().to_string(),
+                &querying_peer.to_string(),
+                Direction::Outgoing,
+                TransferProtocol::ResumableV2 as u8,
+                TransferStatus::Paused,
+                0,
+            ),
+            resume_record(
+                &uuid::Uuid::now_v7().to_string(),
+                &querying_peer.to_string(),
+                Direction::Incoming,
+                TransferProtocol::LegacyV1 as u8,
+                TransferStatus::Transferring,
+                0,
+            ),
+            resume_record(
+                &uuid::Uuid::now_v7().to_string(),
+                &querying_peer.to_string(),
+                Direction::Incoming,
+                TransferProtocol::ResumableV2 as u8,
+                TransferStatus::Cancelled,
+                0,
+            ),
+        ];
+        for transfer in &cases {
+            storage
+                .upsert_transfer(transfer)
+                .expect("persist unauthorized resume fixture");
+        }
+        let mut runtime = production_test_runtime(storage.clone(), &directory, querying_peer);
+        let unknown = uuid::Uuid::now_v7().to_string();
+
+        for transfer_id in cases
+            .iter()
+            .map(|transfer| transfer.transfer_id.as_str())
+            .chain(std::iter::once(unknown.as_str()))
+        {
+            let error = runtime
+                .handle_inbound_request(
+                    querying_peer,
+                    ControlRequest::TransferResumeQuery {
+                        transfer_id: transfer_id.to_string(),
+                    },
+                )
+                .expect_err("unauthorized resume row must be rejected");
+            assert_eq!(error.code(), "permission_error");
+            assert_eq!(error.to_string(), "该可恢复文件传输不可恢复");
+        }
+
+        drop(runtime);
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove unauthorized query fixture");
+    }
+
+    #[test]
+    fn production_inbound_capability_hello_schedules_paused_outgoing_once() {
+        let (directory, storage, _) = automatic_fixture("resume-inbound-hello");
+        let remote_peer = deterministic_peer_id(45);
+        add_runtime_friend(&storage, &remote_peer.to_string());
+        let transfer_id = uuid::Uuid::now_v7().to_string();
+        storage
+            .upsert_transfer(&resume_record(
+                &transfer_id,
+                &remote_peer.to_string(),
+                Direction::Outgoing,
+                TransferProtocol::ResumableV2 as u8,
+                TransferStatus::Paused,
+                0,
+            ))
+            .expect("persist paused outgoing transfer");
+        let mut runtime = production_test_runtime(storage.clone(), &directory, remote_peer);
+        let hello = || ControlRequest::Hello {
+            version: PROTOCOL_VERSION,
+            nickname: "Resume Peer".to_string(),
+            platform: Platform::current(),
+            capabilities: vec![crate::transfer_policy::FILE_RESUME_V2_CAPABILITY.to_string()],
+        };
+
+        for _ in 0..2 {
+            assert!(matches!(
+                runtime
+                    .handle_inbound_request(remote_peer, hello())
+                    .expect("capability hello succeeds"),
+                ControlResponse::Hello { .. }
+            ));
+        }
+
+        let requests = &runtime
+            .test_control_transport
+            .as_ref()
+            .expect("test control transport")
+            .requests;
+        assert!(matches!(
+            requests.as_slice(),
+            [(peer_id, ControlRequest::TransferResumeQuery { transfer_id: requested })]
+                if *peer_id == remote_peer && requested == &transfer_id
+        ));
+        assert_eq!(runtime.pending.len(), 1);
+        let persisted_peer = storage
+            .get_peer(&remote_peer.to_string())
+            .expect("load persisted hello peer")
+            .expect("hello peer exists");
+        assert!(persisted_peer.online);
+        assert_eq!(
+            persisted_peer.capabilities,
+            vec![crate::transfer_policy::FILE_RESUME_V2_CAPABILITY]
+        );
+
+        drop(runtime);
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove inbound hello fixture");
+    }
+
+    #[test]
+    fn production_outbound_hello_response_schedules_paused_outgoing() {
+        let (directory, storage, _) = automatic_fixture("resume-outbound-hello");
+        let remote_peer = deterministic_peer_id(46);
+        add_runtime_friend(&storage, &remote_peer.to_string());
+        let transfer_id = uuid::Uuid::now_v7().to_string();
+        storage
+            .upsert_transfer(&resume_record(
+                &transfer_id,
+                &remote_peer.to_string(),
+                Direction::Outgoing,
+                TransferProtocol::ResumableV2 as u8,
+                TransferStatus::Paused,
+                0,
+            ))
+            .expect("persist paused outgoing transfer");
+        let mut runtime = production_test_runtime(storage.clone(), &directory, remote_peer);
+        runtime
+            .pending
+            .insert(PendingRequestId::Test(77), PendingAction::Hello);
+
+        runtime
+            .handle_outbound_response(
+                remote_peer,
+                PendingRequestId::Test(77),
+                ControlResponse::Hello {
+                    payload: crate::protocol::HelloPayload {
+                        version: PROTOCOL_VERSION,
+                        nickname: "Resume Peer".to_string(),
+                        platform: Platform::current(),
+                        capabilities: vec![
+                            crate::transfer_policy::FILE_RESUME_V2_CAPABILITY.to_string(),
+                        ],
+                    },
+                },
+            )
+            .expect("capability-bearing hello response succeeds");
+
+        assert!(matches!(
+            runtime
+                .test_control_transport
+                .as_ref()
+                .expect("test control transport")
+                .requests
+                .as_slice(),
+            [(peer_id, ControlRequest::TransferResumeQuery { transfer_id: requested })]
+                if *peer_id == remote_peer && requested == &transfer_id
+        ));
+        drop(runtime);
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove outbound hello fixture");
+    }
+
+    #[test]
+    fn production_legacy_or_non_friend_hello_never_schedules_resume_queries() {
+        for (name, friend, capabilities) in [
+            ("legacy", true, Vec::<String>::new()),
+            (
+                "non-friend",
+                false,
+                vec![crate::transfer_policy::FILE_RESUME_V2_CAPABILITY.to_string()],
+            ),
+        ] {
+            let (directory, storage, _) = automatic_fixture(&format!("resume-hello-{name}"));
+            let remote_peer = deterministic_peer_id(if friend { 47 } else { 48 });
+            if friend {
+                add_runtime_friend(&storage, &remote_peer.to_string());
+            }
+            storage
+                .upsert_transfer(&resume_record(
+                    &uuid::Uuid::now_v7().to_string(),
+                    &remote_peer.to_string(),
+                    Direction::Outgoing,
+                    TransferProtocol::ResumableV2 as u8,
+                    TransferStatus::Paused,
+                    0,
+                ))
+                .expect("persist paused outgoing transfer");
+            let mut runtime = production_test_runtime(storage.clone(), &directory, remote_peer);
+
+            runtime
+                .handle_inbound_request(
+                    remote_peer,
+                    ControlRequest::Hello {
+                        version: PROTOCOL_VERSION,
+                        nickname: "Compatibility Peer".to_string(),
+                        platform: Platform::current(),
+                        capabilities,
+                    },
+                )
+                .expect("compatibility hello remains supported");
+
+            assert!(
+                runtime
+                    .test_control_transport
+                    .as_ref()
+                    .expect("test control transport")
+                    .requests
+                    .is_empty()
+            );
+            assert!(runtime.pending.is_empty());
+            drop(runtime);
+            drop(storage);
+            fs::remove_dir_all(directory).expect("remove compatibility hello fixture");
+        }
+    }
+
+    fn persist_paused_outgoing(
+        directory: &std::path::Path,
+        storage: &Storage,
+        peer_id: &str,
+        label: &str,
+        source_bytes: &[u8],
+        transferred_bytes: u64,
+    ) -> TransferRecord {
+        let source = directory.join(format!("{label}-source.bin"));
+        fs::write(&source, source_bytes).expect("write resume source");
+        let manifest =
+            build_manifest(&source, TRANSFER_CHUNK_BYTES).expect("build resume manifest");
+        let transfer_id = uuid::Uuid::now_v7().to_string();
+        let now = now_rfc3339();
+        let transfer = TransferRecord {
+            transfer_id: transfer_id.clone(),
+            peer_id: peer_id.to_string(),
+            direction: Direction::Outgoing,
+            kind: TransferKind::File,
+            file_name: format!("{label}.bin"),
+            file_size: manifest.file_size,
+            mime_type: "application/octet-stream".to_string(),
+            sha256: hex::encode(manifest.file_sha256),
+            local_path: Some(source.to_string_lossy().into_owned()),
+            destination_reserved: false,
+            reservation_token: None,
+            transfer_protocol: TransferProtocol::ResumableV2 as u8,
+            chunk_size: TRANSFER_CHUNK_BYTES,
+            chunk_count: u32::try_from(manifest.chunks.len()).expect("small test manifest"),
+            manifest_sha256: Some(hex::encode(manifest.manifest_sha256)),
+            partial_path: None,
+            source_modified_ns: Some(manifest.source_modified_ns),
+            send_claimed: false,
+            transferred_bytes,
+            status: TransferStatus::Paused,
+            error: Some("connection reset".to_string()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        storage
+            .create_outgoing_transfer_with_manifest(&transfer, &manifest.chunks)
+            .expect("persist paused outgoing manifest");
+        assert!(
+            storage
+                .insert_message(&ChatMessage {
+                    message_id: transfer_id,
+                    peer_id: peer_id.to_string(),
+                    direction: Direction::Outgoing,
+                    kind: MessageKind::File,
+                    body: None,
+                    local_path: transfer.local_path.clone(),
+                    file_name: Some(transfer.file_name.clone()),
+                    file_size: Some(transfer.file_size),
+                    status: MessageStatus::Sending,
+                    error: None,
+                    created_at: now,
+                })
+                .expect("persist outgoing resume message")
+        );
+        transfer
+    }
+
+    fn schedule_resume_query(runtime: &mut NetworkRuntime, remote_peer: libp2p::PeerId) {
+        assert!(matches!(
+            runtime
+                .handle_inbound_request(
+                    remote_peer,
+                    ControlRequest::Hello {
+                        version: PROTOCOL_VERSION,
+                        nickname: "Resume Peer".to_string(),
+                        platform: Platform::current(),
+                        capabilities: vec![
+                            crate::transfer_policy::FILE_RESUME_V2_CAPABILITY.to_string(),
+                        ],
+                    },
+                )
+                .expect("schedule resume through production Hello handler"),
+            ControlResponse::Hello { .. }
+        ));
+    }
+
+    #[test]
+    fn production_receiving_response_claims_exact_transfer_and_launches_v2_suffix_once() {
+        let (directory, storage, _) = automatic_fixture("resume-receiving-response");
+        let remote_peer = deterministic_peer_id(49);
+        add_runtime_friend(&storage, &remote_peer.to_string());
+        let transfer = persist_paused_outgoing(
+            &directory,
+            &storage,
+            &remote_peer.to_string(),
+            "receiving-response",
+            b"resume payload",
+            0,
+        );
+        let mut runtime = production_test_runtime(storage.clone(), &directory, remote_peer);
+        schedule_resume_query(&mut runtime, remote_peer);
+
+        let response = ControlResponse::TransferResume {
+            transfer_id: transfer.transfer_id.clone(),
+            state: TransferResumeState::Receiving,
+            committed_bytes: 0,
+        };
+        runtime
+            .handle_outbound_response(remote_peer, PendingRequestId::Test(1), response.clone())
+            .expect("first receiving response launches suffix");
+        runtime
+            .handle_outbound_response(remote_peer, PendingRequestId::Test(1), response)
+            .expect("duplicate response loses its retired request ID");
+
+        let starts = runtime.test_outgoing_starts.lock().unwrap();
+        assert!(matches!(
+            starts.as_slice(),
+            [(peer_id, started)]
+                if *peer_id == remote_peer
+                    && started.transfer_id == transfer.transfer_id
+                    && started.transferred_bytes == 0
+                    && started.send_claimed
+        ));
+        drop(starts);
+        let claimed = storage
+            .get_transfer(&transfer.transfer_id)
+            .expect("load claimed resume")
+            .expect("claimed resume exists");
+        assert_eq!(claimed.status, TransferStatus::Transferring);
+        assert!(claimed.send_claimed);
+        drop(runtime);
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove receiving response fixture");
+    }
+
+    #[test]
+    fn production_receiving_response_adopts_receiver_ahead_committed_boundary() {
+        let (directory, storage, _) = automatic_fixture("resume-receiver-ahead");
+        let remote_peer = deterministic_peer_id(50);
+        add_runtime_friend(&storage, &remote_peer.to_string());
+        let transfer = persist_paused_outgoing(
+            &directory,
+            &storage,
+            &remote_peer.to_string(),
+            "receiver-ahead",
+            b"receiver already committed this payload",
+            0,
+        );
+        let mut runtime = production_test_runtime(storage.clone(), &directory, remote_peer);
+        schedule_resume_query(&mut runtime, remote_peer);
+
+        runtime
+            .handle_outbound_response(
+                remote_peer,
+                PendingRequestId::Test(1),
+                ControlResponse::TransferResume {
+                    transfer_id: transfer.transfer_id.clone(),
+                    state: TransferResumeState::Receiving,
+                    committed_bytes: transfer.file_size,
+                },
+            )
+            .expect("receiver-ahead response launches finalization handshake");
+
+        let starts = runtime.test_outgoing_starts.lock().unwrap();
+        assert!(matches!(
+            starts.as_slice(),
+            [(_, started)] if started.transferred_bytes == transfer.file_size
+        ));
+        drop(starts);
+        assert_eq!(
+            storage
+                .get_transfer(&transfer.transfer_id)
+                .unwrap()
+                .unwrap()
+                .transferred_bytes,
+            transfer.file_size
+        );
+        drop(runtime);
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove receiver-ahead fixture");
+    }
+
+    #[test]
+    fn production_completed_response_recovers_lost_final_ack_without_retransmit() {
+        let (directory, storage, _) = automatic_fixture("resume-lost-final-ack");
+        let remote_peer = deterministic_peer_id(51);
+        add_runtime_friend(&storage, &remote_peer.to_string());
+        let transfer = persist_paused_outgoing(
+            &directory,
+            &storage,
+            &remote_peer.to_string(),
+            "lost-final-ack",
+            b"final acknowledgement was lost",
+            0,
+        );
+        let mut runtime = production_test_runtime(storage.clone(), &directory, remote_peer);
+        schedule_resume_query(&mut runtime, remote_peer);
+
+        runtime
+            .handle_outbound_response(
+                remote_peer,
+                PendingRequestId::Test(1),
+                ControlResponse::TransferResume {
+                    transfer_id: transfer.transfer_id.clone(),
+                    state: TransferResumeState::Completed,
+                    committed_bytes: transfer.file_size,
+                },
+            )
+            .expect("completed response repairs lost final acknowledgement");
+
+        assert!(runtime.test_outgoing_starts.lock().unwrap().is_empty());
+        let completed = storage
+            .get_transfer(&transfer.transfer_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.status, TransferStatus::Completed);
+        assert_eq!(completed.transferred_bytes, transfer.file_size);
+        assert!(!completed.send_claimed);
+        let message = storage
+            .get_message(&transfer.transfer_id)
+            .unwrap()
+            .expect("outgoing file message exists");
+        assert_eq!(message.status, MessageStatus::Delivered);
+        assert!(
+            runtime
+                .test_events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(
+                    event,
+                    NetworkEvent::MessageStatusChanged {
+                        message_id,
+                        status: MessageStatus::Delivered,
+                        ..
+                    } if message_id == &transfer.transfer_id
+                ))
+        );
+        drop(runtime);
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove lost final ack fixture");
+    }
+
+    #[test]
+    fn production_receiving_response_adopts_receiver_authoritative_rollback_boundary() {
+        let (directory, storage, _) = automatic_fixture("resume-receiver-rollback");
+        let remote_peer = deterministic_peer_id(56);
+        add_runtime_friend(&storage, &remote_peer.to_string());
+        let source_bytes = vec![9_u8; usize::try_from(TRANSFER_CHUNK_BYTES).unwrap() + 1];
+        let transfer = persist_paused_outgoing(
+            &directory,
+            &storage,
+            &remote_peer.to_string(),
+            "receiver-rollback",
+            &source_bytes,
+            u64::from(TRANSFER_CHUNK_BYTES),
+        );
+        let mut runtime = production_test_runtime(storage.clone(), &directory, remote_peer);
+        schedule_resume_query(&mut runtime, remote_peer);
+
+        runtime
+            .handle_outbound_response(
+                remote_peer,
+                PendingRequestId::Test(1),
+                ControlResponse::TransferResume {
+                    transfer_id: transfer.transfer_id.clone(),
+                    state: TransferResumeState::Receiving,
+                    committed_bytes: 0,
+                },
+            )
+            .expect("fresh receiver rollback boundary is authoritative");
+
+        let starts = runtime.test_outgoing_starts.lock().unwrap();
+        assert!(matches!(
+            starts.as_slice(),
+            [(_, started)] if started.transferred_bytes == 0 && started.send_claimed
+        ));
+        drop(starts);
+        let claimed = storage
+            .get_transfer(&transfer.transfer_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.transferred_bytes, 0);
+        assert_eq!(claimed.status, TransferStatus::Transferring);
+        assert!(claimed.send_claimed);
+
+        drop(runtime);
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove receiver rollback fixture");
+    }
+
+    #[test]
+    fn production_invalid_or_stale_resume_offset_never_opens_a_stream() {
+        let (directory, storage, _) = automatic_fixture("resume-invalid-offset");
+        let remote_peer = deterministic_peer_id(52);
+        add_runtime_friend(&storage, &remote_peer.to_string());
+        let invalid = persist_paused_outgoing(
+            &directory,
+            &storage,
+            &remote_peer.to_string(),
+            "invalid-offset",
+            b"invalid offset payload",
+            0,
+        );
+        let mut runtime = production_test_runtime(storage.clone(), &directory, remote_peer);
+        schedule_resume_query(&mut runtime, remote_peer);
+
+        runtime
+            .handle_outbound_response(
+                remote_peer,
+                PendingRequestId::Test(1),
+                ControlResponse::TransferResume {
+                    transfer_id: invalid.transfer_id.clone(),
+                    state: TransferResumeState::Receiving,
+                    committed_bytes: 1,
+                },
+            )
+            .expect("invalid remote offset is contained without stopping runtime");
+        assert!(runtime.test_outgoing_starts.lock().unwrap().is_empty());
+        let retained = storage.get_transfer(&invalid.transfer_id).unwrap().unwrap();
+        assert_eq!(retained.status, TransferStatus::Paused);
+        assert!(!retained.send_claimed);
+        assert!(
+            runtime
+                .test_events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(
+                    event,
+                    NetworkEvent::NetworkError { message, .. }
+                        if message.contains("恢复偏移量")
+                ))
+        );
+
+        let source_bytes = vec![7_u8; usize::try_from(TRANSFER_CHUNK_BYTES).unwrap() + 1];
+        let stale = persist_paused_outgoing(
+            &directory,
+            &storage,
+            &remote_peer.to_string(),
+            "stale-offset",
+            &source_bytes,
+            0,
+        );
+        schedule_resume_query(&mut runtime, remote_peer);
+        assert!(
+            storage
+                .try_claim_outgoing_transfer(&stale.transfer_id, &stale.peer_id)
+                .expect("simulate newer exact resume claim")
+        );
+        assert!(
+            storage
+                .commit_claimed_outgoing_progress(
+                    &stale.transfer_id,
+                    &stale.peer_id,
+                    0,
+                    u64::from(TRANSFER_CHUNK_BYTES),
+                )
+                .expect("advance newer receiver-authoritative progress")
+        );
+        assert!(
+            storage
+                .try_pause_claimed_outgoing_transfer(
+                    &stale.transfer_id,
+                    &stale.peer_id,
+                    "newer attempt paused",
+                )
+                .expect("release newer attempt")
+        );
+        runtime
+            .handle_outbound_response(
+                remote_peer,
+                PendingRequestId::Test(2),
+                ControlResponse::TransferResume {
+                    transfer_id: stale.transfer_id.clone(),
+                    state: TransferResumeState::Receiving,
+                    committed_bytes: 0,
+                },
+            )
+            .expect("stale response loses expected-progress token");
+        let retained = storage.get_transfer(&stale.transfer_id).unwrap().unwrap();
+        assert_eq!(retained.status, TransferStatus::Paused);
+        assert_eq!(retained.transferred_bytes, u64::from(TRANSFER_CHUNK_BYTES));
+        assert!(!retained.send_claimed);
+        assert!(runtime.test_outgoing_starts.lock().unwrap().is_empty());
+
+        drop(runtime);
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove invalid offset fixture");
+    }
+
+    #[test]
+    fn production_cancel_or_wrong_peer_response_loses_resume_claim_cas() {
+        let (directory, storage, _) = automatic_fixture("resume-cancel-race");
+        let remote_peer = deterministic_peer_id(53);
+        let wrong_peer = deterministic_peer_id(54);
+        add_runtime_friend(&storage, &remote_peer.to_string());
+        let cancelled = persist_paused_outgoing(
+            &directory,
+            &storage,
+            &remote_peer.to_string(),
+            "cancel-race",
+            b"cancelled before response",
+            0,
+        );
+        let mut runtime = production_test_runtime(storage.clone(), &directory, remote_peer);
+        schedule_resume_query(&mut runtime, remote_peer);
+        assert!(
+            storage
+                .try_cancel_unclaimed_outgoing_transfer(
+                    &cancelled.transfer_id,
+                    &cancelled.peer_id,
+                    "cancelled",
+                )
+                .expect("cancel wins before response")
+        );
+
+        runtime
+            .handle_outbound_response(
+                remote_peer,
+                PendingRequestId::Test(1),
+                ControlResponse::TransferResume {
+                    transfer_id: cancelled.transfer_id.clone(),
+                    state: TransferResumeState::Receiving,
+                    committed_bytes: 0,
+                },
+            )
+            .expect("late response loses cancelled row CAS");
+        assert_eq!(
+            storage
+                .get_transfer(&cancelled.transfer_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            TransferStatus::Cancelled
+        );
+
+        let wrong = persist_paused_outgoing(
+            &directory,
+            &storage,
+            &remote_peer.to_string(),
+            "wrong-peer-response",
+            b"wrong peer response",
+            0,
+        );
+        schedule_resume_query(&mut runtime, remote_peer);
+        runtime
+            .handle_outbound_response(
+                wrong_peer,
+                PendingRequestId::Test(2),
+                ControlResponse::TransferResume {
+                    transfer_id: wrong.transfer_id.clone(),
+                    state: TransferResumeState::Receiving,
+                    committed_bytes: 0,
+                },
+            )
+            .expect("wrong peer response is contained");
+        let retained = storage.get_transfer(&wrong.transfer_id).unwrap().unwrap();
+        assert_eq!(retained.status, TransferStatus::Paused);
+        assert!(!retained.send_claimed);
+        assert!(runtime.test_outgoing_starts.lock().unwrap().is_empty());
+
+        drop(runtime);
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove cancel race fixture");
+    }
+
+    #[test]
+    fn production_late_resume_response_loses_after_capability_is_withdrawn() {
+        let (directory, storage, _) = automatic_fixture("resume-capability-withdrawn");
+        let remote_peer = deterministic_peer_id(57);
+        add_runtime_friend(&storage, &remote_peer.to_string());
+        let transfer = persist_paused_outgoing(
+            &directory,
+            &storage,
+            &remote_peer.to_string(),
+            "capability-withdrawn",
+            b"capability changed",
+            0,
+        );
+        let mut runtime = production_test_runtime(storage.clone(), &directory, remote_peer);
+        schedule_resume_query(&mut runtime, remote_peer);
+        runtime
+            .handle_inbound_request(
+                remote_peer,
+                ControlRequest::Hello {
+                    version: PROTOCOL_VERSION,
+                    nickname: "Legacy Peer".to_string(),
+                    platform: Platform::current(),
+                    capabilities: Vec::new(),
+                },
+            )
+            .expect("legacy capability update remains compatible");
+
+        runtime
+            .handle_outbound_response(
+                remote_peer,
+                PendingRequestId::Test(1),
+                ControlResponse::TransferResume {
+                    transfer_id: transfer.transfer_id.clone(),
+                    state: TransferResumeState::Receiving,
+                    committed_bytes: 0,
+                },
+            )
+            .expect("late pre-downgrade response is contained");
+
+        assert!(runtime.test_outgoing_starts.lock().unwrap().is_empty());
+        let retained = storage
+            .get_transfer(&transfer.transfer_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.status, TransferStatus::Paused);
+        assert!(!retained.send_claimed);
+        assert!(
+            storage
+                .get_peer(&remote_peer.to_string())
+                .unwrap()
+                .unwrap()
+                .capabilities
+                .is_empty()
+        );
+
+        drop(runtime);
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove capability withdrawal fixture");
+    }
+
+    #[test]
+    fn production_resume_response_fails_changed_source_before_stream_open() {
+        let (directory, storage, _) = automatic_fixture("resume-source-mutation");
+        let remote_peer = deterministic_peer_id(55);
+        add_runtime_friend(&storage, &remote_peer.to_string());
+        let transfer = persist_paused_outgoing(
+            &directory,
+            &storage,
+            &remote_peer.to_string(),
+            "source-mutation",
+            b"original source",
+            0,
+        );
+        let mut runtime = production_test_runtime(storage.clone(), &directory, remote_peer);
+        schedule_resume_query(&mut runtime, remote_peer);
+        fs::write(
+            transfer.local_path.as_deref().expect("source path"),
+            b"source length changed after query",
+        )
+        .expect("mutate source after query");
+
+        runtime
+            .handle_outbound_response(
+                remote_peer,
+                PendingRequestId::Test(1),
+                ControlResponse::TransferResume {
+                    transfer_id: transfer.transfer_id.clone(),
+                    state: TransferResumeState::Receiving,
+                    committed_bytes: 0,
+                },
+            )
+            .expect("source mutation becomes a terminal transfer result");
+
+        assert!(runtime.test_outgoing_starts.lock().unwrap().is_empty());
+        let failed = storage
+            .get_transfer(&transfer.transfer_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.status, TransferStatus::Failed);
+        assert!(!failed.send_claimed);
+        assert!(
+            failed
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("源文件"))
+        );
+        assert_eq!(
+            storage
+                .get_message(&transfer.transfer_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            MessageStatus::Failed
+        );
+
+        drop(runtime);
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove source mutation fixture");
     }
 
     fn reprepare_manual_runtime_acceptance(

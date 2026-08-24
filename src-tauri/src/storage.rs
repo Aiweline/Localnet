@@ -919,7 +919,7 @@ impl Storage {
                  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
              WHERE transfer_id = ?1 AND peer_id = ?2 AND direction = 'outgoing'
                AND transfer_protocol = 2 AND status = 'transferring' AND send_claimed = 1
-               AND transferred_bytes = ?3 AND ?4 > ?3 AND ?4 <= file_size
+               AND transferred_bytes = ?3 AND ?4 != ?3 AND ?4 <= file_size
                AND (?4 = file_size OR ?4 % chunk_size = 0)",
             params![transfer_id, peer_id, previous_bytes, acknowledged_bytes],
         )?;
