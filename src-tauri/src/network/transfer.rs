@@ -5,6 +5,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(test)]
+use std::sync::{Arc, Mutex};
+
 use futures::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, StreamExt as _};
 use libp2p::{PeerId, StreamProtocol};
 use sha2::{Digest, Sha256};
@@ -39,7 +42,7 @@ const PROGRESS_BYTES: u64 = 1024 * 1024;
 const MAX_HEADER_BYTES: usize = 8 * 1024;
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-trait ResumableIo: AsyncRead + AsyncWrite + Unpin + Send {}
+pub(super) trait ResumableIo: AsyncRead + AsyncWrite + Unpin + Send {}
 
 impl<T> ResumableIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 
@@ -47,18 +50,35 @@ enum ResumableStreamOpener<'a> {
     Network(&'a mut libp2p_stream::Control, PeerId),
     #[cfg(test)]
     Scripted(Box<dyn ResumableIo>),
+    #[cfg(test)]
+    ObservedScripted {
+        stream: Box<dyn ResumableIo>,
+        opened_protocol: Arc<Mutex<Option<String>>>,
+    },
 }
 
 impl ResumableStreamOpener<'_> {
     async fn open(self) -> Result<Box<dyn ResumableIo>, AppError> {
+        let protocol = StreamProtocol::new(FILE_PROTOCOL_V2);
         match self {
             Self::Network(control, peer_id) => control
-                .open_stream(peer_id, StreamProtocol::new(FILE_PROTOCOL_V2))
+                .open_stream(peer_id, protocol)
                 .await
                 .map(|stream| Box::new(stream) as Box<dyn ResumableIo>)
                 .map_err(|error| AppError::Network(format!("无法建立可恢复文件传输流：{error}"))),
             #[cfg(test)]
             Self::Scripted(stream) => Ok(stream),
+            #[cfg(test)]
+            Self::ObservedScripted {
+                stream,
+                opened_protocol,
+            } => {
+                *opened_protocol
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    Some(protocol.as_ref().to_string());
+                Ok(stream)
+            }
         }
     }
 }
@@ -130,52 +150,101 @@ pub fn spawn_claimed_outgoing_resumable_transfer(
     mut control: libp2p_stream::Control,
     peer_id: PeerId,
     transfer: TransferRecord,
+    query_token: String,
     storage: Storage,
     app_handle: AppHandle,
 ) {
     tauri::async_runtime::spawn(async move {
         let opener = ResumableStreamOpener::Network(&mut control, peer_id);
         let mut publish = |event| emit_event(&app_handle, &event);
-        let result =
-            send_claimed_resumable_transfer(opener, &transfer, &storage, &mut publish).await;
+        let result = run_claimed_outgoing_resumable_transfer(
+            opener,
+            transfer,
+            query_token,
+            &storage,
+            &mut publish,
+        )
+        .await;
         if let Err(error) = result {
-            match persist_claimed_outgoing_error(&storage, &transfer, &error) {
-                Ok(true) => {
-                    if let Ok(Some(updated)) = storage.get_transfer(&transfer.transfer_id) {
-                        let terminal = updated.status == TransferStatus::Failed;
-                        publish(NetworkEvent::TransferUpdated {
-                            transfer: updated.clone(),
-                        });
-                        if terminal {
-                            let _ = storage.update_message_status(
-                                &updated.transfer_id,
-                                MessageStatus::Failed,
-                                updated.error.as_deref(),
-                            );
-                            publish(NetworkEvent::MessageStatusChanged {
-                                message_id: updated.transfer_id,
-                                status: MessageStatus::Failed,
-                                error: updated.error,
-                            });
-                        }
-                    }
-                }
-                Ok(false) => {}
-                Err(persist_error) => {
-                    tracing::warn!(
-                        transfer_id = %transfer.transfer_id,
-                        %persist_error,
-                        "failed to persist claimed resumable send failure"
-                    );
-                }
-            }
             tracing::warn!(
-                transfer_id = %transfer.transfer_id,
                 %error,
                 "claimed resumable outgoing transfer stopped"
             );
         }
     });
+}
+
+async fn run_claimed_outgoing_resumable_transfer<P>(
+    opener: ResumableStreamOpener<'_>,
+    transfer: TransferRecord,
+    query_token: String,
+    storage: &Storage,
+    publish: &mut P,
+) -> Result<(), AppError>
+where
+    P: FnMut(NetworkEvent),
+{
+    let result =
+        send_claimed_resumable_transfer(opener, &transfer, Some(&query_token), storage, publish)
+            .await;
+    if let Err(error) = &result {
+        match persist_claimed_outgoing_resume_error(storage, &transfer, &query_token, error) {
+            Ok(true) => {
+                if let Ok(Some(updated)) = storage.get_transfer(&transfer.transfer_id) {
+                    let terminal = updated.status == TransferStatus::Failed;
+                    publish(NetworkEvent::TransferUpdated {
+                        transfer: updated.clone(),
+                    });
+                    if terminal {
+                        let _ = storage.update_message_status(
+                            &updated.transfer_id,
+                            MessageStatus::Failed,
+                            updated.error.as_deref(),
+                        );
+                        publish(NetworkEvent::MessageStatusChanged {
+                            message_id: updated.transfer_id,
+                            status: MessageStatus::Failed,
+                            error: updated.error,
+                        });
+                    }
+                }
+            }
+            Ok(false) => {}
+            Err(persist_error) => {
+                tracing::warn!(
+                    transfer_id = %transfer.transfer_id,
+                    %persist_error,
+                    "failed to persist claimed resumable send failure"
+                );
+            }
+        }
+    }
+    result
+}
+
+#[cfg(test)]
+pub(super) async fn run_claimed_outgoing_resumable_transfer_with_stream<P>(
+    stream: Box<dyn ResumableIo>,
+    opened_protocol: Arc<Mutex<Option<String>>>,
+    transfer: TransferRecord,
+    query_token: String,
+    storage: &Storage,
+    publish: &mut P,
+) -> Result<(), AppError>
+where
+    P: FnMut(NetworkEvent),
+{
+    run_claimed_outgoing_resumable_transfer(
+        ResumableStreamOpener::ObservedScripted {
+            stream,
+            opened_protocol,
+        },
+        transfer,
+        query_token,
+        storage,
+        publish,
+    )
+    .await
 }
 
 pub(crate) fn return_pending_incoming_decision_to_manual(
@@ -314,7 +383,7 @@ where
     else {
         return Ok(());
     };
-    let result = send_claimed_resumable_transfer(opener, &transfer, storage, publish).await;
+    let result = send_claimed_resumable_transfer(opener, &transfer, None, storage, publish).await;
     if let Err(error) = &result {
         if persist_claimed_outgoing_error(storage, &transfer, error)? {
             if let Some(updated) = storage.get_transfer(&transfer.transfer_id)? {
@@ -343,6 +412,7 @@ where
 async fn send_claimed_resumable_transfer<P>(
     opener: ResumableStreamOpener<'_>,
     transfer: &TransferRecord,
+    query_token: Option<&str>,
     storage: &Storage,
     publish: &mut P,
 ) -> Result<(), AppError>
@@ -376,12 +446,22 @@ where
         &chunks,
         transfer.transferred_bytes,
         |acknowledged_offset| {
-            if !storage.commit_claimed_outgoing_progress(
-                &transfer.transfer_id,
-                &transfer.peer_id,
-                previous_offset,
-                acknowledged_offset,
-            )? {
+            let committed = match query_token {
+                Some(query_token) => storage.commit_claimed_outgoing_resume_progress(
+                    &transfer.transfer_id,
+                    &transfer.peer_id,
+                    query_token,
+                    previous_offset,
+                    acknowledged_offset,
+                )?,
+                None => storage.commit_claimed_outgoing_progress(
+                    &transfer.transfer_id,
+                    &transfer.peer_id,
+                    previous_offset,
+                    acknowledged_offset,
+                )?,
+            };
+            if !committed {
                 return Err(AppError::Storage(
                     "可恢复发送进度状态已变化，已停止旧传输回调".to_string(),
                 ));
@@ -394,15 +474,48 @@ where
         },
     )
     .await?;
-    if !storage.try_complete_claimed_outgoing_transfer(&transfer.transfer_id, &transfer.peer_id)? {
-        return Err(AppError::Storage(
-            "可恢复发送完成状态已变化，未覆盖当前记录".to_string(),
-        ));
-    }
+    let message_completed_atomically = match query_token {
+        Some(query_token) => match storage.try_complete_claimed_outgoing_resume_and_message(
+            &transfer.transfer_id,
+            &transfer.peer_id,
+            query_token,
+        ) {
+            Ok(true) => true,
+            Ok(false) => {
+                return Err(AppError::Storage(
+                    "可恢复发送完成代次已变化，未覆盖当前记录".to_string(),
+                ));
+            }
+            Err(error) => {
+                if storage.try_pause_claimed_outgoing_resume_transfer(
+                    &transfer.transfer_id,
+                    &transfer.peer_id,
+                    query_token,
+                    &error.to_string(),
+                )? && let Some(updated) = storage.get_transfer(&transfer.transfer_id)?
+                {
+                    publish(NetworkEvent::TransferUpdated { transfer: updated });
+                }
+                return Err(error);
+            }
+        },
+        None => {
+            if !storage
+                .try_complete_claimed_outgoing_transfer(&transfer.transfer_id, &transfer.peer_id)?
+            {
+                return Err(AppError::Storage(
+                    "可恢复发送完成状态已变化，未覆盖当前记录".to_string(),
+                ));
+            }
+            false
+        }
+    };
     let completed = storage
         .get_transfer(&transfer.transfer_id)?
         .ok_or_else(|| AppError::Storage("完成的可恢复发送记录不存在".to_string()))?;
-    storage.update_message_status(&completed.transfer_id, MessageStatus::Delivered, None)?;
+    if !message_completed_atomically {
+        storage.update_message_status(&completed.transfer_id, MessageStatus::Delivered, None)?;
+    }
     publish(NetworkEvent::TransferUpdated {
         transfer: completed.clone(),
     });
@@ -456,6 +569,29 @@ pub(super) fn persist_claimed_outgoing_error(
         storage.try_fail_claimed_outgoing_transfer(
             &transfer.transfer_id,
             &transfer.peer_id,
+            &error.to_string(),
+        )
+    }
+}
+
+pub(super) fn persist_claimed_outgoing_resume_error(
+    storage: &Storage,
+    transfer: &TransferRecord,
+    query_token: &str,
+    error: &AppError,
+) -> Result<bool, AppError> {
+    if is_recoverable_send_error(error) {
+        storage.try_pause_claimed_outgoing_resume_transfer(
+            &transfer.transfer_id,
+            &transfer.peer_id,
+            query_token,
+            &error.to_string(),
+        )
+    } else {
+        storage.try_fail_claimed_outgoing_resume_transfer(
+            &transfer.transfer_id,
+            &transfer.peer_id,
+            query_token,
             &error.to_string(),
         )
     }
