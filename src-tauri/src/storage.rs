@@ -2840,10 +2840,10 @@ mod tests {
             TransferStatus,
         },
         receive_paths::{
-            FinalizationPhase, finalize_reserved_receive_copy_fallback_with_hooks,
-            finalize_reserved_receive_durable, finalize_reserved_receive_durable_with_hooks,
-            reservation_is_owned, reserve_receive_path, reserve_resumable_partial,
-            resumable_partial_path,
+            FinalizationPhase, create_legacy_finalized_stage_fixture,
+            finalize_reserved_receive_copy_fallback_with_hooks, finalize_reserved_receive_durable,
+            finalize_reserved_receive_durable_with_hooks, reservation_is_owned,
+            reserve_receive_path, reserve_resumable_partial, resumable_partial_path,
         },
         transfer_manifest::{TransferChunk, manifest_root},
         transfer_policy::{TRANSFER_CHUNK_BYTES, TransferProtocol},
@@ -5929,6 +5929,218 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+
+        drop(storage);
+        fs::remove_dir_all(fixture).expect("remove fixture");
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn startup_retires_a_completed_legacy_stage_and_clears_database_ownership() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-completed-legacy-stage-cleanup-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&fixture).expect("create storage fixture");
+        let database = fixture.join("localnet.sqlite3");
+        initialize_database(&database);
+        let destination = fixture.join("report.bin");
+        let transfer_id = "completed-legacy-stage";
+        let token = "token-completed-legacy-stage";
+        let payload = b"final hard link must remain intact";
+        reserve_receive_path(&destination, transfer_id, token).expect("reserve destination");
+        let staged =
+            create_legacy_finalized_stage_fixture(&destination, transfer_id, token, payload)
+                .expect("create legacy finalization fixture");
+        {
+            let connection = Connection::open(&database).expect("open fixture database");
+            connection
+                .execute(
+                    "INSERT INTO transfers
+                       (transfer_id, peer_id, direction, kind, file_name, file_size, mime_type,
+                        sha256, local_path, destination_reserved, reservation_token,
+                        transfer_protocol, chunk_size, chunk_count, manifest_sha256,
+                        transferred_bytes, status, created_at, updated_at)
+                     VALUES (?1, 'peer-one', 'incoming', 'file', 'report.bin', ?2,
+                             'application/octet-stream', ?3, ?4, 1, ?5,
+                             2, ?6, 1, ?7, ?2, 'completed', ?8, ?8)",
+                    rusqlite::params![
+                        transfer_id,
+                        payload.len(),
+                        hex::encode(Sha256::digest(payload)),
+                        destination.to_string_lossy(),
+                        token,
+                        TRANSFER_CHUNK_BYTES,
+                        "0".repeat(64),
+                        "2026-08-25T00:00:00.000Z",
+                    ],
+                )
+                .expect("insert completed legacy transfer");
+        }
+
+        let storage = Storage::open(&database).expect("retry completed cleanup at startup");
+        let completed = storage
+            .get_transfer(transfer_id)
+            .unwrap()
+            .expect("completed transfer remains");
+        assert!(!staged.exists());
+        assert_eq!(fs::read(&destination).unwrap(), payload);
+        assert!(!completed.destination_reserved);
+        assert!(completed.reservation_token.is_none());
+
+        drop(storage);
+        fs::remove_dir_all(fixture).expect("remove fixture");
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn legacy_stage_path_replacement_is_preserved_and_terminal_cleanup_stays_pending() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-terminal-legacy-stage-replacement-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&fixture).expect("create storage fixture");
+        let database = fixture.join("localnet.sqlite3");
+        initialize_database(&database);
+        let destination = fixture.join("report.bin");
+        let transfer_id = "terminal-legacy-stage-replacement";
+        let token = "token-terminal-legacy-stage-replacement";
+        let payload = b"final hard link remains owned data";
+        reserve_receive_path(&destination, transfer_id, token).expect("reserve destination");
+        let staged =
+            create_legacy_finalized_stage_fixture(&destination, transfer_id, token, payload)
+                .expect("create legacy finalization fixture");
+        fs::remove_file(&staged).expect("detach originally owned stage link");
+        fs::write(&staged, b"concurrent replacement data").expect("replace stage pathname");
+
+        let storage = Storage::open(&database).expect("open storage");
+        {
+            let connection = storage.connection().expect("insert terminal transfer");
+            connection
+                .execute(
+                    "INSERT INTO transfers
+                       (transfer_id, peer_id, direction, kind, file_name, file_size, mime_type,
+                        sha256, local_path, destination_reserved, reservation_token,
+                        transfer_protocol, transferred_bytes, status, created_at, updated_at)
+                     VALUES (?1, 'peer-one', 'incoming', 'file', 'report.bin', ?2,
+                             'application/octet-stream', ?3, ?4, 1, ?5,
+                             2, ?2, 'failed', ?6, ?6)",
+                    rusqlite::params![
+                        transfer_id,
+                        payload.len(),
+                        hex::encode(Sha256::digest(payload)),
+                        destination.to_string_lossy(),
+                        token,
+                        "2026-08-25T00:00:00.000Z",
+                    ],
+                )
+                .expect("insert terminal legacy transfer");
+        }
+        let record = OwnedArtifactRecord {
+            transfer_id: transfer_id.to_string(),
+            destination: Some(destination.clone()),
+            partial: None,
+            reservation_token: Some(token.to_string()),
+            destination_reserved: true,
+            transfer_protocol: 2,
+            status: "failed".to_string(),
+        };
+        storage
+            .stage_terminal_cleanup(&record)
+            .expect("durably stage terminal cleanup");
+        drop(storage);
+
+        let storage = Storage::open(&database).expect("startup keeps unresolved cleanup");
+        assert_eq!(fs::read(&staged).unwrap(), b"concurrent replacement data");
+        assert_eq!(fs::read(&destination).unwrap(), payload);
+        assert!(
+            storage
+                .pending_terminal_cleanup(transfer_id)
+                .unwrap()
+                .is_some()
+        );
+
+        drop(storage);
+        fs::remove_dir_all(fixture).expect("remove fixture");
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn unavailable_legacy_stage_media_defers_then_finishes_terminal_cleanup() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-terminal-legacy-stage-media-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let media = fixture.join("selected-media");
+        let detached_media = fixture.join("detached-media");
+        fs::create_dir_all(&media).expect("create selected media fixture");
+        let database = fixture.join("localnet.sqlite3");
+        initialize_database(&database);
+        let destination = media.join("report.bin");
+        let transfer_id = "terminal-legacy-stage-media";
+        let token = "token-terminal-legacy-stage-media";
+        let payload = b"terminal legacy hard-link payload";
+        reserve_receive_path(&destination, transfer_id, token).expect("reserve destination");
+        let staged =
+            create_legacy_finalized_stage_fixture(&destination, transfer_id, token, payload)
+                .expect("create legacy finalization fixture");
+        let storage = Storage::open(&database).expect("open storage");
+        {
+            let connection = storage.connection().expect("insert terminal transfer");
+            connection
+                .execute(
+                    "INSERT INTO transfers
+                       (transfer_id, peer_id, direction, kind, file_name, file_size, mime_type,
+                        sha256, local_path, destination_reserved, reservation_token,
+                        transfer_protocol, transferred_bytes, status, created_at, updated_at)
+                     VALUES (?1, 'peer-one', 'incoming', 'file', 'report.bin', ?2,
+                             'application/octet-stream', ?3, ?4, 1, ?5,
+                             2, ?2, 'failed', ?6, ?6)",
+                    rusqlite::params![
+                        transfer_id,
+                        payload.len(),
+                        hex::encode(Sha256::digest(payload)),
+                        destination.to_string_lossy(),
+                        token,
+                        "2026-08-25T00:00:00.000Z",
+                    ],
+                )
+                .expect("insert terminal legacy transfer");
+        }
+        let record = OwnedArtifactRecord {
+            transfer_id: transfer_id.to_string(),
+            destination: Some(destination.clone()),
+            partial: None,
+            reservation_token: Some(token.to_string()),
+            destination_reserved: true,
+            transfer_protocol: 2,
+            status: "failed".to_string(),
+        };
+        storage
+            .stage_terminal_cleanup(&record)
+            .expect("durably stage terminal cleanup");
+        drop(storage);
+        fs::rename(&media, &detached_media).expect("simulate unavailable media");
+
+        let storage = Storage::open(&database).expect("startup defers unavailable media");
+        assert!(
+            storage
+                .pending_terminal_cleanup(transfer_id)
+                .unwrap()
+                .is_some()
+        );
+        drop(storage);
+
+        fs::rename(&detached_media, &media).expect("restore media");
+        let storage = Storage::open(&database).expect("retry cleanup after media returns");
+        assert!(
+            storage
+                .pending_terminal_cleanup(transfer_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!staged.exists());
+        assert_eq!(fs::read(&destination).unwrap(), payload);
 
         drop(storage);
         fs::remove_dir_all(fixture).expect("remove fixture");

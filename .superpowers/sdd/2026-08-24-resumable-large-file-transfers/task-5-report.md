@@ -267,3 +267,53 @@ Required target directory: `G:\codex-localnet-target`
 - `src-tauri/src/storage.rs` — production startup regression proving incomplete candidates remain paused and a fully materialized retry completes idempotently.
 - Self-review confirms the normal fallback has one hard-link probe only, every candidate write stays on its verified handle, no identity mismatch path deletes a candidate/stage name, `CopyPrepared` cannot complete, and reservation/metadata switching remains journal-first and no-clobber.
 - No known round-4 blocker. Intentional compatibility tradeoff: a pre-round-4 legacy stage pathname is retained with its journal/tombstone instead of being unlinked after handle verification; new fallback executions never create such a stage. Task 6 volume gates and Task 7 reconnect discovery/scheduling remain out of scope.
+
+---
+
+## Fix Round 5 — 2026-08-25
+
+### Corrected implementation
+
+- Backward finalization rows now append a checksummed, synced legacy-stage cleanup record before any namespace mutation. `Prepared` binds the exact journaled stage identity and, on macOS, its cryptographically random quarantine leaf; `Removed` is appended only after the owned link is gone. Startup reads the latest valid record and repeats an interrupted cleanup. A durable `Removed` record lets journal/tombstone/DB ownership cleanup finish after a crash between link removal and metadata cleanup.
+- Windows opens the legacy stage with `DELETE | FILE_READ_ATTRIBUTES`, full read/write/delete sharing, and `FILE_FLAG_OPEN_REPARSE_POINT`; reparse points and directories are rejected. The still-open handle is checked against the journaled volume serial and complete 64-bit file index, the path identity is rechecked around durable preparation, then `SetFileInformationByHandle(FileDispositionInfoEx)` requests delete plus POSIX semantics on that exact handle. Only explicit API/filesystem unsupported errors use the compatible `FileDispositionInfo` fallback. Sharing/access/delete-pending failures defer without clearing ownership.
+- Windows never performs `verify handle; remove_file(path)`. After disposition the verified handle is closed, the stage namespace result is inspected, and only confirmed absence advances the journal to `Removed`. A replacement at the old pathname is never a deletion target and leaves cleanup pending; the finalized hard link remains byte-for-byte intact.
+- macOS uses a process-wide cleanup lock plus a same-directory UUIDv4 quarantine leaf recorded durably before mutation. `renameatx_np(..., RENAME_EXCL)` moves without overwrite, the quarantine is immediately opened with `O_NOFOLLOW` and checked by `dev + ino`, then the unpredictable name alone is unlinked and the directory is synced. Identity mismatch is atomically restored without overwrite; a conflicting restore remains journaled and unresolved, never deleted. Missing exclusive-rename support also remains fail-closed and pending.
+- Completed startup cleanup now reaches the existing journal/reservation/DB ownership clear only after exact stage retirement. Terminal startup cleanup likewise deletes its tombstone only after exact retirement. Missing media keeps the durable state; returning media retries and completes.
+- Added only feature gates to existing dependencies: UUID v4 generation and the `windows-sys` Foundation constants needed for explicit disposition/fallback error handling.
+
+### Crash ordering and restart proof
+
+1. Windows: open no-follow with delete access → verify handle identity → append/sync `Prepared` → recheck pathname identity → set disposition on that handle → close handle → confirm stage absence → append/sync `Removed` → caller removes finalization journal and clears ownership state. A crash after disposition closes the handle; `Prepared + absent` is completed on restart. A crash after `Removed` returns completion immediately.
+2. macOS: open/verify stage → generate random same-directory quarantine leaf → append/sync `Prepared` → atomic no-replace rename → open no-follow and verify quarantine identity → unlink only quarantine → fsync directory → append/sync `Removed`. Restart handles stage-present, quarantine-present, and post-unlink absence idempotently.
+3. A pre-mutation stage replacement fails identity validation. A post-open replacement is detected by the second pathname identity check. On Windows disposition remains handle-targeted; on macOS a quarantine mismatch is restored without overwrite. Every mismatch retains the journal/tombstone and user data.
+4. The final destination is a separate hard link to the same data identity. Retiring only the legacy stage link reduces the link count without changing final bytes.
+
+### RED → GREEN evidence for round 5
+
+1. `identity_owned_legacy_stage_is_removed_while_the_final_hard_link_remains` was RED at runtime because `remove_owned_finalization_stage` returned `false`; it is GREEN with the stage absent and final hard-link bytes unchanged.
+2. `startup_retires_a_completed_legacy_stage_and_clears_database_ownership` was RED because the stage still existed and completed ownership remained set. It is GREEN with the stage/journal retired and `destination_reserved = 0`, `reservation_token = NULL`.
+3. `unavailable_legacy_stage_media_defers_then_finishes_terminal_cleanup` was RED after media return because the terminal tombstone remained. It is GREEN: unavailable startup defers, restored media removes the exact stage, clears the tombstone, and preserves the final link.
+4. The crash matrix was RED at compile time for missing `LegacyStageCleanupPhase` and the phase-hook cleanup seam. Windows is GREEN for crashes after open verification, durable preparation, disposition, and journal completion; every restart converges without touching the final link.
+5. The prior replacement regression was strengthened to require durable `Prepared` state. The filesystem and storage tests prove a concurrent replacement is preserved while both finalization and terminal cleanup remain pending.
+6. macOS-gated tests cover preparation, rename, quarantine verification, unlink, journal completion, and mismatch restoration. The production and `cfg(test)` paths type-check for `aarch64-apple-darwin` through a minimal crate using the exact real dependencies.
+
+### Exact round-5 verification
+
+- `$env:CARGO_TARGET_DIR='G:\codex-localnet-target'; cargo test --manifest-path src-tauri/Cargo.toml --locked --lib receive_paths::tests` — PASS, 26 passed, 0 failed.
+- `$env:CARGO_TARGET_DIR='G:\codex-localnet-target'; cargo test --manifest-path src-tauri/Cargo.toml --locked --lib storage::tests` — PASS, 49 passed, 0 failed.
+- `$env:CARGO_TARGET_DIR='G:\codex-localnet-target'; cargo test --manifest-path src-tauri/Cargo.toml --locked --lib network::resumable_transfer::tests` — PASS, 27 passed, 0 failed.
+- `$env:CARGO_TARGET_DIR='G:\codex-localnet-target'; cargo test --manifest-path src-tauri/Cargo.toml --locked --lib` — PASS, 129 passed, 0 failed.
+- `$env:CARGO_TARGET_DIR='G:\codex-localnet-target'; cargo check --manifest-path src-tauri/Cargo.toml --locked` — PASS, debug profile with no warnings.
+- `$env:CARGO_TARGET_DIR='G:\codex-localnet-target'; cargo check --manifest-path src-tauri/Cargo.toml --release --locked` — PASS, optimized profile.
+- Minimal real-dependency `receive_paths.rs` check with `--target aarch64-apple-darwin --tests --offline` — PASS; production and macOS-gated tests type-check. The temporary check crate was removed afterward.
+- Full Tauri `cargo check --target aarch64-apple-darwin` on Windows reached Apple dependencies but stopped before Localnet code because no Apple Objective-C `cc` toolchain is available; this is an environment-only cross-check limit, not a passing macOS runtime claim.
+- `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check` — PASS.
+- `git diff --check` — PASS.
+- `pnpm release:check` with Windows PowerShell as `npm_config_script_shell` — PASS, synchronized version `0.1.7`.
+
+### Round-5 self-review and concerns
+
+- Windows cleanup uses the strongest available exact-handle mechanism and a narrow compatibility fallback; the required real hard-link and replacement races run on Windows. No pathname delete follows identity proof.
+- macOS follows the required unpredictable-quarantine design and fails closed when exclusive rename or identity proof is unavailable. Its code and crash tests type-check for Apple ARM, but macOS runtime execution still belongs to native CI because this Windows host has no Apple Objective-C toolchain.
+- No known unsafe namespace race remains beyond the deliberately accepted macOS quarantine protocol. The in-process lock, random name, no-replace rename/restore, immediate no-follow identity check, and directory fsync are all present.
+- Task 6 volume gates and Task 7 reconnect discovery/scheduling remain out of scope.

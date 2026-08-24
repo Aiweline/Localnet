@@ -2,6 +2,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
 };
 
 use serde::{Deserialize, Serialize};
@@ -30,6 +31,20 @@ pub enum FinalizationPhase {
     AfterCopySync,
     BeforeCopyMaterializedJournal,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LegacyStageCleanupPhase {
+    AfterOpenIdentityVerified,
+    AfterPreparation,
+    AfterNamespaceMutation,
+    #[cfg(target_os = "macos")]
+    AfterQuarantineVerification,
+    #[cfg(target_os = "macos")]
+    AfterUnlink,
+    AfterJournalComplete,
+}
+
+static LEGACY_STAGE_CLEANUP_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub fn commit_without_overwrite(partial: &Path, destination: &Path) -> std::io::Result<()> {
     match fs::hard_link(partial, destination) {
@@ -668,7 +683,10 @@ where
 }
 
 #[cfg(test)]
-fn reserve_finalization_stage(directory: &Path, transfer_id: &str) -> io::Result<(PathBuf, File)> {
+pub(crate) fn reserve_finalization_stage(
+    directory: &Path,
+    transfer_id: &str,
+) -> io::Result<(PathBuf, File)> {
     let digest = hex::encode(Sha256::digest(transfer_id.as_bytes()));
     let mut sequence = 0_u32;
     loop {
@@ -699,6 +717,36 @@ fn reserve_finalization_stage(directory: &Path, transfer_id: &str) -> io::Result
             Err(error) => return Err(error),
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn create_legacy_finalized_stage_fixture(
+    destination: &Path,
+    transfer_id: &str,
+    reservation_token: &str,
+    payload: &[u8],
+) -> io::Result<PathBuf> {
+    let directory = destination
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "接收文件保存位置无效"))?;
+    let (staged, mut staged_file) = reserve_finalization_stage(directory, transfer_id)?;
+    staged_file.write_all(payload)?;
+    staged_file.flush()?;
+    staged_file.sync_all()?;
+    let staged_identity = file_identity(&staged_file)?;
+    fs::hard_link(&staged, destination)?;
+    append_finalization_record_with_stage(
+        destination,
+        transfer_id,
+        reservation_token,
+        destination,
+        &[],
+        Some(&staged),
+        Some(staged_identity),
+        staged_identity,
+        FinalizationState::Created,
+    )?;
+    Ok(staged)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -986,7 +1034,7 @@ pub fn remove_owned_finalization_stage(
         reserved_destination,
         transfer_id,
         reservation_token,
-        || Ok(()),
+        |_| Ok(()),
     )
 }
 
@@ -1000,11 +1048,37 @@ fn remove_owned_finalization_stage_with_hook<H>(
 where
     H: FnOnce() -> io::Result<()>,
 {
+    let mut after_verified_open = Some(after_verified_open);
     remove_owned_finalization_stage_internal(
         reserved_destination,
         transfer_id,
         reservation_token,
-        after_verified_open,
+        move |phase| {
+            if phase == LegacyStageCleanupPhase::AfterPreparation {
+                if let Some(hook) = after_verified_open.take() {
+                    hook()?;
+                }
+            }
+            Ok(())
+        },
+    )
+}
+
+#[cfg(test)]
+fn remove_owned_finalization_stage_with_phase_hook<H>(
+    reserved_destination: &Path,
+    transfer_id: &str,
+    reservation_token: &str,
+    phase_hook: H,
+) -> io::Result<bool>
+where
+    H: FnMut(LegacyStageCleanupPhase) -> io::Result<()>,
+{
+    remove_owned_finalization_stage_internal(
+        reserved_destination,
+        transfer_id,
+        reservation_token,
+        phase_hook,
     )
 }
 
@@ -1012,11 +1086,15 @@ fn remove_owned_finalization_stage_internal<H>(
     reserved_destination: &Path,
     transfer_id: &str,
     reservation_token: &str,
-    after_verified_open: H,
+    mut phase_hook: H,
 ) -> io::Result<bool>
 where
-    H: FnOnce() -> io::Result<()>,
+    H: FnMut(LegacyStageCleanupPhase) -> io::Result<()>,
 {
+    let cleanup_lock = LEGACY_STAGE_CLEANUP_LOCK.get_or_init(|| Mutex::new(()));
+    let _cleanup_guard = cleanup_lock
+        .lock()
+        .map_err(|_| io::Error::other("遗留暂存文件清理锁不可用"))?;
     let Some(record) =
         read_finalization_record(reserved_destination, transfer_id, reservation_token)?
     else {
@@ -1025,24 +1103,467 @@ where
     let Some(staged) = record.staged.as_deref() else {
         return Ok(true);
     };
+    if record
+        .stage_cleanup
+        .as_ref()
+        .is_some_and(|cleanup| cleanup.state == LegacyStageCleanupState::Removed)
+    {
+        return Ok(true);
+    }
     let directory = reserved_destination
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "接收文件保存位置无效"))?;
     let staged = directory.join(staged);
-    let staged_file = match open_regular_file_no_follow(&staged, false) {
+    let expected_identity = record.staged_identity.unwrap_or(record.identity);
+
+    #[cfg(windows)]
+    {
+        return remove_owned_finalization_stage_windows(
+            reserved_destination,
+            transfer_id,
+            &directory,
+            &staged,
+            expected_identity,
+            record,
+            &mut phase_hook,
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        return remove_owned_finalization_stage_macos(
+            reserved_destination,
+            transfer_id,
+            &directory,
+            &staged,
+            expected_identity,
+            record,
+            &mut phase_hook,
+        );
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = (record, expected_identity, &mut phase_hook);
+        Ok(false)
+    }
+}
+
+fn complete_legacy_stage_cleanup_record<H>(
+    reserved_destination: &Path,
+    transfer_id: &str,
+    record: &FinalizationRecord,
+    expected_identity: FileIdentity,
+    quarantine: Option<String>,
+    phase_hook: &mut H,
+) -> io::Result<bool>
+where
+    H: FnMut(LegacyStageCleanupPhase) -> io::Result<()>,
+{
+    append_legacy_stage_cleanup_record(
+        reserved_destination,
+        transfer_id,
+        record,
+        LegacyStageCleanupRecord {
+            identity: expected_identity,
+            quarantine,
+            state: LegacyStageCleanupState::Removed,
+        },
+    )?;
+    phase_hook(LegacyStageCleanupPhase::AfterJournalComplete)?;
+    Ok(true)
+}
+
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn remove_owned_finalization_stage_windows<H>(
+    reserved_destination: &Path,
+    transfer_id: &str,
+    directory: &Path,
+    staged: &Path,
+    expected_identity: FileIdentity,
+    mut record: FinalizationRecord,
+    phase_hook: &mut H,
+) -> io::Result<bool>
+where
+    H: FnMut(LegacyStageCleanupPhase) -> io::Result<()>,
+{
+    let staged_file = match open_regular_file_for_delete_no_follow(staged) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound && directory.is_dir() => {
-            return Ok(true);
+            let Some(cleanup) = record.stage_cleanup.as_ref() else {
+                return Ok(false);
+            };
+            if cleanup.state != LegacyStageCleanupState::Prepared {
+                return Ok(false);
+            }
+            return complete_legacy_stage_cleanup_record(
+                reserved_destination,
+                transfer_id,
+                &record,
+                expected_identity,
+                None,
+                phase_hook,
+            );
         }
         Err(error) if is_no_follow_rejection(&error) => return Ok(false),
+        Err(error) if windows_stage_cleanup_should_defer(&error) => return Ok(false),
         Err(error) => return Err(error),
     };
-    if file_identity(&staged_file)? != record.staged_identity.unwrap_or(record.identity) {
+    if file_identity(&staged_file)? != expected_identity {
         return Ok(false);
     }
-    after_verified_open()?;
-    Ok(false)
+    phase_hook(LegacyStageCleanupPhase::AfterOpenIdentityVerified)?;
+    match path_has_file_identity(staged, expected_identity) {
+        Ok(true) => {}
+        Ok(false) => return Ok(false),
+        Err(error) if windows_stage_cleanup_should_defer(&error) => return Ok(false),
+        Err(error) => return Err(error),
+    }
+    if record.stage_cleanup.is_none() {
+        record = append_legacy_stage_cleanup_record(
+            reserved_destination,
+            transfer_id,
+            &record,
+            LegacyStageCleanupRecord {
+                identity: expected_identity,
+                quarantine: None,
+                state: LegacyStageCleanupState::Prepared,
+            },
+        )?;
+    }
+    phase_hook(LegacyStageCleanupPhase::AfterPreparation)?;
+    match path_has_file_identity(staged, expected_identity) {
+        Ok(true) => {}
+        Ok(false) => return Ok(false),
+        Err(error) if windows_stage_cleanup_should_defer(&error) => return Ok(false),
+        Err(error) => return Err(error),
+    }
+    match mark_windows_file_link_for_delete(&staged_file) {
+        Ok(()) => {}
+        Err(error) if windows_stage_cleanup_should_defer(&error) => return Ok(false),
+        Err(error) => return Err(error),
+    }
+    phase_hook(LegacyStageCleanupPhase::AfterNamespaceMutation)?;
+    drop(staged_file);
+
+    match open_regular_file_no_follow(staged, false) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound && directory.is_dir() => {
+            complete_legacy_stage_cleanup_record(
+                reserved_destination,
+                transfer_id,
+                &record,
+                expected_identity,
+                None,
+                phase_hook,
+            )
+        }
+        Ok(file) if file_identity(&file)? == expected_identity => Ok(false),
+        Ok(_) => Ok(false),
+        Err(error) if is_no_follow_rejection(&error) => Ok(false),
+        Err(error) if windows_stage_cleanup_should_defer(&error) => Ok(false),
+        Err(error) => Err(error),
+    }
 }
+
+#[cfg(windows)]
+fn open_regular_file_for_delete_no_follow(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE,
+    };
+
+    let file = OpenOptions::new()
+        .access_mode(DELETE | FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let information = windows_file_information(&file)?;
+    if information.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY) != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "遗留暂存路径是重解析点或目录",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn mark_windows_file_link_for_delete(file: &File) -> io::Result<()> {
+    use std::{mem::size_of, os::windows::io::AsRawHandle as _};
+    use windows_sys::Win32::{
+        Foundation::{ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED},
+        Storage::FileSystem::{
+            FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+            FILE_DISPOSITION_INFO, FILE_DISPOSITION_INFO_EX, FileDispositionInfo,
+            FileDispositionInfoEx, SetFileInformationByHandle,
+        },
+    };
+
+    let disposition = FILE_DISPOSITION_INFO_EX {
+        Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+    };
+    let succeeded = unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileDispositionInfoEx,
+            std::ptr::addr_of!(disposition).cast(),
+            u32::try_from(size_of::<FILE_DISPOSITION_INFO_EX>())
+                .expect("Windows disposition structure size fits in u32"),
+        )
+    };
+    if succeeded != 0 {
+        return Ok(());
+    }
+    let extended_error = io::Error::last_os_error();
+    if !matches!(
+        extended_error.raw_os_error().map(|value| value as u32),
+        Some(ERROR_INVALID_FUNCTION) | Some(ERROR_INVALID_PARAMETER) | Some(ERROR_NOT_SUPPORTED)
+    ) {
+        return Err(extended_error);
+    }
+
+    let fallback = FILE_DISPOSITION_INFO { DeleteFile: true };
+    let succeeded = unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileDispositionInfo,
+            std::ptr::addr_of!(fallback).cast(),
+            u32::try_from(size_of::<FILE_DISPOSITION_INFO>())
+                .expect("Windows disposition structure size fits in u32"),
+        )
+    };
+    if succeeded == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_stage_cleanup_should_defer(error: &io::Error) -> bool {
+    use windows_sys::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_DELETE_PENDING, ERROR_SHARING_VIOLATION,
+    };
+
+    matches!(
+        error.raw_os_error().map(|value| value as u32),
+        Some(ERROR_ACCESS_DENIED) | Some(ERROR_DELETE_PENDING) | Some(ERROR_SHARING_VIOLATION)
+    )
+}
+
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn remove_owned_finalization_stage_macos<H>(
+    reserved_destination: &Path,
+    transfer_id: &str,
+    directory: &Path,
+    staged: &Path,
+    expected_identity: FileIdentity,
+    mut record: FinalizationRecord,
+    phase_hook: &mut H,
+) -> io::Result<bool>
+where
+    H: FnMut(LegacyStageCleanupPhase) -> io::Result<()>,
+{
+    let quarantine_name = if let Some(cleanup) = record.stage_cleanup.as_ref() {
+        let Some(quarantine) = cleanup.quarantine.as_deref() else {
+            return Ok(false);
+        };
+        quarantine.to_string()
+    } else {
+        let staged_file = match open_regular_file_no_follow(staged, false) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound && directory.is_dir() => {
+                return Ok(false);
+            }
+            Err(error) if is_no_follow_rejection(&error) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if file_identity(&staged_file)? != expected_identity {
+            return Ok(false);
+        }
+        phase_hook(LegacyStageCleanupPhase::AfterOpenIdentityVerified)?;
+        if !path_has_file_identity(staged, expected_identity)? {
+            return Ok(false);
+        }
+        let quarantine = format!(
+            ".weline-localnet-finalize-quarantine-{}",
+            uuid::Uuid::new_v4()
+        );
+        record = append_legacy_stage_cleanup_record(
+            reserved_destination,
+            transfer_id,
+            &record,
+            LegacyStageCleanupRecord {
+                identity: expected_identity,
+                quarantine: Some(quarantine.clone()),
+                state: LegacyStageCleanupState::Prepared,
+            },
+        )?;
+        phase_hook(LegacyStageCleanupPhase::AfterPreparation)?;
+        quarantine
+    };
+    let quarantine = directory.join(&quarantine_name);
+
+    let quarantine_file = match open_regular_file_no_follow(&quarantine, false) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let staged_file = match open_regular_file_no_follow(staged, false) {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::NotFound && directory.is_dir() => {
+                    return complete_legacy_stage_cleanup_record(
+                        reserved_destination,
+                        transfer_id,
+                        &record,
+                        expected_identity,
+                        Some(quarantine_name),
+                        phase_hook,
+                    );
+                }
+                Err(error) if is_no_follow_rejection(&error) => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            if file_identity(&staged_file)? != expected_identity {
+                return Ok(false);
+            }
+            phase_hook(LegacyStageCleanupPhase::AfterOpenIdentityVerified)?;
+            if !path_has_file_identity(staged, expected_identity)? {
+                return Ok(false);
+            }
+            match macos_rename_no_replace(staged, &quarantine) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    let existing = match open_regular_file_no_follow(&quarantine, false) {
+                        Ok(file) => file,
+                        Err(error) if is_no_follow_rejection(&error) => {
+                            macos_restore_quarantine_without_overwrite(
+                                &quarantine,
+                                staged,
+                                directory,
+                            )?;
+                            return Ok(false);
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    if file_identity(&existing)? != expected_identity {
+                        macos_restore_quarantine_without_overwrite(&quarantine, staged, directory)?;
+                        return Ok(false);
+                    }
+                }
+                Err(error) if macos_exclusive_rename_is_unavailable(&error) => return Ok(false),
+                Err(error) => return Err(error),
+            }
+            phase_hook(LegacyStageCleanupPhase::AfterNamespaceMutation)?;
+            let file = match open_regular_file_no_follow(&quarantine, false) {
+                Ok(file) => file,
+                Err(error) if is_no_follow_rejection(&error) => {
+                    macos_restore_quarantine_without_overwrite(&quarantine, staged, directory)?;
+                    return Ok(false);
+                }
+                Err(error) => return Err(error),
+            };
+            sync_directory(directory)?;
+            file
+        }
+        Err(error) if is_no_follow_rejection(&error) => {
+            macos_restore_quarantine_without_overwrite(&quarantine, staged, directory)?;
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
+    };
+    if file_identity(&quarantine_file)? != expected_identity {
+        drop(quarantine_file);
+        macos_restore_quarantine_without_overwrite(&quarantine, staged, directory)?;
+        return Ok(false);
+    }
+    phase_hook(LegacyStageCleanupPhase::AfterQuarantineVerification)?;
+    if !path_has_file_identity(&quarantine, expected_identity)? {
+        drop(quarantine_file);
+        macos_restore_quarantine_without_overwrite(&quarantine, staged, directory)?;
+        return Ok(false);
+    }
+    fs::remove_file(&quarantine)?;
+    sync_directory(directory)?;
+    phase_hook(LegacyStageCleanupPhase::AfterUnlink)?;
+    complete_legacy_stage_cleanup_record(
+        reserved_destination,
+        transfer_id,
+        &record,
+        expected_identity,
+        Some(quarantine_name),
+        phase_hook,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn macos_rename_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt as _};
+
+    if source.parent() != destination.parent() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "遗留暂存隔离必须保持在同一目录",
+        ));
+    }
+    let source = CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "遗留暂存路径包含空字节"))?;
+    let destination = CString::new(destination.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "隔离路径包含空字节"))?;
+    let succeeded = unsafe {
+        libc::renameatx_np(
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    if succeeded != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_restore_quarantine_without_overwrite(
+    quarantine: &Path,
+    staged: &Path,
+    directory: &Path,
+) -> io::Result<()> {
+    match macos_rename_no_replace(quarantine, staged) {
+        Ok(()) => sync_directory(directory),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::AlreadyExists | io::ErrorKind::NotFound
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) if macos_exclusive_rename_is_unavailable(&error) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_exclusive_rename_is_unavailable(error: &io::Error) -> bool {
+    let raw = error.raw_os_error();
+    [Some(libc::ENOSYS), Some(libc::ENOTSUP), Some(libc::EINVAL)].contains(&raw)
+}
+
+#[cfg(target_os = "macos")]
+fn sync_directory(directory: &Path) -> io::Result<()> {
+    File::open(directory)?.sync_all()
+}
+
+#[cfg(windows)]
+const _: fn(&Path) -> io::Result<File> = open_regular_file_for_delete_no_follow;
+
+#[cfg(target_os = "macos")]
+const _: fn(&Path, &Path) -> io::Result<()> = macos_rename_no_replace;
 
 pub fn finalize_reserved_receive(
     partial: &Path,
@@ -1118,6 +1639,20 @@ enum FinalizationState {
     Created,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+enum LegacyStageCleanupState {
+    Prepared,
+    Removed,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct LegacyStageCleanupRecord {
+    identity: FileIdentity,
+    #[serde(default)]
+    quarantine: Option<String>,
+    state: LegacyStageCleanupState,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct FinalizationRecord {
     prefix: String,
@@ -1129,6 +1664,8 @@ struct FinalizationRecord {
     staged: Option<String>,
     #[serde(default)]
     staged_identity: Option<FileIdentity>,
+    #[serde(default)]
+    stage_cleanup: Option<LegacyStageCleanupRecord>,
     identity: FileIdentity,
     state: FinalizationState,
 }
@@ -1196,9 +1733,18 @@ fn append_finalization_record_with_stage(
         previous,
         staged,
         staged_identity,
+        stage_cleanup: None,
         identity,
         state,
     };
+    append_finalization_record_value(reserved_destination, transfer_id, &record)
+}
+
+fn append_finalization_record_value(
+    reserved_destination: &Path,
+    transfer_id: &str,
+    record: &FinalizationRecord,
+) -> io::Result<()> {
     let encoded = serde_json::to_vec(&record).map_err(io::Error::other)?;
     let checksum = hex::encode(Sha256::digest(&encoded));
     let mut marker = OpenOptions::new()
@@ -1208,6 +1754,18 @@ fn append_finalization_record_with_stage(
     writeln!(marker, "{checksum} {}", hex::encode(encoded))?;
     marker.flush()?;
     marker.sync_all()
+}
+
+fn append_legacy_stage_cleanup_record(
+    reserved_destination: &Path,
+    transfer_id: &str,
+    record: &FinalizationRecord,
+    cleanup: LegacyStageCleanupRecord,
+) -> io::Result<FinalizationRecord> {
+    let mut updated = record.clone();
+    updated.stage_cleanup = Some(cleanup);
+    append_finalization_record_value(reserved_destination, transfer_id, &updated)?;
+    Ok(updated)
 }
 
 fn read_finalization_record(
@@ -1262,12 +1820,29 @@ fn read_finalization_record(
                 .as_deref()
                 .is_some_and(|name| !valid_finalization_stage_name(name, transfer_id))
             || (record.staged_identity.is_some() && record.staged.is_none())
+            || record.stage_cleanup.as_ref().is_some_and(|cleanup| {
+                record.staged.is_none()
+                    || cleanup.identity != record.staged_identity.unwrap_or(record.identity)
+                    || cleanup
+                        .quarantine
+                        .as_deref()
+                        .is_some_and(|name| !valid_finalization_quarantine_name(name))
+            })
         {
             continue;
         }
         latest = Some(record);
     }
     Ok(latest)
+}
+
+fn valid_finalization_quarantine_name(value: &str) -> bool {
+    if !valid_journal_file_name(value) {
+        return false;
+    }
+    value
+        .strip_prefix(".weline-localnet-finalize-quarantine-")
+        .is_some_and(|suffix| uuid::Uuid::parse_str(suffix).is_ok())
 }
 
 fn valid_journal_file_name(value: &str) -> bool {
@@ -1686,15 +2261,17 @@ mod tests {
     use std::{fs, io, io::Write as _};
 
     use super::{
-        FinalizationPhase, FinalizationState, append_finalization_record_with_stage,
-        commit_without_overwrite, copy_without_overwrite, file_identity, finalize_reserved_receive,
+        FinalizationPhase, FinalizationState, LegacyStageCleanupPhase, LegacyStageCleanupState,
+        append_finalization_record_with_stage, commit_without_overwrite, copy_without_overwrite,
+        create_legacy_finalized_stage_fixture, file_identity, finalize_reserved_receive,
         finalize_reserved_receive_copy_fallback_with_hooks, finalize_reserved_receive_durable,
         finalize_reserved_receive_durable_with_hooks, owned_finalization_reservations,
-        owned_finalized_receive_path, partial_owner_sidecar_path, remove_owned_finalization_stage,
-        remove_owned_finalization_stage_with_hook, remove_owned_partial, remove_owned_reservation,
-        reservation_is_owned, reserve_available_receive_path, reserve_finalization_stage,
-        reserve_receive_path, reserve_resumable_partial, resumable_partial_is_owned,
-        resumable_partial_path, safe_file_name,
+        owned_finalized_receive_path, partial_owner_sidecar_path, read_finalization_record,
+        remove_owned_finalization_stage, remove_owned_finalization_stage_with_hook,
+        remove_owned_finalization_stage_with_phase_hook, remove_owned_partial,
+        remove_owned_reservation, reservation_is_owned, reserve_available_receive_path,
+        reserve_finalization_stage, reserve_receive_path, reserve_resumable_partial,
+        resumable_partial_is_owned, resumable_partial_path, safe_file_name,
     };
 
     fn temporary_directory(label: &str) -> std::path::PathBuf {
@@ -2484,6 +3061,7 @@ mod tests {
         fs::remove_dir_all(directory).expect("remove fixture");
     }
 
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
     fn legacy_stage_cleanup_never_unlinks_a_concurrent_path_replacement() {
         let directory = temporary_directory("legacy-stage-cleanup-race");
@@ -2530,10 +3108,199 @@ mod tests {
             !cleaned,
             "legacy cleanup retains authority instead of unlinking by name"
         );
+        let cleanup = read_finalization_record(&destination, "legacy-stage", "legacy-token")
+            .unwrap()
+            .expect("legacy cleanup journal remains pending")
+            .stage_cleanup;
+        assert!(matches!(
+            cleanup,
+            Some(super::LegacyStageCleanupRecord {
+                state: LegacyStageCleanupState::Prepared,
+                ..
+            })
+        ));
         assert_eq!(fs::read(&detached).unwrap(), b"legacy owned stage");
         fs::remove_dir_all(directory).expect("remove fixture");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_legacy_stage_cleanup_crashes_are_restart_idempotent() {
+        for crash_phase in [
+            LegacyStageCleanupPhase::AfterOpenIdentityVerified,
+            LegacyStageCleanupPhase::AfterPreparation,
+            LegacyStageCleanupPhase::AfterNamespaceMutation,
+            LegacyStageCleanupPhase::AfterJournalComplete,
+        ] {
+            let directory = temporary_directory(&format!("windows-stage-crash-{crash_phase:?}"));
+            fs::create_dir_all(&directory).expect("create receive directory");
+            let destination = directory.join("report.bin");
+            let transfer_id = format!("windows-stage-crash-{crash_phase:?}");
+            let token = "legacy-token";
+            let payload = b"windows crash-idempotent hard link";
+            reserve_receive_path(&destination, &transfer_id, token).expect("reserve destination");
+            let staged =
+                create_legacy_finalized_stage_fixture(&destination, &transfer_id, token, payload)
+                    .expect("create identity-owned legacy stage");
+
+            let error = remove_owned_finalization_stage_with_phase_hook(
+                &destination,
+                &transfer_id,
+                token,
+                |phase| {
+                    if phase == crash_phase {
+                        Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            format!("injected cleanup crash at {phase:?}"),
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .expect_err("inject one cleanup crash");
+            assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+
+            assert!(
+                remove_owned_finalization_stage(&destination, &transfer_id, token)
+                    .expect("restart exact legacy cleanup")
+            );
+            assert!(!staged.exists());
+            assert_eq!(fs::read(&destination).unwrap(), payload);
+            fs::remove_dir_all(directory).expect("remove fixture");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_legacy_stage_quarantine_crashes_are_restart_idempotent() {
+        for crash_phase in [
+            LegacyStageCleanupPhase::AfterOpenIdentityVerified,
+            LegacyStageCleanupPhase::AfterPreparation,
+            LegacyStageCleanupPhase::AfterNamespaceMutation,
+            LegacyStageCleanupPhase::AfterQuarantineVerification,
+            LegacyStageCleanupPhase::AfterUnlink,
+            LegacyStageCleanupPhase::AfterJournalComplete,
+        ] {
+            let directory = temporary_directory(&format!("macos-stage-crash-{crash_phase:?}"));
+            fs::create_dir_all(&directory).expect("create receive directory");
+            let destination = directory.join("report.bin");
+            let transfer_id = format!("macos-stage-crash-{crash_phase:?}");
+            let token = "legacy-token";
+            let payload = b"macos crash-idempotent hard link";
+            reserve_receive_path(&destination, &transfer_id, token).expect("reserve destination");
+            let staged =
+                create_legacy_finalized_stage_fixture(&destination, &transfer_id, token, payload)
+                    .expect("create identity-owned legacy stage");
+
+            let error = remove_owned_finalization_stage_with_phase_hook(
+                &destination,
+                &transfer_id,
+                token,
+                |phase| {
+                    if phase == crash_phase {
+                        Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            format!("injected cleanup crash at {phase:?}"),
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .expect_err("inject one cleanup crash");
+            assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+
+            assert!(
+                remove_owned_finalization_stage(&destination, &transfer_id, token)
+                    .expect("restart quarantined legacy cleanup")
+            );
+            assert!(!staged.exists());
+            assert_eq!(fs::read(&destination).unwrap(), payload);
+            fs::remove_dir_all(directory).expect("remove fixture");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_quarantine_identity_mismatch_restores_without_overwrite_and_stays_pending() {
+        let directory = temporary_directory("macos-stage-quarantine-mismatch");
+        fs::create_dir_all(&directory).expect("create receive directory");
+        let destination = directory.join("report.bin");
+        let transfer_id = "macos-stage-quarantine-mismatch";
+        let token = "legacy-token";
+        let payload = b"macos owned stage payload";
+        reserve_receive_path(&destination, transfer_id, token).expect("reserve destination");
+        let staged =
+            create_legacy_finalized_stage_fixture(&destination, transfer_id, token, payload)
+                .expect("create identity-owned legacy stage");
+        let detached = directory.join("detached-owned-stage");
+
+        let cleaned = remove_owned_finalization_stage_with_phase_hook(
+            &destination,
+            transfer_id,
+            token,
+            |phase| {
+                if phase == LegacyStageCleanupPhase::AfterQuarantineVerification {
+                    let record = read_finalization_record(&destination, transfer_id, token)?
+                        .ok_or_else(|| io::Error::other("cleanup journal disappeared"))?;
+                    let quarantine = record
+                        .stage_cleanup
+                        .and_then(|cleanup| cleanup.quarantine)
+                        .ok_or_else(|| io::Error::other("cleanup quarantine was not journaled"))?;
+                    let quarantine = directory.join(quarantine);
+                    fs::rename(&quarantine, &detached)?;
+                    fs::write(&quarantine, b"concurrent quarantine replacement")?;
+                }
+                Ok(())
+            },
+        )
+        .expect("identity mismatch remains fail-closed");
+
+        assert!(!cleaned);
+        assert_eq!(
+            fs::read(&staged).unwrap(),
+            b"concurrent quarantine replacement"
+        );
+        assert_eq!(fs::read(&detached).unwrap(), payload);
+        assert_eq!(fs::read(&destination).unwrap(), payload);
+        assert!(
+            !remove_owned_finalization_stage(&destination, transfer_id, token)
+                .expect("replacement keeps cleanup pending")
+        );
+        fs::remove_dir_all(directory).expect("remove fixture");
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn identity_owned_legacy_stage_is_removed_while_the_final_hard_link_remains() {
+        let directory = temporary_directory("legacy-stage-cleanup-owned");
+        fs::create_dir_all(&directory).expect("create receive directory");
+        let destination = directory.join("report.bin");
+        let payload = b"legacy finalized hard-link payload";
+        reserve_receive_path(&destination, "legacy-owned", "legacy-token")
+            .expect("reserve destination");
+        let staged = create_legacy_finalized_stage_fixture(
+            &destination,
+            "legacy-owned",
+            "legacy-token",
+            payload,
+        )
+        .expect("create identity-owned legacy stage and final hard link");
+
+        assert_eq!(fs::read(&staged).unwrap(), payload);
+        assert_eq!(fs::read(&destination).unwrap(), payload);
+        assert!(
+            remove_owned_finalization_stage(&destination, "legacy-owned", "legacy-token")
+                .expect("retire exact legacy stage link")
+        );
+        assert!(!staged.exists());
+        assert_eq!(fs::read(&destination).unwrap(), payload);
+
+        fs::remove_dir_all(directory).expect("remove fixture");
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
     fn legacy_copy_prepared_stage_recovers_without_hard_links_and_retains_cleanup_authority() {
         let directory = temporary_directory("legacy-stage-recovery");
@@ -2593,11 +3360,8 @@ mod tests {
         let cleaned =
             remove_owned_finalization_stage(&destination, "legacy-recovery", "legacy-token")
                 .expect("clean legacy stage using retained identity authority");
-        assert!(
-            !cleaned,
-            "legacy pathname cleanup remains deliberately pending"
-        );
-        assert!(staged.exists());
+        assert!(cleaned, "identity-owned legacy stage cleanup must complete");
+        assert!(!staged.exists());
         assert_eq!(fs::read(&destination).unwrap(), payload);
         fs::remove_dir_all(directory).expect("remove fixture");
     }
