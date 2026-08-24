@@ -11,7 +11,10 @@ use tauri::AppHandle;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use super::{
-    resumable_transfer::{receive_acknowledged_chunks, send_acknowledged_chunks},
+    resumable_transfer::{
+        open_resumable_partial, receive_acknowledged_chunks, send_acknowledged_chunks,
+        verify_committed_manifest,
+    },
     runtime::{NetworkEvent, emit_event},
 };
 use crate::{
@@ -25,7 +28,7 @@ use crate::{
         commit_without_overwrite, finalize_reserved_receive, remove_owned_reservation,
     },
     storage::Storage,
-    transfer_policy::TransferProtocol,
+    transfer_policy::{TRANSFER_CHUNK_BYTES, TransferProtocol},
 };
 
 const BUFFER_SIZE: usize = 64 * 1024;
@@ -399,6 +402,7 @@ async fn receive_resumable_transfer(
         || transfer.direction != Direction::Incoming
         || transfer.status != TransferStatus::Transferring
         || transfer.transfer_protocol != TransferProtocol::ResumableV2 as u8
+        || header.chunk_size != TRANSFER_CHUNK_BYTES
         || header.chunk_size != transfer.chunk_size
         || header.start_offset != transfer.transferred_bytes
         || !storage.is_friend(&transfer.peer_id)?
@@ -457,18 +461,7 @@ async fn receive_resumable_body(
         .parent()
         .ok_or_else(|| AppError::InvalidInput("部分文件保存位置无效".to_string()))?;
     tokio::fs::create_dir_all(partial_parent).await?;
-    let file = tokio::fs::OpenOptions::new()
-        .create(start_offset == 0)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(&partial)
-        .await?;
-    if file.metadata().await?.len() != start_offset {
-        return Err(AppError::InvalidInput(
-            "部分文件长度与已提交恢复偏移量不一致".to_string(),
-        ));
-    }
+    let file = open_resumable_partial(&partial, start_offset).await?;
 
     let transfer_id = transfer.transfer_id.clone();
     let storage_for_finalize = storage.clone();
@@ -484,6 +477,7 @@ async fn receive_resumable_body(
         |chunk, committed_bytes| {
             storage.commit_received_chunk(&transfer_id, chunk, committed_bytes)
         },
+        || verify_committed_manifest(storage, transfer),
         move || async move {
             let file_name = destination_for_finalize
                 .file_name()

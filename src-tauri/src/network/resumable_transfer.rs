@@ -7,6 +7,7 @@ use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
 use crate::{
     domain::{Direction, TransferRecord},
     error::AppError,
+    storage::Storage,
     transfer_manifest::{
         TransferChunk, capture_source_snapshot, decode_sha256, expected_chunk_count,
         expected_chunk_length, manifest_root,
@@ -51,7 +52,7 @@ pub(crate) fn validate_resume_offset(
     chunk_size: u32,
     start_offset: u64,
 ) -> Result<u32, AppError> {
-    if chunk_size == 0 || chunk_size > TRANSFER_CHUNK_BYTES {
+    if chunk_size != TRANSFER_CHUNK_BYTES {
         return Err(AppError::InvalidInput("恢复分块大小无效".to_string()));
     }
     if start_offset > file_size {
@@ -135,7 +136,7 @@ fn validate_frame_header(
     file_size: u64,
     chunk_size: u32,
 ) -> Result<(), AppError> {
-    if chunk_size == 0 || chunk_size > TRANSFER_CHUNK_BYTES {
+    if chunk_size != TRANSFER_CHUNK_BYTES {
         return Err(AppError::InvalidInput("文件分块大小无效".to_string()));
     }
     if header.index != expected_index {
@@ -184,6 +185,30 @@ impl DurableChunkWriter for tokio::fs::File {
     async fn sync_data(&mut self) -> std::io::Result<()> {
         tokio::fs::File::sync_data(self).await
     }
+}
+
+pub(crate) async fn open_resumable_partial(
+    partial_path: &Path,
+    committed_offset: u64,
+) -> Result<tokio::fs::File, AppError> {
+    let file = tokio::fs::OpenOptions::new()
+        .create(committed_offset == 0)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(partial_path)
+        .await?;
+    let length = file.metadata().await?.len();
+    if length < committed_offset {
+        return Err(AppError::InvalidInput(
+            "部分文件短于已提交恢复偏移量，需要先执行恢复对账".to_string(),
+        ));
+    }
+    if length > committed_offset {
+        file.set_len(committed_offset).await?;
+        file.sync_data().await?;
+    }
+    Ok(file)
 }
 
 pub(crate) async fn send_acknowledged_chunks<S, P>(
@@ -274,18 +299,20 @@ where
     Ok(committed_offset)
 }
 
-pub(crate) async fn receive_acknowledged_chunks<S, W, C, F, Fut>(
+pub(crate) async fn receive_acknowledged_chunks<S, W, C, V, F, Fut>(
     stream: &mut S,
     mut destination: W,
     transfer: &TransferRecord,
     start_offset: u64,
     mut commit_chunk: C,
+    verify_manifest: V,
     finalize: F,
 ) -> Result<u64, AppError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
     W: DurableChunkWriter,
     C: FnMut(&TransferChunk, u64) -> Result<bool, AppError>,
+    V: FnOnce() -> Result<(), AppError>,
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<(), AppError>>,
 {
@@ -341,6 +368,7 @@ where
     }
 
     drop(destination);
+    verify_manifest()?;
     finalize().await?;
     stream.write_all(&committed_offset.to_be_bytes()).await?;
     stream.flush().await?;
@@ -403,6 +431,54 @@ fn validate_incoming_metadata(transfer: &TransferRecord) -> Result<(), AppError>
     Ok(())
 }
 
+pub(crate) fn verify_committed_manifest(
+    storage: &Storage,
+    accepted: &TransferRecord,
+) -> Result<(), AppError> {
+    let current = storage
+        .get_transfer(&accepted.transfer_id)?
+        .ok_or_else(|| AppError::Storage("最终清单校验时找不到接收传输记录".to_string()))?;
+    if current.direction != Direction::Incoming
+        || current.transfer_protocol != TransferProtocol::ResumableV2 as u8
+        || current.file_size != accepted.file_size
+        || current.chunk_size != accepted.chunk_size
+        || current.chunk_count != accepted.chunk_count
+        || current.transferred_bytes != accepted.file_size
+    {
+        return Err(AppError::InvalidInput(
+            "最终清单校验发现接收传输几何信息不一致".to_string(),
+        ));
+    }
+    let chunks = storage.list_transfer_chunks(&accepted.transfer_id)?;
+    if usize::try_from(accepted.chunk_count).ok() != Some(chunks.len()) {
+        return Err(AppError::IntegrityFailure);
+    }
+    let mut total_bytes = 0_u64;
+    for (expected_index, chunk) in chunks.iter().enumerate() {
+        let expected_index = u32::try_from(expected_index)
+            .map_err(|_| AppError::InvalidInput("最终清单分块索引溢出".to_string()))?;
+        if chunk.index != expected_index
+            || chunk.length
+                != expected_chunk_length(accepted.file_size, accepted.chunk_size, expected_index)?
+        {
+            return Err(AppError::IntegrityFailure);
+        }
+        total_bytes = total_bytes
+            .checked_add(u64::from(chunk.length))
+            .ok_or_else(|| AppError::InvalidInput("最终清单字节数溢出".to_string()))?;
+    }
+    let expected_root = decode_sha256(
+        accepted
+            .manifest_sha256
+            .as_deref()
+            .ok_or_else(|| AppError::InvalidInput("缺少接收分块清单哈希".to_string()))?,
+    )?;
+    if total_bytes != accepted.file_size || manifest_root(&chunks) != expected_root {
+        return Err(AppError::IntegrityFailure);
+    }
+    Ok(())
+}
+
 fn verify_source_snapshot(source_path: &Path, transfer: &TransferRecord) -> Result<(), AppError> {
     let expected_modified_ns = transfer
         .source_modified_ns
@@ -442,17 +518,25 @@ mod tests {
         io,
         path::{Path, PathBuf},
         pin::Pin,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
         task::{Context, Poll},
+        time::Duration,
     };
 
     use futures::io::{AsyncRead, AsyncWrite};
     use sha2::{Digest, Sha256};
-    use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
+    use tokio::io::{
+        AsyncRead as TokioAsyncRead, AsyncSeekExt as _, AsyncWrite as TokioAsyncWrite,
+        AsyncWriteExt as _, ReadBuf,
+    };
 
     use super::{
-        ChunkFrameHeader, DurableChunkWriter, read_chunk_frame, receive_acknowledged_chunks,
-        send_acknowledged_chunks, validate_resume_offset, write_chunk_frame,
+        ChunkFrameHeader, DurableChunkWriter, open_resumable_partial, read_chunk_frame,
+        receive_acknowledged_chunks, send_acknowledged_chunks, validate_resume_offset,
+        verify_committed_manifest, write_chunk_frame,
     };
     use crate::{
         domain::{Direction, TransferKind, TransferRecord, TransferStatus},
@@ -524,6 +608,84 @@ mod tests {
 
         fn poll_close(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
             Poll::Ready(Ok(()))
+        }
+    }
+
+    struct FuturesDuplex {
+        inner: tokio::io::DuplexStream,
+        write_limit: Option<usize>,
+        written: usize,
+    }
+
+    impl FuturesDuplex {
+        fn new(inner: tokio::io::DuplexStream) -> Self {
+            Self {
+                inner,
+                write_limit: None,
+                written: 0,
+            }
+        }
+
+        fn with_write_limit(inner: tokio::io::DuplexStream, write_limit: usize) -> Self {
+            Self {
+                inner,
+                write_limit: Some(write_limit),
+                written: 0,
+            }
+        }
+    }
+
+    impl AsyncRead for FuturesDuplex {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            buffer: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            let mut read_buffer = ReadBuf::new(buffer);
+            match TokioAsyncRead::poll_read(Pin::new(&mut self.inner), context, &mut read_buffer) {
+                Poll::Ready(Ok(())) => Poll::Ready(Ok(read_buffer.filled().len())),
+                Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+    }
+
+    impl AsyncWrite for FuturesDuplex {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            buffer: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let allowed = match self.write_limit {
+                Some(limit) => limit.saturating_sub(self.written),
+                None => buffer.len(),
+            };
+            if allowed == 0 {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "test duplex disconnected",
+                )));
+            }
+            let allowed_buffer = &buffer[..buffer.len().min(allowed)];
+            match TokioAsyncWrite::poll_write(Pin::new(&mut self.inner), context, allowed_buffer) {
+                Poll::Ready(Ok(written)) => {
+                    self.written = self
+                        .written
+                        .checked_add(written)
+                        .expect("test duplex byte count fits");
+                    Poll::Ready(Ok(written))
+                }
+                Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            TokioAsyncWrite::poll_flush(Pin::new(&mut self.inner), context)
+        }
+
+        fn poll_close(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            TokioAsyncWrite::poll_shutdown(Pin::new(&mut self.inner), context)
         }
     }
 
@@ -606,7 +768,7 @@ mod tests {
             destination_reserved: false,
             reservation_token: None,
             transfer_protocol: TransferProtocol::ResumableV2 as u8,
-            chunk_size: u32::try_from(payload.len()).expect("fixture length fits"),
+            chunk_size: TRANSFER_CHUNK_BYTES,
             chunk_count: 1,
             manifest_sha256: Some(hex::encode(manifest_root(&[chunk]))),
             partial_path: None,
@@ -709,9 +871,14 @@ mod tests {
         let payload = b"e";
         let mut stream = ScriptedStream::with_incoming(encoded_frame(1, payload, sha256(payload)));
 
-        let (header, bytes) = read_chunk_frame(&mut stream, 1, 5, 4)
-            .await
-            .expect("read final short frame");
+        let (header, bytes) = read_chunk_frame(
+            &mut stream,
+            1,
+            u64::from(TRANSFER_CHUNK_BYTES) + 1,
+            TRANSFER_CHUNK_BYTES,
+        )
+        .await
+        .expect("read final short frame");
 
         assert_eq!(header.index, 1);
         assert_eq!(header.length, 1);
@@ -719,10 +886,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn protocol_v2_reader_rejects_a_smaller_consistent_chunk_size() {
+        let payload = b"tiny";
+        let mut stream = ScriptedStream::with_incoming(encoded_frame(0, payload, sha256(payload)));
+
+        let result =
+            read_chunk_frame(&mut stream, 0, payload.len() as u64, payload.len() as u32).await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
     async fn bounded_reader_rejects_a_payload_hash_mismatch() {
         let mut stream = ScriptedStream::with_incoming(encoded_frame(0, b"abcd", sha256(b"wxyz")));
 
-        let error = read_chunk_frame(&mut stream, 0, 4, 4)
+        let error = read_chunk_frame(&mut stream, 0, 4, TRANSFER_CHUNK_BYTES)
             .await
             .expect_err("corrupted payload must fail");
 
@@ -734,14 +912,24 @@ mod tests {
         let frame = encoded_frame(1, b"abcd", sha256(b"abcd"));
 
         assert!(
-            read_chunk_frame(&mut ScriptedStream::with_incoming(frame.clone()), 0, 8, 4)
-                .await
-                .is_err()
+            read_chunk_frame(
+                &mut ScriptedStream::with_incoming(frame.clone()),
+                0,
+                u64::from(TRANSFER_CHUNK_BYTES) * 2,
+                TRANSFER_CHUNK_BYTES,
+            )
+            .await
+            .is_err()
         );
         assert!(
-            read_chunk_frame(&mut ScriptedStream::with_incoming(frame), 2, 12, 4)
-                .await
-                .is_err()
+            read_chunk_frame(
+                &mut ScriptedStream::with_incoming(frame),
+                2,
+                u64::from(TRANSFER_CHUNK_BYTES) * 3,
+                TRANSFER_CHUNK_BYTES,
+            )
+            .await
+            .is_err()
         );
     }
 
@@ -753,7 +941,7 @@ mod tests {
             &mut ScriptedStream::with_incoming(complete[..39].to_vec()),
             0,
             4,
-            4,
+            TRANSFER_CHUNK_BYTES,
         )
         .await
         .expect_err("truncated header must fail");
@@ -761,7 +949,7 @@ mod tests {
             &mut ScriptedStream::with_incoming(complete[..42].to_vec()),
             0,
             4,
-            4,
+            TRANSFER_CHUNK_BYTES,
         )
         .await
         .expect_err("truncated payload must fail");
@@ -782,21 +970,31 @@ mod tests {
         .to_vec();
         let oversized = ChunkFrameHeader {
             index: 0,
-            length: 5,
+            length: TRANSFER_CHUNK_BYTES + 1,
             sha256: sha256(b"abcde"),
         }
         .encode()
         .to_vec();
 
         assert!(
-            read_chunk_frame(&mut ScriptedStream::with_incoming(zero), 0, 8, 4)
-                .await
-                .is_err()
+            read_chunk_frame(
+                &mut ScriptedStream::with_incoming(zero),
+                0,
+                u64::from(TRANSFER_CHUNK_BYTES) * 2,
+                TRANSFER_CHUNK_BYTES,
+            )
+            .await
+            .is_err()
         );
         assert!(
-            read_chunk_frame(&mut ScriptedStream::with_incoming(oversized), 0, 4, 4)
-                .await
-                .is_err()
+            read_chunk_frame(
+                &mut ScriptedStream::with_incoming(oversized),
+                0,
+                u64::from(TRANSFER_CHUNK_BYTES),
+                TRANSFER_CHUNK_BYTES,
+            )
+            .await
+            .is_err()
         );
     }
 
@@ -805,12 +1003,12 @@ mod tests {
         let mut stream = ScriptedStream::default();
         let header = ChunkFrameHeader {
             index: 0,
-            length: 4,
+            length: 3,
             sha256: sha256(b"abc"),
         };
 
         assert!(
-            write_chunk_frame(&mut stream, &header, b"abc", 3, 4)
+            write_chunk_frame(&mut stream, &header, b"ab", 3, TRANSFER_CHUNK_BYTES)
                 .await
                 .is_err()
         );
@@ -819,17 +1017,44 @@ mod tests {
 
     #[test]
     fn resume_offsets_accept_boundaries_and_complete_size() {
-        assert_eq!(validate_resume_offset(10, 4, 0).unwrap(), 0);
-        assert_eq!(validate_resume_offset(10, 4, 8).unwrap(), 2);
-        assert_eq!(validate_resume_offset(10, 4, 10).unwrap(), 3);
+        let file_size = u64::from(TRANSFER_CHUNK_BYTES) * 2 + 2;
+        assert_eq!(
+            validate_resume_offset(file_size, TRANSFER_CHUNK_BYTES, 0).unwrap(),
+            0
+        );
+        assert_eq!(
+            validate_resume_offset(
+                file_size,
+                TRANSFER_CHUNK_BYTES,
+                u64::from(TRANSFER_CHUNK_BYTES) * 2,
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            validate_resume_offset(file_size, TRANSFER_CHUNK_BYTES, file_size).unwrap(),
+            3
+        );
     }
 
     #[test]
     fn resume_offsets_reject_unaligned_out_of_range_and_index_overflow() {
-        assert!(validate_resume_offset(10, 4, 5).is_err());
-        assert!(validate_resume_offset(10, 4, 11).is_err());
-        assert!(validate_resume_offset(u64::MAX, 1, u64::MAX - 1).is_err());
-        assert!(validate_resume_offset(u64::MAX, 4, 0).is_err());
+        let file_size = u64::from(TRANSFER_CHUNK_BYTES) * 2 + 2;
+        assert!(
+            validate_resume_offset(
+                file_size,
+                TRANSFER_CHUNK_BYTES,
+                u64::from(TRANSFER_CHUNK_BYTES) + 1,
+            )
+            .is_err()
+        );
+        assert!(validate_resume_offset(file_size, TRANSFER_CHUNK_BYTES, file_size + 1).is_err());
+        assert!(validate_resume_offset(u64::MAX, TRANSFER_CHUNK_BYTES, u64::MAX - 1).is_err());
+        assert!(validate_resume_offset(u64::MAX, TRANSFER_CHUNK_BYTES, 0).is_err());
+        assert!(
+            validate_resume_offset(u64::from(TRANSFER_CHUNK_BYTES), TRANSFER_CHUNK_BYTES / 2, 0,)
+                .is_err()
+        );
         assert!(validate_resume_offset(10, 0, 0).is_err());
     }
 
@@ -841,7 +1066,7 @@ mod tests {
         let writer = TrackingFile::open(&partial, Arc::new(Mutex::new(Vec::new())), false).await;
         let mut transfer = small_incoming_transfer(b"x", sha256(b"x"));
         transfer.file_size = 0;
-        transfer.chunk_size = 4;
+        transfer.chunk_size = TRANSFER_CHUNK_BYTES;
         transfer.chunk_count = 0;
         transfer.manifest_sha256 = Some("0".repeat(64));
         let mut stream = ScriptedStream::default();
@@ -854,6 +1079,7 @@ mod tests {
             &transfer,
             0,
             |_, _| Ok(true),
+            || Ok(()),
             move || async move {
                 *finalized_for_callback.lock().expect("lock finalized flag") = true;
                 Ok(())
@@ -912,6 +1138,7 @@ mod tests {
                 commit_called = true;
                 Ok(true)
             },
+            || Ok(()),
             || async { Ok(()) },
         )
         .await
@@ -955,6 +1182,7 @@ mod tests {
                     commit_called = true;
                     Ok(false)
                 },
+                || Ok(()),
                 || async { Ok(()) },
             )
             .await;
@@ -982,6 +1210,7 @@ mod tests {
             &transfer,
             0,
             |_, _| Ok(true),
+            || Ok(()),
             || async { Err(AppError::Storage("scripted finalize failure".to_string())) },
         )
         .await
@@ -989,6 +1218,198 @@ mod tests {
 
         assert_eq!(error.code(), "storage_error");
         assert!(stream.written.is_empty());
+        std::fs::remove_dir_all(fixture).expect("remove fixture");
+    }
+
+    #[tokio::test]
+    async fn receiver_rejects_a_self_consistent_substituted_non_empty_manifest_before_finalize() {
+        let fixture = fixture_directory("substituted-manifest");
+        std::fs::create_dir_all(&fixture).expect("create fixture");
+        let partial = fixture.join("payload.part");
+        let writer = TrackingFile::open(&partial, Arc::new(Mutex::new(Vec::new())), false).await;
+        let accepted_payload = b"good";
+        let substituted_payload = b"evil";
+        let accepted_hash = sha256(accepted_payload);
+        let substituted_hash = sha256(substituted_payload);
+        let transfer = small_incoming_transfer(accepted_payload, accepted_hash);
+        let mut stream =
+            ScriptedStream::with_incoming(encoded_frame(0, substituted_payload, substituted_hash));
+        let committed = Arc::new(Mutex::new(Vec::new()));
+        let committed_for_commit = committed.clone();
+        let committed_for_verify = committed.clone();
+        let expected_root = crate::transfer_manifest::decode_sha256(
+            transfer
+                .manifest_sha256
+                .as_deref()
+                .expect("accepted manifest root"),
+        )
+        .expect("decode accepted root");
+        let finalized = Arc::new(Mutex::new(false));
+        let finalized_for_callback = finalized.clone();
+
+        let error = receive_acknowledged_chunks(
+            &mut stream,
+            writer,
+            &transfer,
+            0,
+            move |chunk, _| {
+                committed_for_commit
+                    .lock()
+                    .expect("lock committed chunks")
+                    .push(chunk.clone());
+                Ok(true)
+            },
+            move || {
+                let actual_root =
+                    manifest_root(&committed_for_verify.lock().expect("lock committed chunks"));
+                if actual_root != expected_root {
+                    return Err(AppError::IntegrityFailure);
+                }
+                Ok(())
+            },
+            move || async move {
+                *finalized_for_callback.lock().expect("lock finalized flag") = true;
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("substituted manifest must fail before finalization");
+
+        assert_eq!(error.code(), "integrity_failure");
+        assert!(!*finalized.lock().expect("lock finalized flag"));
+        assert!(stream.written.is_empty());
+        std::fs::remove_dir_all(fixture).expect("remove fixture");
+    }
+
+    #[test]
+    fn production_manifest_verifier_loads_ordered_records_and_rejects_a_substitution() {
+        let fixture = fixture_directory("persisted-manifest-verify");
+        std::fs::create_dir_all(&fixture).expect("create fixture");
+        let accepted_payload = b"good";
+        let substituted_payload = b"evil";
+        let transfer = small_incoming_transfer(accepted_payload, sha256(accepted_payload));
+        let database = fixture.join("receiver.sqlite3");
+        let storage = Storage::open(&database).expect("open storage");
+        storage
+            .upsert_transfer(&transfer)
+            .expect("persist accepted transfer");
+        let connection = rusqlite::Connection::open(&database).expect("open storage connection");
+        connection
+            .execute(
+                "INSERT INTO transfer_chunks (transfer_id, chunk_index, chunk_length, sha256)
+                 VALUES (?1, 0, 4, ?2)",
+                rusqlite::params![transfer.transfer_id, sha256(substituted_payload).as_slice()],
+            )
+            .expect("insert substituted committed record");
+        connection
+            .execute(
+                "UPDATE transfers SET transferred_bytes = 4 WHERE transfer_id = ?1",
+                [&transfer.transfer_id],
+            )
+            .expect("advance simulated committed progress");
+        drop(connection);
+
+        assert_eq!(
+            verify_committed_manifest(&storage, &transfer)
+                .expect_err("substituted persisted manifest must fail")
+                .code(),
+            "integrity_failure"
+        );
+
+        let connection = rusqlite::Connection::open(&database).expect("open storage connection");
+        connection
+            .execute(
+                "UPDATE transfer_chunks SET sha256 = ?2 WHERE transfer_id = ?1",
+                rusqlite::params![transfer.transfer_id, sha256(accepted_payload).as_slice()],
+            )
+            .expect("restore accepted committed record");
+        drop(connection);
+        verify_committed_manifest(&storage, &transfer).expect("accepted ordered manifest succeeds");
+
+        drop(storage);
+        std::fs::remove_dir_all(fixture).expect("remove fixture");
+    }
+
+    #[tokio::test]
+    async fn reopening_truncates_uncommitted_tail_and_resumes_without_touching_prefix() {
+        let fixture = fixture_directory("truncate-tail-resume");
+        std::fs::create_dir_all(&fixture).expect("create fixture");
+        let source = fixture.join("source.bin");
+        let partial = fixture.join("payload.part");
+        let chunk_len = usize::try_from(TRANSFER_CHUNK_BYTES).expect("chunk size fits usize");
+        let prefix = vec![0x31; chunk_len];
+        let suffix = b"verified-suffix";
+        let mut expected = prefix.clone();
+        expected.extend_from_slice(suffix);
+        std::fs::write(&source, &expected).expect("write source");
+        let manifest = build_manifest(&source, TRANSFER_CHUNK_BYTES).expect("build manifest");
+        let transfer = transfer_record(
+            Direction::Incoming,
+            None,
+            Some(&fixture.join("destination.bin")),
+            Some(&partial),
+            &manifest,
+        );
+        let resume_offset = u64::from(TRANSFER_CHUNK_BYTES);
+        let storage = Storage::open(&fixture.join("receiver.sqlite3")).expect("open storage");
+        storage
+            .upsert_transfer(&transfer)
+            .expect("persist incoming transfer");
+        assert!(
+            storage
+                .commit_received_chunk(&transfer.transfer_id, &manifest.chunks[0], resume_offset)
+                .expect("commit prefix authority")
+        );
+        let resumed_transfer = storage
+            .get_transfer(&transfer.transfer_id)
+            .expect("load receiver authority")
+            .expect("incoming transfer exists");
+        let mut partial_with_tail = prefix.clone();
+        partial_with_tail.extend_from_slice(b"uncommitted-tail-that-must-be-removed");
+        std::fs::write(&partial, partial_with_tail).expect("write partial with durable tail");
+
+        let file = open_resumable_partial(&partial, resume_offset)
+            .await
+            .expect("truncate uncommitted tail");
+        assert_eq!(
+            file.metadata().await.expect("partial metadata").len(),
+            resume_offset
+        );
+        let mut stream =
+            ScriptedStream::with_incoming(encoded_frame(1, suffix, manifest.chunks[1].sha256));
+        receive_acknowledged_chunks(
+            &mut stream,
+            file,
+            &resumed_transfer,
+            resume_offset,
+            |chunk, committed| {
+                storage.commit_received_chunk(&transfer.transfer_id, chunk, committed)
+            },
+            || verify_committed_manifest(&storage, &resumed_transfer),
+            || async { Ok(()) },
+        )
+        .await
+        .expect("resume suffix after truncation");
+
+        assert_eq!(
+            std::fs::read(&partial).expect("read resumed partial"),
+            expected
+        );
+        assert_eq!(stream.written, acknowledgement_bytes(&[manifest.file_size]));
+
+        std::fs::write(&partial, &prefix[..chunk_len - 1]).expect("write short partial");
+        assert!(
+            open_resumable_partial(&partial, resume_offset)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::metadata(&partial)
+                .expect("short partial metadata")
+                .len(),
+            resume_offset - 1
+        );
+        drop(storage);
         std::fs::remove_dir_all(fixture).expect("remove fixture");
     }
 
@@ -1134,6 +1555,7 @@ mod tests {
             |chunk, committed| {
                 receiver_storage.commit_received_chunk(&incoming.transfer_id, chunk, committed)
             },
+            || Ok(()),
             || async { Ok(()) },
         )
         .await;
@@ -1186,6 +1608,7 @@ mod tests {
             |chunk, committed| {
                 receiver_storage.commit_received_chunk(&incoming.transfer_id, chunk, committed)
             },
+            || verify_committed_manifest(&receiver_storage, &resumed_incoming),
             move || async move {
                 *finalized_for_callback.lock().expect("lock finalized flag") = true;
                 Ok(())
@@ -1214,6 +1637,223 @@ mod tests {
                 .expect("incoming transfer exists")
                 .transferred_bytes,
             final_offset
+        );
+
+        drop(receiver_storage);
+        drop(sender_storage);
+        std::fs::remove_dir_all(fixture).expect("remove fixture");
+    }
+
+    #[tokio::test]
+    async fn concurrent_duplex_exchange_resumes_from_receiver_acks_and_finalizes_before_final_ack()
+    {
+        let fixture = fixture_directory("concurrent-duplex-resume");
+        std::fs::create_dir_all(&fixture).expect("create fixture");
+        let source = fixture.join("source.bin");
+        let partial = fixture.join("payload.part");
+        let destination = fixture.join("payload.bin");
+        let chunk_len = usize::try_from(TRANSFER_CHUNK_BYTES).expect("chunk size fits usize");
+        let mut source_bytes = vec![0x41; chunk_len];
+        source_bytes.extend(vec![0x52; chunk_len]);
+        source_bytes.extend(b"duplex-final-suffix");
+        std::fs::write(&source, &source_bytes).expect("write source fixture");
+        let manifest = build_manifest(&source, TRANSFER_CHUNK_BYTES).expect("build manifest");
+        let outgoing = transfer_record(Direction::Outgoing, Some(&source), None, None, &manifest);
+        let incoming = transfer_record(
+            Direction::Incoming,
+            None,
+            Some(&destination),
+            Some(&partial),
+            &manifest,
+        );
+        let sender_storage =
+            Storage::open(&fixture.join("duplex-sender.sqlite3")).expect("open sender storage");
+        sender_storage
+            .create_outgoing_transfer_with_manifest(&outgoing, &manifest.chunks)
+            .expect("persist sender manifest");
+        let persisted_chunks = sender_storage
+            .list_transfer_chunks(&outgoing.transfer_id)
+            .expect("load sender chunks");
+        let receiver_storage =
+            Storage::open(&fixture.join("duplex-receiver.sqlite3")).expect("open receiver storage");
+        receiver_storage
+            .upsert_transfer(&incoming)
+            .expect("persist incoming transfer");
+        let first_offset = u64::from(TRANSFER_CHUNK_BYTES);
+        let resume_offset = first_offset * 2;
+        let two_frame_bytes = (40 + chunk_len) * 2;
+        let sender_progress = Arc::new(Mutex::new(Vec::new()));
+        let sender_progress_for_task = sender_progress.clone();
+        let finalized_first_exchange = Arc::new(AtomicBool::new(false));
+        let finalized_first_for_task = finalized_first_exchange.clone();
+        let write_offsets = Arc::new(Mutex::new(Vec::new()));
+        let first_writer = TrackingFile::open(&partial, write_offsets.clone(), false).await;
+        let (sender_half, receiver_half) = tokio::io::duplex(64 * 1024);
+        let source_for_sender = source.clone();
+        let outgoing_for_sender = outgoing.clone();
+        let chunks_for_sender = persisted_chunks.clone();
+        let incoming_for_receiver = incoming.clone();
+        let receiver_storage_for_task = receiver_storage.clone();
+        let first_exchange = async move {
+            let sender = async move {
+                let mut stream = FuturesDuplex::with_write_limit(sender_half, two_frame_bytes);
+                send_acknowledged_chunks(
+                    &mut stream,
+                    &source_for_sender,
+                    &outgoing_for_sender,
+                    &chunks_for_sender,
+                    0,
+                    |offset| {
+                        sender_progress_for_task
+                            .lock()
+                            .expect("lock sender progress")
+                            .push(offset);
+                        Ok(())
+                    },
+                )
+                .await
+            };
+            let receiver = async move {
+                let mut stream = FuturesDuplex::new(receiver_half);
+                receive_acknowledged_chunks(
+                    &mut stream,
+                    first_writer,
+                    &incoming_for_receiver,
+                    0,
+                    |chunk, committed| {
+                        receiver_storage_for_task.commit_received_chunk(
+                            &incoming_for_receiver.transfer_id,
+                            chunk,
+                            committed,
+                        )
+                    },
+                    || {
+                        verify_committed_manifest(
+                            &receiver_storage_for_task,
+                            &incoming_for_receiver,
+                        )
+                    },
+                    move || async move {
+                        finalized_first_for_task.store(true, Ordering::SeqCst);
+                        Ok(())
+                    },
+                )
+                .await
+            };
+            tokio::join!(sender, receiver)
+        };
+        let (first_send, first_receive) =
+            tokio::time::timeout(Duration::from_secs(30), first_exchange)
+                .await
+                .expect("first duplex exchange must not deadlock");
+
+        assert!(matches!(first_send, Err(AppError::Io(_))));
+        assert!(matches!(first_receive, Err(AppError::Io(_))));
+        assert_eq!(
+            *sender_progress.lock().expect("lock sender progress"),
+            vec![first_offset, resume_offset]
+        );
+        assert!(!finalized_first_exchange.load(Ordering::SeqCst));
+        let resumed_incoming = receiver_storage
+            .get_transfer(&incoming.transfer_id)
+            .expect("load receiver authority")
+            .expect("incoming transfer exists");
+        assert_eq!(resumed_incoming.transferred_bytes, resume_offset);
+
+        let resumed_file = open_resumable_partial(&partial, resume_offset)
+            .await
+            .expect("open committed partial");
+        let finalized = Arc::new(AtomicBool::new(false));
+        let finalized_for_receiver = finalized.clone();
+        let ack_observed_after_finalize = Arc::new(AtomicBool::new(false));
+        let ack_order_for_sender = ack_observed_after_finalize.clone();
+        let finalized_for_sender = finalized.clone();
+        let resumed_progress = Arc::new(Mutex::new(Vec::new()));
+        let resumed_progress_for_sender = resumed_progress.clone();
+        let (sender_half, receiver_half) = tokio::io::duplex(64 * 1024);
+        let source_for_sender = source.clone();
+        let outgoing_for_sender = outgoing.clone();
+        let chunks_for_sender = persisted_chunks.clone();
+        let receiver_storage_for_task = receiver_storage.clone();
+        let resumed_transfer_for_receiver = resumed_incoming.clone();
+        let final_exchange = async move {
+            let sender = async move {
+                let mut stream = FuturesDuplex::new(sender_half);
+                send_acknowledged_chunks(
+                    &mut stream,
+                    &source_for_sender,
+                    &outgoing_for_sender,
+                    &chunks_for_sender,
+                    resume_offset,
+                    |offset| {
+                        ack_order_for_sender.store(
+                            finalized_for_sender.load(Ordering::SeqCst),
+                            Ordering::SeqCst,
+                        );
+                        resumed_progress_for_sender
+                            .lock()
+                            .expect("lock resumed progress")
+                            .push(offset);
+                        Ok(())
+                    },
+                )
+                .await
+            };
+            let receiver = async move {
+                let mut stream = FuturesDuplex::new(receiver_half);
+                receive_acknowledged_chunks(
+                    &mut stream,
+                    resumed_file,
+                    &resumed_transfer_for_receiver,
+                    resume_offset,
+                    |chunk, committed| {
+                        receiver_storage_for_task.commit_received_chunk(
+                            &resumed_transfer_for_receiver.transfer_id,
+                            chunk,
+                            committed,
+                        )
+                    },
+                    || {
+                        verify_committed_manifest(
+                            &receiver_storage_for_task,
+                            &resumed_transfer_for_receiver,
+                        )
+                    },
+                    move || async move {
+                        finalized_for_receiver.store(true, Ordering::SeqCst);
+                        Ok(())
+                    },
+                )
+                .await
+            };
+            tokio::join!(sender, receiver)
+        };
+        let (final_send, final_receive) =
+            tokio::time::timeout(Duration::from_secs(30), final_exchange)
+                .await
+                .expect("resumed duplex exchange must not deadlock");
+
+        assert_eq!(
+            final_send.expect("sender receives final ACK"),
+            manifest.file_size
+        );
+        assert_eq!(
+            final_receive.expect("receiver completes suffix"),
+            manifest.file_size
+        );
+        assert_eq!(
+            *resumed_progress.lock().expect("lock resumed progress"),
+            vec![manifest.file_size]
+        );
+        assert!(finalized.load(Ordering::SeqCst));
+        assert!(ack_observed_after_finalize.load(Ordering::SeqCst));
+        assert_eq!(
+            *write_offsets.lock().expect("lock write offsets"),
+            vec![0, first_offset]
+        );
+        assert_eq!(
+            std::fs::read(&partial).expect("read final partial"),
+            source_bytes
         );
 
         drop(receiver_storage);
