@@ -16,7 +16,7 @@
 - Preserve `com.aiweline.localnet`, the existing app-data/SQLite path, keyring identity, Peer ID, protocol names, UDP magic/port, and `localnet://event`.
 - Keep all discovery and transfer traffic on the LAN; do not add cloud discovery, relay, MAC-address identity, or automatic friendship.
 - Treat mDNS/TXT/UDP data only as dial hints; peers become online only after TCP, Noise, and Hello.
-- Keep the Windows installer `currentUser` and `asInvoker`; do not add installer hooks, firewall automation, or permission prompts.
+- Keep the Windows installer `currentUser` and `asInvoker`; the only installer hook may migrate the old Weline Chat current-user install directory/registry keys after a successful copy. Do not add firewall automation, process execution, elevation, or permission prompts.
 - Do not add persistent unit or E2E test files. Use temporary diagnostics, remove them before each commit, and finish with real-process/desktop acceptance.
 - Do not modify historical 0.1.3 design records merely to replace their historical product/version text.
 
@@ -266,6 +266,7 @@
 - Modify: `src-tauri/Cargo.toml`
 - Modify: `src-tauri/Cargo.lock`
 - Modify: `src-tauri/tauri.conf.json`
+- Create: `src-tauri/windows/installer-hooks.nsh`
 - Modify: `src-tauri/Info.plist`
 - Modify: `src-tauri/capabilities/default.json`
 - Modify: `src-tauri/src/network/behaviour.rs`
