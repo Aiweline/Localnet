@@ -1190,6 +1190,17 @@ impl Storage {
             !normalized.contains("typeof(sha256)='blob'andlength(sha256)=32")
         });
         if requires_chunk_table_rebuild {
+            let invalid_chunk_hashes: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM transfer_chunks
+                 WHERE typeof(sha256) != 'blob' OR length(sha256) != 32",
+                [],
+                |row| row.get(0),
+            )?;
+            if invalid_chunk_hashes != 0 {
+                return Err(AppError::Storage(format!(
+                    "检测到 {invalid_chunk_hashes} 条旧版传输分块哈希无效；迁移已回滚，请先保留数据并执行恢复"
+                )));
+            }
             transaction.execute_batch(
                 "ALTER TABLE transfer_chunks RENAME TO transfer_chunks_legacy;
                  CREATE TABLE transfer_chunks (
@@ -1202,8 +1213,7 @@ impl Storage {
                  );
                  INSERT INTO transfer_chunks (transfer_id, chunk_index, chunk_length, sha256)
                    SELECT transfer_id, chunk_index, chunk_length, sha256
-                   FROM transfer_chunks_legacy
-                   WHERE typeof(sha256) = 'blob' AND length(sha256) = 32;
+                   FROM transfer_chunks_legacy;
                  DROP TABLE transfer_chunks_legacy;",
             )?;
         }
@@ -1801,6 +1811,79 @@ mod tests {
 
         drop(connection);
         drop(storage);
+        fs::remove_dir_all(fixture).expect("remove storage fixture");
+    }
+
+    #[test]
+    fn migration_fails_closed_and_preserves_invalid_legacy_chunk_state() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-chunk-table-fail-closed-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&fixture).expect("create storage fixture");
+        let database = fixture.join("localnet.sqlite3");
+        Storage::open(&database).expect("create current schema");
+        {
+            let connection = Connection::open(&database).expect("open weak-schema database");
+            connection
+                .execute_batch(
+                    "DROP TABLE transfer_chunks;
+                     CREATE TABLE transfer_chunks (
+                       transfer_id TEXT NOT NULL,
+                       chunk_index INTEGER NOT NULL,
+                       chunk_length INTEGER NOT NULL,
+                       sha256 BLOB NOT NULL CHECK(length(sha256) = 32),
+                       PRIMARY KEY (transfer_id, chunk_index)
+                     );
+                     INSERT INTO transfers
+                       (transfer_id, peer_id, direction, kind, file_name, file_size, mime_type,
+                        sha256, transfer_protocol, chunk_size, chunk_count, manifest_sha256,
+                        transferred_bytes, status, created_at, updated_at)
+                     VALUES
+                       ('invalid-legacy-transfer', 'peer-one', 'incoming', 'file', 'report.txt',
+                        4194304, 'text/plain',
+                        '0000000000000000000000000000000000000000000000000000000000000000',
+                        2, 4194304, 1,
+                        '0000000000000000000000000000000000000000000000000000000000000000',
+                        1048576, 'transferring',
+                        '2026-08-24T00:00:00.000Z', '2026-08-24T00:00:00.000Z');
+                     INSERT INTO transfer_chunks
+                       VALUES ('invalid-legacy-transfer', 0, 4194304,
+                               'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx');",
+                )
+                .expect("seed weak table with invalid text hash");
+        }
+
+        let error = match Storage::open(&database) {
+            Ok(_) => panic!("invalid old chunks must block migration"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("分块哈希"));
+
+        let connection = Connection::open(&database).expect("read failed migration database");
+        let schema: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'transfer_chunks'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read unchanged old schema");
+        assert!(schema.contains("CHECK(length(sha256) = 32)"));
+        let state: (String, i64, i64, i64) = connection
+            .query_row(
+                "SELECT typeof(chunk.sha256), transfer.chunk_count, transfer.transferred_bytes,
+                        COUNT(*)
+                 FROM transfer_chunks chunk
+                 JOIN transfers transfer ON transfer.transfer_id = chunk.transfer_id
+                 WHERE chunk.transfer_id = 'invalid-legacy-transfer'
+                 GROUP BY chunk.transfer_id",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read unchanged invalid row and transfer progress");
+        assert_eq!(state, ("text".to_string(), 1, 1_048_576, 1));
+
+        drop(connection);
         fs::remove_dir_all(fixture).expect("remove storage fixture");
     }
 
