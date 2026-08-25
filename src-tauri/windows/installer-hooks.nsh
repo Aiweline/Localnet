@@ -44,8 +44,9 @@ weline_localnet_postinstall_done:
 
   SetShellVarContext current
   CreateDirectory "$APPDATA\com.aiweline.localnet"
-  GetTempFileName $R7
-  Delete $R7
+  System::Call 'ole32::CoCreateGuid(g .s)'
+  Pop $R7
+  StrCmp $R7 "" weline_localnet_locale_done
   ClearErrors
   FileOpen $R8 "$APPDATA\com.aiweline.localnet\installer-locale" w
   IfErrors weline_localnet_locale_done

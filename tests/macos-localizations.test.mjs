@@ -79,6 +79,7 @@ test("Windows installer always offers and hands off the exact ten supported lang
     );
   }
   assert.match(hook, /\$APPDATA\\com\.aiweline\.localnet\\installer-locale/u);
-  assert.match(hook, /GetTempFileName \$R7/u);
+  assert.match(hook, /ole32::CoCreateGuid\(g \.s\)/u);
+  assert.match(hook, /Pop \$R7/u);
   assert.match(hook, /FileWrite \$R8 "\$R9\$\\n\$R7"/u);
 });

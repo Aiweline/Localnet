@@ -88,8 +88,11 @@ function App() {
   const refreshTimer = useRef<number | null>(null);
   const languagePreferenceRef = useRef<LanguagePreference | null>(null);
   const translatorRef = useRef(t);
-  translatorRef.current = t;
   const hasOnlinePeer = snapshot.peers.some((peer) => peer.online);
+
+  useEffect(() => {
+    translatorRef.current = t;
+  }, [t]);
 
   const refresh = useCallback(async (showLoader = false) => {
     if (showLoader) setLoading(true);

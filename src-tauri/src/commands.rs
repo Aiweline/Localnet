@@ -739,7 +739,7 @@ where
         .parent()
         .filter(|parent| parent.is_dir())
         .ok_or_else(|| AppError::InvalidInput("另存目录不存在".to_string()))?;
-    let destination_name = destination
+    destination
         .file_name()
         .filter(|name| !name.is_empty())
         .ok_or_else(|| AppError::InvalidInput("另存文件名无效".to_string()))?;
@@ -753,8 +753,7 @@ where
         }
     }
 
-    let (temporary, staging_directory, mut temporary_file) =
-        create_save_temporary(parent, destination_name)?;
+    let (temporary, staging_directory, mut temporary_file) = create_save_temporary(parent)?;
     let temporary_identity = save_file_identity(&temporary_file)?;
     let copy_result = (|| -> Result<u64, AppError> {
         let copied = std::io::copy(&mut source_file, &mut temporary_file)?;
@@ -785,21 +784,14 @@ where
 }
 
 #[cfg(windows)]
-fn create_save_temporary(
-    parent: &Path,
-    destination_name: &std::ffi::OsStr,
-) -> Result<(PathBuf, Option<PathBuf>, File), AppError> {
+fn create_save_temporary(parent: &Path) -> Result<(PathBuf, Option<PathBuf>, File), AppError> {
     use std::os::windows::fs::OpenOptionsExt as _;
     use windows_sys::Win32::Storage::FileSystem::{
         DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
         FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
 
-    let temporary = parent.join(format!(
-        ".{}.weline-save-{}.part",
-        destination_name.to_string_lossy(),
-        uuid::Uuid::now_v7()
-    ));
+    let temporary = parent.join(format!(".weline-save-{}.part", uuid::Uuid::now_v7()));
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -812,10 +804,7 @@ fn create_save_temporary(
 }
 
 #[cfg(unix)]
-fn create_save_temporary(
-    parent: &Path,
-    _destination_name: &std::ffi::OsStr,
-) -> Result<(PathBuf, Option<PathBuf>, File), AppError> {
+fn create_save_temporary(parent: &Path) -> Result<(PathBuf, Option<PathBuf>, File), AppError> {
     use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 
     let staging_directory = parent.join(format!(".weline-save-{}.staging", uuid::Uuid::now_v7()));
