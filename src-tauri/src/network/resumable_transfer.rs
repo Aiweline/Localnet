@@ -733,6 +733,7 @@ fn is_recoverable_stream_error(error: &AppError) -> bool {
         | AppError::Storage(_)
         | AppError::Identity(_)
         | AppError::Permission(_)
+        | AppError::Update(_)
         | AppError::NotFriend
         | AppError::IncompatibleProtocol
         | AppError::IntegrityFailure
