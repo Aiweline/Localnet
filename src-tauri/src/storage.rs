@@ -8701,6 +8701,8 @@ mod tests {
             let transfer_id = format!("{status}-partial-proof-lost");
             let reservation_token = format!("{status}-reservation-token");
             let destination = fixture.join("report.bin");
+            reserve_receive_path(&destination, &transfer_id, &reservation_token)
+                .expect("reserve destination");
             let partial = reserve_resumable_partial(&destination, &transfer_id, &reservation_token)
                 .expect("reserve owned partial");
             fs::write(&partial, b"original owned payload").expect("write owned partial");
