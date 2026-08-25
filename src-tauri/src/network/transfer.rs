@@ -30,11 +30,12 @@ use crate::{
     protocol::{FILE_PROTOCOL, FILE_PROTOCOL_V2, TransferStreamHeader},
     receive_paths::{
         commit_without_overwrite, finalize_reserved_receive,
-        finalize_reserved_receive_durable_with_hooks, preflight_receive_directory,
-        remove_owned_reservation,
+        finalize_reserved_receive_durable_with_hooks, is_storage_full_error,
+        preflight_receive_directory, remove_owned_reservation,
     },
     storage::Storage,
     transfer_policy::{TRANSFER_CHUNK_BYTES, TransferProtocol},
+    volume_preflight::DESTINATION_PREFLIGHT_PAUSE_MARKER,
 };
 
 const BUFFER_SIZE: usize = 64 * 1024;
@@ -597,6 +598,72 @@ pub(super) fn persist_claimed_outgoing_resume_error(
     }
 }
 
+fn claim_legacy_incoming(
+    storage: &Storage,
+    peer_id: &str,
+    header: &TransferStreamHeader,
+) -> Result<TransferRecord, AppError> {
+    if header.version != TransferProtocol::LegacyV1 as u16
+        || header.start_offset != 0
+        || header.chunk_size != 0
+    {
+        return Err(AppError::InvalidInput(
+            "旧版文件传输头版本或几何信息无效".to_string(),
+        ));
+    }
+    let transfer = storage
+        .get_transfer(&header.transfer_id)?
+        .ok_or_else(|| AppError::Permission("未找到已接受的文件传输".to_string()))?;
+    if transfer.peer_id != peer_id
+        || transfer.direction != Direction::Incoming
+        || transfer.status != TransferStatus::Transferring
+        || transfer.transfer_protocol != TransferProtocol::LegacyV1 as u8
+        || !storage.is_friend(&transfer.peer_id)?
+    {
+        return Err(AppError::Permission(
+            "该文件传输未获授权，连接已拒绝".to_string(),
+        ));
+    }
+    if !storage.try_claim_legacy_incoming_transfer(&transfer.transfer_id, &transfer.peer_id)? {
+        return Err(AppError::Permission(
+            "该文件传输已有接收连接，重复连接已拒绝".to_string(),
+        ));
+    }
+    Ok(transfer)
+}
+
+fn authorize_resumable_incoming(
+    storage: &Storage,
+    peer_id: &str,
+    header: &TransferStreamHeader,
+) -> Result<TransferRecord, AppError> {
+    if header.version != TransferProtocol::ResumableV2 as u16 {
+        return Err(AppError::InvalidInput(
+            "可恢复文件传输头版本无效".to_string(),
+        ));
+    }
+    let transfer = storage
+        .get_transfer(&header.transfer_id)?
+        .ok_or_else(|| AppError::Permission("未找到已接受的可恢复文件传输".to_string()))?;
+    if transfer.peer_id != peer_id
+        || transfer.direction != Direction::Incoming
+        || !matches!(
+            transfer.status,
+            TransferStatus::Transferring | TransferStatus::Paused
+        )
+        || transfer.transfer_protocol != TransferProtocol::ResumableV2 as u8
+        || header.chunk_size != TRANSFER_CHUNK_BYTES
+        || header.chunk_size != transfer.chunk_size
+        || header.start_offset != transfer.transferred_bytes
+        || !storage.is_friend(&transfer.peer_id)?
+    {
+        return Err(AppError::Permission(
+            "该可恢复文件传输未获授权或恢复几何信息无效".to_string(),
+        ));
+    }
+    Ok(transfer)
+}
+
 async fn receive_transfer(
     peer_id: PeerId,
     mut stream: libp2p::swarm::Stream,
@@ -617,23 +684,7 @@ async fn receive_transfer(
         .map_err(|_| AppError::Network("文件传输头等待超时".to_string()))??;
     let header: TransferStreamHeader = serde_json::from_slice(&header)
         .map_err(|error| AppError::Network(format!("无法读取文件传输头：{error}")))?;
-    let transfer = storage
-        .get_transfer(&header.transfer_id)?
-        .ok_or_else(|| AppError::Permission("未找到已接受的文件传输".to_string()))?;
-    if transfer.peer_id != peer_id.to_string()
-        || transfer.direction != Direction::Incoming
-        || transfer.status != TransferStatus::Transferring
-        || !storage.is_friend(&transfer.peer_id)?
-    {
-        return Err(AppError::Permission(
-            "该文件传输未获授权，连接已拒绝".to_string(),
-        ));
-    }
-    if !storage.try_claim_incoming_transfer(&transfer.transfer_id, &transfer.peer_id)? {
-        return Err(AppError::Permission(
-            "该文件传输已有接收连接，重复连接已拒绝".to_string(),
-        ));
-    }
+    let transfer = claim_legacy_incoming(&storage, &peer_id.to_string(), &header)?;
 
     let result = receive_body(&mut stream, &storage, &app_handle, &transfer).await;
     if let Err(error) = result {
@@ -687,30 +738,7 @@ async fn receive_resumable_transfer(
         .map_err(|_| AppError::Network("可恢复文件传输头等待超时".to_string()))??;
     let header: TransferStreamHeader = serde_json::from_slice(&header)
         .map_err(|error| AppError::InvalidInput(format!("无法读取可恢复文件传输头：{error}")))?;
-    if header.version != TransferProtocol::ResumableV2 as u16 {
-        return Err(AppError::InvalidInput(
-            "可恢复文件传输头版本无效".to_string(),
-        ));
-    }
-    let transfer = storage
-        .get_transfer(&header.transfer_id)?
-        .ok_or_else(|| AppError::Permission("未找到已接受的可恢复文件传输".to_string()))?;
-    if transfer.peer_id != peer_id.to_string()
-        || transfer.direction != Direction::Incoming
-        || !matches!(
-            transfer.status,
-            TransferStatus::Transferring | TransferStatus::Paused
-        )
-        || transfer.transfer_protocol != TransferProtocol::ResumableV2 as u8
-        || header.chunk_size != TRANSFER_CHUNK_BYTES
-        || header.chunk_size != transfer.chunk_size
-        || header.start_offset != transfer.transferred_bytes
-        || !storage.is_friend(&transfer.peer_id)?
-    {
-        return Err(AppError::Permission(
-            "该可恢复文件传输未获授权或恢复几何信息无效".to_string(),
-        ));
-    }
+    let transfer = authorize_resumable_incoming(&storage, &peer_id.to_string(), &header)?;
     let transfer_id = transfer.transfer_id.clone();
     let storage_for_body = storage.clone();
     let app_for_body = app_handle.clone();
@@ -782,10 +810,16 @@ where
     let result = body(claimed.clone(), authoritative_offset).await;
     if let Err(error) = &result {
         if is_recoverable_receive_error(error) {
+            let persisted_error = match error {
+                AppError::Io(error) if is_storage_full_error(error) => {
+                    format!("{DESTINATION_PREFLIGHT_PAUSE_MARKER}{error}")
+                }
+                _ => error.to_string(),
+            };
             storage.try_pause_claimed_incoming_transfer(
                 &claimed.transfer_id,
                 &claimed.peer_id,
-                &error.to_string(),
+                &persisted_error,
             )?;
         } else {
             storage.try_fail_claimed_incoming_transfer(
@@ -1180,13 +1214,18 @@ mod tests {
     use futures::io::{AsyncRead, AsyncWrite};
 
     use super::{
-        ResumableStreamOpener, claim_resumable_outgoing, persist_claimed_outgoing_error,
-        run_resumable_receive_body_with, send_resumable_transfer,
+        DESTINATION_PREFLIGHT_PAUSE_MARKER, ResumableStreamOpener, authorize_resumable_incoming,
+        claim_legacy_incoming, claim_resumable_outgoing, is_storage_full_error,
+        persist_claimed_outgoing_error, run_resumable_receive_body_with, send_resumable_transfer,
     };
     use crate::{
-        domain::{Direction, TransferKind, TransferRecord, TransferStatus},
+        domain::{
+            Direction, Friend, FriendRequest, FriendRequestStatus, Platform, TransferKind,
+            TransferRecord, TransferStatus,
+        },
         error::AppError,
-        receive_paths::reserve_receive_path,
+        protocol::TransferStreamHeader,
+        receive_paths::{reservation_is_owned, reserve_receive_path, resumable_partial_is_owned},
         storage::Storage,
         transfer_manifest::{TransferChunk, build_manifest, manifest_root},
         transfer_policy::{TRANSFER_CHUNK_BYTES, TransferProtocol},
@@ -1313,6 +1352,271 @@ mod tests {
             created_at: "2026-08-24T00:00:00.000Z".to_string(),
             updated_at: "2026-08-24T00:00:00.000Z".to_string(),
         }
+    }
+
+    fn add_authorized_friend(storage: &Storage, peer_id: &str) {
+        let now = "2026-08-25T00:00:00.000Z".to_string();
+        let request = FriendRequest {
+            request_id: format!("request-{peer_id}"),
+            peer_id: peer_id.to_string(),
+            nickname: "Peer One".to_string(),
+            direction: Direction::Incoming,
+            status: FriendRequestStatus::Pending,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        storage
+            .put_friend_request(&request)
+            .expect("persist friend request fixture");
+        storage
+            .resolve_friend_request(
+                &request.request_id,
+                FriendRequestStatus::Accepted,
+                Some(&Friend {
+                    peer_id: peer_id.to_string(),
+                    nickname: "Peer One".to_string(),
+                    platform: Platform::Windows,
+                    online: true,
+                    added_at: now.clone(),
+                    last_seen: now.clone(),
+                }),
+                &now,
+            )
+            .expect("authorize friend fixture");
+    }
+
+    fn accepted_incoming_transfer(
+        storage: &Storage,
+        directory: &std::path::Path,
+        transfer_id: &str,
+        protocol: TransferProtocol,
+    ) -> TransferRecord {
+        let token = format!("reservation-{transfer_id}");
+        let destination = directory.join(format!("{transfer_id}.bin"));
+        let now = "2026-08-25T00:00:00.000Z".to_string();
+        let mut transfer = TransferRecord {
+            transfer_id: transfer_id.to_string(),
+            peer_id: "peer-one".to_string(),
+            direction: Direction::Incoming,
+            kind: TransferKind::File,
+            file_name: format!("{transfer_id}.bin"),
+            file_size: u64::from(TRANSFER_CHUNK_BYTES),
+            mime_type: "application/octet-stream".to_string(),
+            sha256: "0".repeat(64),
+            local_path: None,
+            destination_reserved: false,
+            reservation_token: None,
+            transfer_protocol: protocol as u8,
+            chunk_size: if protocol == TransferProtocol::ResumableV2 {
+                TRANSFER_CHUNK_BYTES
+            } else {
+                0
+            },
+            chunk_count: if protocol == TransferProtocol::ResumableV2 {
+                1
+            } else {
+                0
+            },
+            manifest_sha256: (protocol == TransferProtocol::ResumableV2).then(|| "0".repeat(64)),
+            partial_path: None,
+            source_modified_ns: None,
+            send_claimed: false,
+            transferred_bytes: 0,
+            status: TransferStatus::AwaitingAcceptance,
+            error: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        storage
+            .upsert_transfer(&transfer)
+            .expect("persist incoming offer fixture");
+        reserve_receive_path(&destination, transfer_id, &token)
+            .expect("reserve incoming destination fixture");
+        transfer.local_path = Some(destination.to_string_lossy().into_owned());
+        transfer.destination_reserved = true;
+        transfer.reservation_token = Some(token);
+        transfer.status = TransferStatus::Transferring;
+        assert!(
+            storage
+                .try_accept_incoming_transfer(&transfer)
+                .expect("accept incoming fixture")
+        );
+        storage
+            .get_transfer(transfer_id)
+            .expect("reload incoming fixture")
+            .expect("incoming fixture exists")
+    }
+
+    #[test]
+    fn legacy_route_claims_only_an_exact_v1_header_and_v1_row() {
+        let directory = std::env::temp_dir().join(format!(
+            "weline-localnet-legacy-route-exact-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&directory).expect("create legacy route fixture");
+        let storage = Storage::open(&directory.join("localnet.sqlite3")).expect("open storage");
+        add_authorized_friend(&storage, "peer-one");
+        let transfer = accepted_incoming_transfer(
+            &storage,
+            &directory,
+            "legacy-exact",
+            TransferProtocol::LegacyV1,
+        );
+
+        for (version, start_offset, chunk_size) in [(2, 0, 0), (1, 1, 0), (1, 0, 1)] {
+            claim_legacy_incoming(
+                &storage,
+                "peer-one",
+                &TransferStreamHeader {
+                    transfer_id: transfer.transfer_id.clone(),
+                    version,
+                    start_offset,
+                    chunk_size,
+                },
+            )
+            .expect_err("legacy route rejects non-v1 geometry before claiming");
+        }
+
+        let claimed = claim_legacy_incoming(
+            &storage,
+            "peer-one",
+            &TransferStreamHeader {
+                transfer_id: transfer.transfer_id.clone(),
+                version: 1,
+                start_offset: 0,
+                chunk_size: 0,
+            },
+        )
+        .expect("exact v1 route claims exact v1 row");
+        assert_eq!(claimed.transfer_protocol, TransferProtocol::LegacyV1 as u8);
+        claim_legacy_incoming(
+            &storage,
+            "peer-one",
+            &TransferStreamHeader {
+                transfer_id: transfer.transfer_id.clone(),
+                version: 1,
+                start_offset: 0,
+                chunk_size: 0,
+            },
+        )
+        .expect_err("duplicate legacy stream cannot claim the same row");
+
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove legacy route fixture");
+    }
+
+    #[test]
+    fn legacy_route_rejects_a_v2_row_without_claim_status_or_artifact_mutation() {
+        let directory = std::env::temp_dir().join(format!(
+            "weline-localnet-legacy-route-v2-row-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&directory).expect("create cross-route fixture");
+        let storage = Storage::open(&directory.join("localnet.sqlite3")).expect("open storage");
+        add_authorized_friend(&storage, "peer-one");
+        let before = accepted_incoming_transfer(
+            &storage,
+            &directory,
+            "v2-on-legacy-route",
+            TransferProtocol::ResumableV2,
+        );
+        let destination =
+            std::path::PathBuf::from(before.local_path.as_deref().expect("destination"));
+        let partial = std::path::PathBuf::from(before.partial_path.as_deref().expect("partial"));
+        let token = before
+            .reservation_token
+            .as_deref()
+            .expect("reservation token");
+
+        claim_legacy_incoming(
+            &storage,
+            "peer-one",
+            &TransferStreamHeader {
+                transfer_id: before.transfer_id.clone(),
+                version: 1,
+                start_offset: 0,
+                chunk_size: 0,
+            },
+        )
+        .expect_err("legacy route must reject an exact v2 row");
+
+        let after = storage
+            .get_transfer(&before.transfer_id)
+            .expect("reload rejected v2 row")
+            .expect("v2 row remains");
+        assert_eq!(after.status, before.status);
+        assert_eq!(after.transferred_bytes, before.transferred_bytes);
+        assert_eq!(after.local_path, before.local_path);
+        assert_eq!(after.partial_path, before.partial_path);
+        assert_eq!(after.reservation_token, before.reservation_token);
+        assert!(
+            reservation_is_owned(&destination, &before.transfer_id, token)
+                .expect("reservation remains owned")
+        );
+        assert!(
+            resumable_partial_is_owned(&partial, &destination, &before.transfer_id, token)
+                .expect("partial remains owned")
+        );
+        assert!(
+            storage
+                .try_claim_incoming_transfer(&before.transfer_id, &before.peer_id)
+                .expect("v2 row remains unclaimed")
+        );
+
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove cross-route fixture");
+    }
+
+    #[test]
+    fn resumable_route_rejects_a_v1_row_without_claim_or_mutation() {
+        let directory = std::env::temp_dir().join(format!(
+            "weline-localnet-resumable-route-v1-row-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&directory).expect("create reverse-route fixture");
+        let storage = Storage::open(&directory.join("localnet.sqlite3")).expect("open storage");
+        add_authorized_friend(&storage, "peer-one");
+        let before = accepted_incoming_transfer(
+            &storage,
+            &directory,
+            "v1-on-resumable-route",
+            TransferProtocol::LegacyV1,
+        );
+
+        authorize_resumable_incoming(
+            &storage,
+            "peer-one",
+            &TransferStreamHeader {
+                transfer_id: before.transfer_id.clone(),
+                version: 2,
+                start_offset: 0,
+                chunk_size: TRANSFER_CHUNK_BYTES,
+            },
+        )
+        .expect_err("resumable route must reject an exact v1 row");
+
+        let after = storage
+            .get_transfer(&before.transfer_id)
+            .expect("reload rejected v1 row")
+            .expect("v1 row remains");
+        assert_eq!(after.status, before.status);
+        assert_eq!(after.transferred_bytes, before.transferred_bytes);
+        assert_eq!(after.local_path, before.local_path);
+        assert_eq!(after.reservation_token, before.reservation_token);
+        claim_legacy_incoming(
+            &storage,
+            "peer-one",
+            &TransferStreamHeader {
+                transfer_id: before.transfer_id.clone(),
+                version: 1,
+                start_offset: 0,
+                chunk_size: 0,
+            },
+        )
+        .expect("v1 row remains available to its exact route");
+
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove reverse-route fixture");
     }
 
     fn paused_receive_with_real_partial(
@@ -1718,6 +2022,157 @@ mod tests {
         fs::remove_dir_all(directory).expect("remove stream pause fixture");
     }
 
+    #[tokio::test]
+    async fn terminal_receiver_integrity_failure_cleans_owned_partial_and_queues_peer_convergence()
+    {
+        let (directory, storage, paused) =
+            paused_receive_with_real_partial("terminal-integrity-convergence");
+        let partial = std::path::PathBuf::from(
+            paused
+                .partial_path
+                .as_deref()
+                .expect("terminal receive partial path"),
+        );
+
+        let error = run_resumable_receive_body_with(
+            &storage,
+            &paused,
+            paused.transferred_bytes,
+            &|_, _, _| Ok(()),
+            move |_, _| Box::pin(async move { Err(AppError::IntegrityFailure) }),
+        )
+        .await
+        .expect_err("integrity failure is terminal");
+        assert!(matches!(error, AppError::IntegrityFailure));
+
+        let failed = storage
+            .get_transfer(&paused.transfer_id)
+            .expect("load terminal integrity transfer")
+            .expect("terminal integrity transfer exists");
+        assert_eq!(failed.status, TransferStatus::Failed);
+        assert!(!partial.exists());
+        let pending = storage
+            .list_pending_terminal_notifications(&paused.peer_id)
+            .expect("load receiver terminal convergence outbox");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].transfer_id, paused.transfer_id);
+        assert_eq!(pending[0].state, TransferStatus::Failed);
+
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove integrity convergence fixture");
+    }
+
+    #[tokio::test]
+    async fn storage_full_finalization_pauses_with_trusted_marker_and_retries_without_retransmit() {
+        let (directory, storage, paused) =
+            paused_receive_with_real_partial("storage-full-finalization");
+        let database = directory.join("localnet.sqlite3");
+        let partial = std::path::PathBuf::from(
+            paused
+                .partial_path
+                .as_deref()
+                .expect("storage-full partial path"),
+        );
+        let committed = paused.transferred_bytes;
+
+        let error = run_resumable_receive_body_with(
+            &storage,
+            &paused,
+            committed,
+            &|_, _, _| Ok(()),
+            move |_, offset| {
+                Box::pin(async move {
+                    assert_eq!(offset, committed);
+                    Err(AppError::Io(injected_storage_full_error()))
+                })
+            },
+        )
+        .await
+        .expect_err("storage-full finalization is recoverable");
+        assert!(matches!(error, AppError::Io(ref error) if is_storage_full_error(error)));
+        let blocked = storage
+            .get_transfer(&paused.transfer_id)
+            .expect("load storage-full pause")
+            .expect("storage-full transfer exists");
+        assert_eq!(blocked.status, TransferStatus::Paused);
+        assert_eq!(blocked.transferred_bytes, committed);
+        assert!(
+            blocked
+                .error
+                .as_deref()
+                .is_some_and(|error| error.starts_with(DESTINATION_PREFLIGHT_PAUSE_MARKER))
+        );
+        assert_eq!(
+            fs::metadata(&partial)
+                .expect("full partial remains after storage-full")
+                .len(),
+            committed
+        );
+        drop(storage);
+
+        let restarted = Storage::open(&database).expect("restart storage-full receiver");
+        let retry = restarted
+            .get_transfer(&paused.transfer_id)
+            .expect("reload storage-full transfer")
+            .expect("storage-full transfer survives restart");
+        assert_eq!(retry.status, TransferStatus::Paused);
+        assert_eq!(retry.transferred_bytes, committed);
+        run_resumable_receive_body_with(
+            &restarted,
+            &retry,
+            committed,
+            &|_, _, _| Ok(()),
+            move |_, offset| {
+                Box::pin(async move {
+                    assert_eq!(
+                        offset, committed,
+                        "retry starts at committed completion boundary without retransmission"
+                    );
+                    Ok(())
+                })
+            },
+        )
+        .await
+        .expect("retry after space returns enters body at committed offset");
+        assert!(
+            restarted
+                .try_pause_claimed_incoming_transfer(
+                    &retry.transfer_id,
+                    &retry.peer_id,
+                    "test cleanup",
+                )
+                .expect("release retry claim")
+        );
+        assert!(
+            restarted
+                .try_cancel_unclaimed_incoming_transfer(
+                    &retry.transfer_id,
+                    &retry.peer_id,
+                    retry.transfer_protocol,
+                    "test cleanup",
+                )
+                .expect("clean storage-full retry fixture")
+        );
+
+        drop(restarted);
+        fs::remove_dir_all(directory).expect("remove storage-full finalization fixture");
+    }
+
+    fn injected_storage_full_error() -> std::io::Error {
+        #[cfg(windows)]
+        {
+            std::io::Error::from_raw_os_error(112)
+        }
+        #[cfg(unix)]
+        {
+            std::io::Error::from_raw_os_error(libc::ENOSPC)
+        }
+        #[cfg(not(any(windows, unix)))]
+        {
+            std::io::Error::new(std::io::ErrorKind::StorageFull, "storage full")
+        }
+    }
+
     #[test]
     fn live_v2_send_claims_before_work_and_recoverable_disconnect_pauses() {
         let fixture = std::env::temp_dir().join(format!(
@@ -1795,6 +2250,12 @@ mod tests {
             .expect("failed send exists");
         assert_eq!(failed.status, TransferStatus::Failed);
         assert!(!failed.send_claimed);
+        let pending = storage
+            .list_pending_terminal_notifications("peer-one")
+            .expect("load terminal send convergence outbox");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].transfer_id, "terminal-send");
+        assert_eq!(pending[0].state, TransferStatus::Failed);
 
         drop(storage);
         fs::remove_dir_all(fixture).expect("remove fixture");

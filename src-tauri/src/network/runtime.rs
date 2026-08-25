@@ -35,14 +35,14 @@ use crate::{
     identity::LocalIdentity,
     protocol::{
         ControlRequest, ControlResponse, FILE_PROTOCOL, FILE_PROTOCOL_V2, HelloPayload,
-        TransferOffer, TransferResumeState,
+        TransferOffer, TransferResumeState, TransferTerminalState,
     },
     receive_paths::{
         preflight_receive_directory, remove_owned_reservation, reserve_available_receive_path,
     },
     storage::Storage,
     transfer_manifest::validate_transfer_metadata,
-    transfer_policy::FILE_RESUME_V2_CAPABILITY,
+    transfer_policy::{FILE_RESUME_V2_CAPABILITY, TransferProtocol},
 };
 
 const EVENT_NAME: &str = "localnet://event";
@@ -70,6 +70,9 @@ pub enum NetworkCommand {
     CancelTransfer {
         peer_id: String,
         transfer_id: String,
+    },
+    FlushTerminalNotifications {
+        peer_id: String,
     },
     ExpireIncomingDecision {
         transfer_id: String,
@@ -229,6 +232,11 @@ enum PendingAction {
         decision_token: Option<String>,
     },
     TransferCancel,
+    TransferTerminal {
+        peer_id: String,
+        transfer_id: String,
+        generation: String,
+    },
     TransferResume {
         peer_id: String,
         transfer_id: String,
@@ -390,7 +398,10 @@ impl NetworkRuntime {
                         self.handle_discovery_event(discovery)?;
                     }
                 }
-                _ = discovery_cleanup.tick() => self.expire_beacon_addresses()?,
+                _ = discovery_cleanup.tick() => {
+                    self.expire_beacon_addresses()?;
+                    self.retry_terminal_notifications_for_connected_peers()?;
+                },
             }
         }
     }
@@ -530,6 +541,11 @@ impl NetworkRuntime {
                 self.pending
                     .insert(outbound_id, PendingAction::TransferCancel);
             }
+            NetworkCommand::FlushTerminalNotifications { peer_id } => {
+                let peer_id = parse_peer_id(&peer_id)?;
+                self.ensure_connected(&peer_id)?;
+                self.flush_terminal_notifications_for_peer(peer_id)?;
+            }
             NetworkCommand::ExpireIncomingDecision {
                 transfer_id,
                 decision_token,
@@ -607,6 +623,7 @@ impl NetworkRuntime {
             | NetworkCommand::SendFriendRequest(_)
             | NetworkCommand::ResolveFriendRequest { .. }
             | NetworkCommand::CancelTransfer { .. }
+            | NetworkCommand::FlushTerminalNotifications { .. }
             | NetworkCommand::ExpireIncomingDecision { .. } => {}
         }
         Ok(())
@@ -1109,6 +1126,18 @@ impl NetworkRuntime {
                         "文件传输与发送者不匹配，已拒绝处理".to_string(),
                     ));
                 }
+                if transfer.transfer_protocol == TransferProtocol::ResumableV2 as u8 {
+                    if self.storage.apply_remote_terminal_transfer(
+                        &transfer.transfer_id,
+                        &transfer.peer_id,
+                        TransferStatus::Cancelled,
+                        "对方取消了传输",
+                    )? && let Some(updated) = self.storage.get_transfer(&transfer_id)?
+                    {
+                        self.emit(NetworkEvent::TransferUpdated { transfer: updated });
+                    }
+                    return Ok(ControlResponse::Accepted);
+                }
                 if !self.storage.try_cancel_unclaimed_incoming_transfer(
                     &transfer.transfer_id,
                     &transfer.peer_id,
@@ -1189,6 +1218,55 @@ impl NetworkRuntime {
                     committed_bytes: transfer.transferred_bytes,
                 })
             }
+            ControlRequest::TransferTerminal {
+                transfer_id,
+                generation,
+                state,
+            } => {
+                let unauthorized = || AppError::Permission("该可恢复文件传输不可终止".to_string());
+                let peer_id_text = peer_id.to_string();
+                if generation.trim().is_empty()
+                    || !self.storage.is_friend(&peer_id_text)?
+                    || !self.peer_supports_resumable_transfers(&peer_id_text)?
+                {
+                    return Err(unauthorized());
+                }
+                let transfer = self
+                    .storage
+                    .get_transfer(&transfer_id)?
+                    .ok_or_else(unauthorized)?;
+                if transfer.peer_id != peer_id_text || transfer.transfer_protocol != 2 {
+                    return Err(unauthorized());
+                }
+                let terminal_status = match state {
+                    TransferTerminalState::Cancelled => TransferStatus::Cancelled,
+                    TransferTerminalState::Failed => TransferStatus::Failed,
+                };
+                let error = match state {
+                    TransferTerminalState::Cancelled => "对方取消了传输",
+                    TransferTerminalState::Failed => "对方终止了文件传输",
+                };
+                if self.storage.apply_remote_terminal_transfer(
+                    &transfer_id,
+                    &peer_id_text,
+                    terminal_status,
+                    error,
+                )? && let Some(transfer) = self.storage.get_transfer(&transfer_id)?
+                {
+                    if transfer.direction == Direction::Outgoing {
+                        self.storage.update_message_status(
+                            &transfer.transfer_id,
+                            MessageStatus::Failed,
+                            transfer.error.as_deref(),
+                        )?;
+                    }
+                    self.emit(NetworkEvent::TransferUpdated { transfer });
+                }
+                Ok(ControlResponse::TransferTerminalAck {
+                    transfer_id,
+                    generation,
+                })
+            }
         }
     }
 
@@ -1243,6 +1321,28 @@ impl NetworkRuntime {
                 });
             }
             (
+                PendingAction::TransferTerminal {
+                    peer_id: expected_peer,
+                    transfer_id: expected_transfer,
+                    generation: expected_generation,
+                },
+                ControlResponse::TransferTerminalAck {
+                    transfer_id,
+                    generation,
+                },
+            ) => {
+                if peer_id.to_string() == expected_peer
+                    && transfer_id == expected_transfer
+                    && generation == expected_generation
+                {
+                    self.storage.acknowledge_terminal_notification(
+                        &expected_transfer,
+                        &expected_peer,
+                        &expected_generation,
+                    )?;
+                }
+            }
+            (
                 PendingAction::TransferDecision {
                     transfer_id,
                     accepted: true,
@@ -1287,19 +1387,29 @@ impl NetworkRuntime {
             }
             (
                 PendingAction::TransferResume {
-                    peer_id,
+                    peer_id: expected_peer,
                     transfer_id,
                     expected_bytes,
                     query_token,
                 },
                 ControlResponse::Rejected { message, .. },
             ) => {
-                self.storage.clear_outgoing_resume_query(
+                let changed = self.storage.try_fail_pending_outgoing_resume_query(
                     &transfer_id,
-                    &peer_id,
+                    &expected_peer,
                     expected_bytes,
                     &query_token,
+                    &format!("对方拒绝了恢复请求：{message}"),
                 )?;
+                if changed && let Some(transfer) = self.storage.get_transfer(&transfer_id)? {
+                    self.storage.update_message_status(
+                        &transfer.transfer_id,
+                        MessageStatus::Failed,
+                        transfer.error.as_deref(),
+                    )?;
+                    self.emit(NetworkEvent::TransferUpdated { transfer });
+                    self.flush_terminal_notifications_for_peer(peer_id)?;
+                }
                 self.emit(NetworkEvent::NetworkError {
                     code: "transfer.resume_rejected".to_string(),
                     message: format!("对方拒绝恢复文件 {transfer_id}：{message}"),
@@ -1324,6 +1434,9 @@ impl NetworkRuntime {
                     code: "transfer.resume_invalid_response".to_string(),
                     message: format!("对方未返回文件 {transfer_id} 的有效恢复状态"),
                 });
+            }
+            (PendingAction::TransferTerminal { .. }, _) => {
+                tracing::debug!("terminal notification was not acknowledged exactly");
             }
             _ => {}
         }
@@ -1378,6 +1491,19 @@ impl NetworkRuntime {
                 )?;
                 tracing::debug!(%error, %transfer_id, "resume query failed");
             }
+            PendingAction::TransferTerminal {
+                peer_id,
+                transfer_id,
+                generation,
+            } => {
+                tracing::debug!(
+                    %error,
+                    %peer_id,
+                    %transfer_id,
+                    %generation,
+                    "durable terminal notification will be retried"
+                );
+            }
             PendingAction::Hello
             | PendingAction::FriendDecision
             | PendingAction::TransferDecision {
@@ -1419,7 +1545,85 @@ impl NetworkRuntime {
             .any(|capability| capability == FILE_RESUME_V2_CAPABILITY);
         self.emit(NetworkEvent::PeerDiscovered { peer });
         if supports_resume && self.storage.is_friend(&peer_id.to_string())? {
+            self.flush_terminal_notifications_for_peer(peer_id)?;
             self.resume_outgoing_for_peer(peer_id)?;
+        }
+        Ok(())
+    }
+
+    fn retry_terminal_notifications_for_connected_peers(&mut self) -> Result<(), AppError> {
+        let connected = self
+            .active_connections
+            .iter()
+            .filter_map(|(peer_id, count)| (*count > 0).then_some(*peer_id))
+            .collect::<Vec<_>>();
+        for peer_id in connected {
+            self.flush_terminal_notifications_for_peer(peer_id)?;
+        }
+        Ok(())
+    }
+
+    fn flush_terminal_notifications_for_peer(&mut self, peer_id: PeerId) -> Result<(), AppError> {
+        let peer_id_text = peer_id.to_string();
+        if !self.storage.is_friend(&peer_id_text)?
+            || !self.peer_supports_resumable_transfers(&peer_id_text)?
+        {
+            return Ok(());
+        }
+
+        for notification in self
+            .storage
+            .list_pending_terminal_notifications(&peer_id_text)?
+        {
+            let already_pending = self.pending.values().any(|action| {
+                matches!(
+                    action,
+                    PendingAction::TransferTerminal {
+                        peer_id: pending_peer,
+                        transfer_id: pending_transfer,
+                        generation: pending_generation,
+                    } if pending_peer == &notification.peer_id
+                        && pending_transfer == &notification.transfer_id
+                        && pending_generation == &notification.generation
+                )
+            });
+            if already_pending {
+                continue;
+            }
+            let state = match notification.state {
+                TransferStatus::Cancelled => TransferTerminalState::Cancelled,
+                TransferStatus::Failed => TransferTerminalState::Failed,
+                _ => {
+                    return Err(AppError::Storage("待通知文件传输包含无效终态".to_string()));
+                }
+            };
+            match self.send_control_request(
+                peer_id,
+                ControlRequest::TransferTerminal {
+                    transfer_id: notification.transfer_id.clone(),
+                    generation: notification.generation.clone(),
+                    state,
+                },
+            ) {
+                Ok(request_id) => {
+                    self.pending.insert(
+                        request_id,
+                        PendingAction::TransferTerminal {
+                            peer_id: notification.peer_id,
+                            transfer_id: notification.transfer_id,
+                            generation: notification.generation,
+                        },
+                    );
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        %error,
+                        peer_id = %peer_id_text,
+                        transfer_id = %notification.transfer_id,
+                        "durable terminal notification remains queued"
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -1993,10 +2197,24 @@ impl NetworkRuntime {
         let Some(mut transfer) = self.storage.get_transfer(transfer_id)? else {
             return Ok(());
         };
-        transfer.status = TransferStatus::Failed;
-        transfer.error = Some(error.clone());
-        transfer.updated_at = now_rfc3339();
-        self.storage.upsert_transfer(&transfer)?;
+        if transfer.transfer_protocol == TransferProtocol::ResumableV2 as u8 {
+            if !self.storage.try_fail_unclaimed_outgoing_transfer(
+                &transfer.transfer_id,
+                &transfer.peer_id,
+                &error,
+            )? {
+                return Ok(());
+            }
+            transfer = self
+                .storage
+                .get_transfer(transfer_id)?
+                .ok_or_else(|| AppError::Storage("失败的可恢复发送记录不存在".to_string()))?;
+        } else {
+            transfer.status = TransferStatus::Failed;
+            transfer.error = Some(error.clone());
+            transfer.updated_at = now_rfc3339();
+            self.storage.upsert_transfer(&transfer)?;
+        }
         self.storage
             .update_message_status(transfer_id, MessageStatus::Failed, Some(&error))?;
         self.emit(NetworkEvent::TransferUpdated { transfer });
@@ -2449,7 +2667,7 @@ mod tests {
         error::AppError,
         protocol::{
             ControlRequest, ControlResponse, TransferOffer, TransferResumeState,
-            TransferStreamHeader,
+            TransferStreamHeader, TransferTerminalState,
         },
         receive_paths::{preflight_receive_directory, reservation_is_owned, reserve_receive_path},
         storage::{IncomingAcceptancePhase, Storage},
@@ -2660,7 +2878,15 @@ mod tests {
         directory: &std::path::Path,
         remote_peer: libp2p::PeerId,
     ) -> NetworkRuntime {
-        let local_peer = deterministic_peer_id(1);
+        production_test_runtime_for_peers(storage, directory, deterministic_peer_id(1), remote_peer)
+    }
+
+    fn production_test_runtime_for_peers(
+        storage: Storage,
+        directory: &std::path::Path,
+        local_peer: libp2p::PeerId,
+        remote_peer: libp2p::PeerId,
+    ) -> NetworkRuntime {
         let (command_sender, receiver) = mpsc::channel(1);
         let (_discovery_sender, discovery_receiver) = mpsc::channel(1);
         let (listen_port_sender, _listen_port_receiver) = watch::channel(None);
@@ -3042,6 +3268,349 @@ mod tests {
     }
 
     #[test]
+    fn production_hello_retries_durable_terminal_until_exact_generation_ack() {
+        let (directory, storage, _) = automatic_fixture("terminal-hello-retry");
+        let remote_peer = deterministic_peer_id(74);
+        add_runtime_friend(&storage, &remote_peer.to_string());
+        persist_runtime_resume_capability(&storage, &remote_peer.to_string());
+        let transfer_id = "durable-terminal";
+        storage
+            .upsert_transfer(&resume_record(
+                transfer_id,
+                &remote_peer.to_string(),
+                Direction::Outgoing,
+                TransferProtocol::ResumableV2 as u8,
+                TransferStatus::Paused,
+                0,
+            ))
+            .expect("persist paused outgoing terminal fixture");
+        assert!(
+            storage
+                .try_cancel_unclaimed_outgoing_transfer(
+                    transfer_id,
+                    &remote_peer.to_string(),
+                    "cancelled while offline",
+                )
+                .expect("persist durable terminal notification")
+        );
+        let mut runtime = production_test_runtime(storage.clone(), &directory, remote_peer);
+
+        schedule_resume_query(&mut runtime, remote_peer);
+        let first_generation = match runtime.pending.get(&PendingRequestId::Test(1)) {
+            Some(PendingAction::TransferTerminal { generation, .. }) => generation.clone(),
+            action => panic!("expected pending terminal notification, got {action:?}"),
+        };
+        assert!(matches!(
+            runtime
+                .test_control_transport
+                .as_ref()
+                .expect("test control transport")
+                .requests
+                .as_slice(),
+            [(peer, ControlRequest::TransferTerminal {
+                transfer_id: requested,
+                generation,
+                state: TransferTerminalState::Cancelled,
+            })] if *peer == remote_peer
+                && requested == transfer_id
+                && generation == &first_generation
+        ));
+
+        runtime
+            .handle_outbound_response(
+                remote_peer,
+                PendingRequestId::Test(1),
+                ControlResponse::TransferTerminalAck {
+                    transfer_id: transfer_id.to_string(),
+                    generation: "stale-generation".to_string(),
+                },
+            )
+            .expect("stale acknowledgement is ignored");
+        assert_eq!(
+            storage
+                .list_pending_terminal_notifications(&remote_peer.to_string())
+                .expect("stale acknowledgement retains outbox")
+                .len(),
+            1
+        );
+
+        schedule_resume_query(&mut runtime, remote_peer);
+        runtime
+            .handle_outbound_response(
+                remote_peer,
+                PendingRequestId::Test(2),
+                ControlResponse::TransferTerminalAck {
+                    transfer_id: transfer_id.to_string(),
+                    generation: first_generation,
+                },
+            )
+            .expect("exact terminal acknowledgement retires outbox");
+        assert!(
+            storage
+                .list_pending_terminal_notifications(&remote_peer.to_string())
+                .expect("load acknowledged terminal outbox")
+                .is_empty()
+        );
+
+        drop(runtime);
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove terminal Hello retry fixture");
+    }
+
+    #[test]
+    fn production_terminal_request_closes_both_peers_cleans_owned_artifacts_and_never_resumes() {
+        let (origin_directory, origin_storage, _) = automatic_fixture("terminal-round-trip-origin");
+        let (target_directory, target_storage, _) = automatic_fixture("terminal-round-trip-target");
+        let origin_peer = deterministic_peer_id(81);
+        let target_peer = deterministic_peer_id(82);
+        add_runtime_friend(&origin_storage, &target_peer.to_string());
+        persist_runtime_resume_capability(&origin_storage, &target_peer.to_string());
+        add_runtime_friend(&target_storage, &origin_peer.to_string());
+        persist_runtime_resume_capability(&target_storage, &origin_peer.to_string());
+
+        let mut offer = v2_offer();
+        offer.transfer_id = uuid::Uuid::now_v7().to_string();
+        origin_storage
+            .upsert_transfer(&resume_record(
+                &offer.transfer_id,
+                &target_peer.to_string(),
+                Direction::Outgoing,
+                TransferProtocol::ResumableV2 as u8,
+                TransferStatus::Paused,
+                0,
+            ))
+            .expect("persist origin paused transfer");
+        let target_transfer = prepare_manual_runtime_acceptance(
+            &target_directory,
+            &target_storage,
+            &origin_peer.to_string(),
+            &offer,
+        );
+        let target_destination = PathBuf::from(
+            target_transfer
+                .local_path
+                .as_deref()
+                .expect("target reserved destination"),
+        );
+        let target_reservation = target_transfer
+            .reservation_token
+            .as_deref()
+            .expect("target reservation token")
+            .to_string();
+        let target_partial = PathBuf::from(
+            target_transfer
+                .partial_path
+                .as_deref()
+                .expect("target owned resumable partial"),
+        );
+
+        assert!(
+            origin_storage
+                .try_cancel_unclaimed_outgoing_transfer(
+                    &offer.transfer_id,
+                    &target_peer.to_string(),
+                    "cancelled while peers were disconnected",
+                )
+                .expect("durably terminalize origin transfer")
+        );
+        let mut origin_runtime = production_test_runtime_for_peers(
+            origin_storage.clone(),
+            &origin_directory,
+            origin_peer,
+            target_peer,
+        );
+        let mut target_runtime = production_test_runtime_for_peers(
+            target_storage.clone(),
+            &target_directory,
+            target_peer,
+            origin_peer,
+        );
+
+        schedule_resume_query(&mut origin_runtime, target_peer);
+        let request = origin_runtime
+            .test_control_transport
+            .as_ref()
+            .expect("origin test transport")
+            .requests
+            .first()
+            .expect("Hello flushes durable terminal request")
+            .1
+            .clone();
+        let response = target_runtime
+            .handle_inbound_request(origin_peer, request)
+            .expect("authenticated target applies terminal request");
+        origin_runtime
+            .handle_outbound_response(target_peer, PendingRequestId::Test(1), response)
+            .expect("origin applies exact terminal acknowledgement");
+
+        assert_eq!(
+            origin_storage
+                .get_transfer(&offer.transfer_id)
+                .expect("load origin transfer")
+                .expect("origin transfer exists")
+                .status,
+            TransferStatus::Cancelled
+        );
+        assert_eq!(
+            target_storage
+                .get_transfer(&offer.transfer_id)
+                .expect("load target transfer")
+                .expect("target transfer exists")
+                .status,
+            TransferStatus::Cancelled
+        );
+        assert!(
+            !reservation_is_owned(&target_destination, &offer.transfer_id, &target_reservation,)
+                .expect("inspect target reservation after peer cleanup")
+        );
+        assert!(
+            !target_partial.exists(),
+            "the peer terminal handler must remove its exact owned partial"
+        );
+        assert!(
+            origin_storage
+                .list_pending_terminal_notifications(&target_peer.to_string())
+                .expect("load acknowledged origin outbox")
+                .is_empty()
+        );
+        assert!(
+            target_storage
+                .list_pending_terminal_notifications(&origin_peer.to_string())
+                .expect("remote terminal must not echo")
+                .is_empty()
+        );
+
+        schedule_resume_query(&mut origin_runtime, target_peer);
+        assert_eq!(
+            origin_runtime
+                .test_control_transport
+                .as_ref()
+                .expect("origin test transport")
+                .requests
+                .len(),
+            1,
+            "an acknowledged terminal transfer must never send a later resume query"
+        );
+        assert!(origin_runtime.pending.is_empty());
+
+        drop(origin_runtime);
+        drop(target_runtime);
+        drop(origin_storage);
+        drop(target_storage);
+        fs::remove_dir_all(origin_directory).expect("remove terminal origin fixture");
+        fs::remove_dir_all(target_directory).expect("remove terminal target fixture");
+    }
+
+    #[test]
+    fn production_remote_terminal_is_authenticated_idempotent_and_never_echoed() {
+        let (directory, storage, _) = automatic_fixture("remote-terminal-control");
+        let remote_peer = deterministic_peer_id(75);
+        add_runtime_friend(&storage, &remote_peer.to_string());
+        persist_runtime_resume_capability(&storage, &remote_peer.to_string());
+        let transfer_id = "remote-terminal-control";
+        storage
+            .upsert_transfer(&resume_record(
+                transfer_id,
+                &remote_peer.to_string(),
+                Direction::Incoming,
+                TransferProtocol::ResumableV2 as u8,
+                TransferStatus::Paused,
+                0,
+            ))
+            .expect("persist incoming remote terminal fixture");
+        let mut runtime = production_test_runtime(storage.clone(), &directory, remote_peer);
+        let request = || ControlRequest::TransferTerminal {
+            transfer_id: transfer_id.to_string(),
+            generation: "remote-generation".to_string(),
+            state: TransferTerminalState::Failed,
+        };
+
+        for _ in 0..2 {
+            assert!(matches!(
+                runtime
+                    .handle_inbound_request(remote_peer, request())
+                    .expect("authenticated remote terminal is acknowledged"),
+                ControlResponse::TransferTerminalAck {
+                    transfer_id: acknowledged,
+                    generation,
+                } if acknowledged == transfer_id && generation == "remote-generation"
+            ));
+        }
+        assert_eq!(
+            storage
+                .get_transfer(transfer_id)
+                .expect("load remote terminal transfer")
+                .expect("remote terminal transfer exists")
+                .status,
+            TransferStatus::Failed
+        );
+        assert!(
+            storage
+                .list_pending_terminal_notifications(&remote_peer.to_string())
+                .expect("remote terminal must not produce an echo notification")
+                .is_empty()
+        );
+        assert!(
+            runtime
+                .test_control_transport
+                .as_ref()
+                .expect("test control transport")
+                .requests
+                .is_empty()
+        );
+
+        drop(runtime);
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove remote terminal control fixture");
+    }
+
+    #[test]
+    fn production_unclaimed_v2_offer_failure_queues_durable_terminal_convergence() {
+        let (directory, storage, _) = automatic_fixture("terminal-offer-failure");
+        let remote_peer = deterministic_peer_id(76);
+        add_runtime_friend(&storage, &remote_peer.to_string());
+        persist_runtime_resume_capability(&storage, &remote_peer.to_string());
+        let transfer = resume_record(
+            "failed-v2-offer",
+            &remote_peer.to_string(),
+            Direction::Outgoing,
+            TransferProtocol::ResumableV2 as u8,
+            TransferStatus::AwaitingAcceptance,
+            0,
+        );
+        storage
+            .upsert_transfer(&transfer)
+            .expect("persist outgoing v2 offer");
+        let runtime = production_test_runtime(storage.clone(), &directory, remote_peer);
+
+        runtime
+            .handle_command_failure(
+                &NetworkCommand::OfferTransfer(transfer.clone()),
+                &AppError::Network("offline before offer delivery".to_string()),
+            )
+            .expect("persist failed v2 offer");
+
+        assert_eq!(
+            storage
+                .get_transfer(&transfer.transfer_id)
+                .expect("load failed v2 offer")
+                .expect("failed v2 offer exists")
+                .status,
+            TransferStatus::Failed
+        );
+        let pending = storage
+            .list_pending_terminal_notifications(&remote_peer.to_string())
+            .expect("load failed-offer terminal outbox");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].transfer_id, transfer.transfer_id);
+        assert_eq!(pending[0].state, TransferStatus::Failed);
+
+        drop(runtime);
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove failed offer fixture");
+    }
+
+    #[test]
     fn production_duplicate_hello_is_deduped_by_durable_query_generation() {
         let (directory, storage, _) = automatic_fixture("resume-durable-hello-dedupe");
         let remote_peer = deterministic_peer_id(59);
@@ -3333,7 +3902,7 @@ mod tests {
     }
 
     #[test]
-    fn production_rejected_query_and_same_offset_late_response_are_generation_scoped() {
+    fn production_rejected_exact_query_terminalizes_and_never_resumes_again() {
         let (directory, storage, _) = automatic_fixture("resume-rejected-generation");
         let remote_peer = deterministic_peer_id(61);
         add_runtime_friend(&storage, &remote_peer.to_string());
@@ -3357,10 +3926,8 @@ mod tests {
                     message: "retry later".to_string(),
                 },
             )
-            .expect("rejection clears exact first generation");
+            .expect("rejection terminalizes the exact query");
         schedule_resume_query(&mut runtime, remote_peer);
-        let second_generation = pending_resume_generation(&runtime, 2);
-        assert_ne!(first_generation, second_generation);
 
         runtime.pending.insert(
             PendingRequestId::Test(99),
@@ -3381,23 +3948,46 @@ mod tests {
                     committed_bytes: 0,
                 },
             )
-            .expect("same-offset old response loses exact generation claim");
+            .expect("same-offset old response cannot revive a terminal transfer");
 
         let retained = storage
             .get_transfer(&transfer.transfer_id)
             .unwrap()
             .unwrap();
-        assert_eq!(retained.status, TransferStatus::Paused);
+        assert_eq!(retained.status, TransferStatus::Failed);
         assert!(!retained.send_claimed);
-        assert!(
+        assert_eq!(
             storage
-                .clear_outgoing_resume_query(
-                    &transfer.transfer_id,
-                    &transfer.peer_id,
-                    0,
-                    &second_generation,
-                )
-                .expect("new generation remains after same-offset old response")
+                .get_message(&transfer.transfer_id)
+                .expect("load rejected resume message")
+                .expect("rejected resume message exists")
+                .status,
+            MessageStatus::Failed
+        );
+        let pending_terminal = storage
+            .list_pending_terminal_notifications(&transfer.peer_id)
+            .expect("load rejected-resume terminal notification");
+        assert_eq!(pending_terminal.len(), 1);
+        assert_eq!(pending_terminal[0].transfer_id, transfer.transfer_id);
+        assert_eq!(pending_terminal[0].state, TransferStatus::Failed);
+        assert!(matches!(
+            runtime.pending.get(&PendingRequestId::Test(2)),
+            Some(PendingAction::TransferTerminal {
+                transfer_id,
+                generation,
+                ..
+            }) if transfer_id == &transfer.transfer_id
+                && generation == &pending_terminal[0].generation
+        ));
+        assert_eq!(
+            runtime
+                .test_control_transport
+                .as_ref()
+                .expect("test control transport")
+                .requests
+                .len(),
+            2,
+            "subsequent Hello and late resume response must not schedule another query"
         );
 
         drop(runtime);
@@ -3841,8 +4431,25 @@ mod tests {
             0,
         );
         schedule_resume_query(&mut runtime, remote_peer);
-        let stale_generation = pending_resume_generation(&runtime, 2);
-        runtime.pending.remove(&PendingRequestId::Test(2));
+        let cancelled_generation = storage
+            .list_pending_terminal_notifications(&remote_peer.to_string())
+            .expect("load invalid-offset terminal notification")
+            .into_iter()
+            .find(|notification| notification.transfer_id == invalid.transfer_id)
+            .expect("invalid-offset terminal notification exists")
+            .generation;
+        runtime
+            .handle_outbound_response(
+                remote_peer,
+                PendingRequestId::Test(2),
+                ControlResponse::TransferTerminalAck {
+                    transfer_id: invalid.transfer_id.clone(),
+                    generation: cancelled_generation,
+                },
+            )
+            .expect("acknowledge retired invalid-offset fixture");
+        let stale_generation = pending_resume_generation(&runtime, 3);
+        runtime.pending.remove(&PendingRequestId::Test(3));
         storage
             .try_claim_outgoing_resume_query(
                 &stale.transfer_id,
@@ -3874,7 +4481,7 @@ mod tests {
                 .expect("release newer attempt")
         );
         schedule_resume_query(&mut runtime, remote_peer);
-        let current_generation = pending_resume_generation(&runtime, 3);
+        let current_generation = pending_resume_generation(&runtime, 4);
         assert_ne!(stale_generation, current_generation);
         runtime.pending.insert(
             PendingRequestId::Test(99),
@@ -4119,6 +4726,12 @@ mod tests {
                 .status,
             MessageStatus::Failed
         );
+        let pending = storage
+            .list_pending_terminal_notifications(&remote_peer.to_string())
+            .expect("load source-mutation terminal convergence outbox");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].transfer_id, transfer.transfer_id);
+        assert_eq!(pending[0].state, TransferStatus::Failed);
 
         drop(runtime);
         drop(storage);

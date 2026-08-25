@@ -528,36 +528,69 @@ pub fn cancel_transfer(
     transfer_id: String,
     state: State<'_, AppState>,
 ) -> Result<TransferRecord, AppError> {
-    let mut transfer = state
-        .storage
-        .get_transfer(&transfer_id)?
+    let transfer = cancel_transfer_locally(&state.storage, &transfer_id)?;
+    if transfer.transfer_protocol == TransferProtocol::ResumableV2 as u8 {
+        if let Ok(network) = state.network() {
+            let _ = network.try_send(NetworkCommand::FlushTerminalNotifications {
+                peer_id: transfer.peer_id.clone(),
+            });
+        }
+    } else {
+        state.network()?.try_send(NetworkCommand::CancelTransfer {
+            peer_id: transfer.peer_id.clone(),
+            transfer_id,
+        })?;
+    }
+    Ok(transfer)
+}
+
+fn cancel_transfer_locally(
+    storage: &Storage,
+    transfer_id: &str,
+) -> Result<TransferRecord, AppError> {
+    let transfer = storage
+        .get_transfer(transfer_id)?
         .ok_or_else(|| AppError::InvalidInput("找不到这次文件传输".to_string()))?;
-    if transfer.direction != Direction::Outgoing
-        || transfer.status != TransferStatus::AwaitingAcceptance
+    let cancelled = if transfer.transfer_protocol == TransferProtocol::ResumableV2 as u8 {
+        match transfer.direction {
+            Direction::Outgoing => storage.try_cancel_unclaimed_outgoing_transfer(
+                &transfer.transfer_id,
+                &transfer.peer_id,
+                "你取消了传输",
+            )?,
+            Direction::Incoming => storage.try_cancel_unclaimed_incoming_transfer(
+                &transfer.transfer_id,
+                &transfer.peer_id,
+                transfer.transfer_protocol,
+                "你取消了传输",
+            )?,
+        }
+    } else if transfer.direction == Direction::Outgoing
+        && transfer.status == TransferStatus::AwaitingAcceptance
     {
+        storage.try_transition_outgoing_awaiting(
+            &transfer.transfer_id,
+            &transfer.peer_id,
+            TransferStatus::Cancelled,
+            Some("你取消了传输"),
+        )?
+    } else {
+        false
+    };
+    if !cancelled {
         return Err(AppError::InvalidInput("当前传输不能取消".to_string()));
     }
-    if !state.storage.try_transition_outgoing_awaiting(
-        &transfer.transfer_id,
-        &transfer.peer_id,
-        TransferStatus::Cancelled,
-        Some("你取消了传输"),
-    )? {
-        return Err(AppError::InvalidInput("当前传输不能取消".to_string()));
-    }
-    transfer = state
-        .storage
+
+    let transfer = storage
         .get_transfer(&transfer.transfer_id)?
         .ok_or_else(|| AppError::InvalidInput("找不到这次文件传输".to_string()))?;
-    state.storage.update_message_status(
-        &transfer.transfer_id,
-        MessageStatus::Failed,
-        transfer.error.as_deref(),
-    )?;
-    state.network()?.try_send(NetworkCommand::CancelTransfer {
-        peer_id: transfer.peer_id.clone(),
-        transfer_id,
-    })?;
+    if transfer.direction == Direction::Outgoing {
+        storage.update_message_status(
+            &transfer.transfer_id,
+            MessageStatus::Failed,
+            transfer.error.as_deref(),
+        )?;
+    }
     Ok(transfer)
 }
 
@@ -900,8 +933,9 @@ mod tests {
     };
 
     use super::{
-        accept_incoming_transfer_with_preflight, prepare_receive_directory, prepare_source,
-        prepare_transfer_preferences, reserve_manual_receive_destination,
+        accept_incoming_transfer_with_preflight, cancel_transfer_locally,
+        prepare_receive_directory, prepare_source, prepare_transfer_preferences,
+        reserve_manual_receive_destination,
     };
     use crate::{
         domain::{
@@ -909,7 +943,7 @@ mod tests {
             now_rfc3339,
         },
         error::AppError,
-        receive_paths::preflight_receive_directory,
+        receive_paths::{preflight_receive_directory, reserve_receive_path},
         storage::Storage,
         transfer_policy::{FILE_RESUME_V2_CAPABILITY, TRANSFER_CHUNK_BYTES, TransferProtocol},
         volume_preflight::{VolumeSnapshot, validate_volume},
@@ -987,6 +1021,134 @@ mod tests {
             .upsert_transfer(&transfer)
             .expect("persist legacy acceptance fixture");
         (directory, storage, transfer)
+    }
+
+    #[test]
+    fn paused_v2_transfer_can_be_cancelled_locally_without_a_network_handle() {
+        let directory = std::env::temp_dir().join(format!(
+            "weline-localnet-local-cancel-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&directory).expect("create local cancellation fixture");
+        let storage =
+            Storage::open(&directory.join("localnet.sqlite3")).expect("open cancellation storage");
+        let now = now_rfc3339();
+
+        for (transfer_id, direction) in [
+            ("paused-outgoing", Direction::Outgoing),
+            ("paused-incoming", Direction::Incoming),
+        ] {
+            storage
+                .upsert_transfer(&TransferRecord {
+                    transfer_id: transfer_id.to_string(),
+                    peer_id: "cancel-peer".to_string(),
+                    direction,
+                    kind: TransferKind::File,
+                    file_name: "archive.bin".to_string(),
+                    file_size: u64::from(TRANSFER_CHUNK_BYTES),
+                    mime_type: "application/octet-stream".to_string(),
+                    sha256: "0".repeat(64),
+                    local_path: None,
+                    destination_reserved: false,
+                    reservation_token: None,
+                    transfer_protocol: TransferProtocol::ResumableV2 as u8,
+                    chunk_size: TRANSFER_CHUNK_BYTES,
+                    chunk_count: 1,
+                    manifest_sha256: Some("1".repeat(64)),
+                    partial_path: None,
+                    source_modified_ns: None,
+                    send_claimed: false,
+                    transferred_bytes: 0,
+                    status: TransferStatus::Paused,
+                    error: Some("network disconnected".to_string()),
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                })
+                .expect("persist paused cancellable transfer");
+
+            let cancelled = cancel_transfer_locally(&storage, transfer_id)
+                .expect("paused transfer cancellation is local-first");
+            assert_eq!(cancelled.status, TransferStatus::Cancelled);
+        }
+
+        let pending = storage
+            .list_pending_terminal_notifications("cancel-peer")
+            .expect("list durable cancellation notifications");
+        assert_eq!(pending.len(), 2);
+        assert!(pending.iter().all(|notification| {
+            notification.state == TransferStatus::Cancelled
+                && matches!(
+                    notification.transfer_id.as_str(),
+                    "paused-outgoing" | "paused-incoming"
+                )
+        }));
+
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove local cancellation fixture");
+    }
+
+    #[test]
+    fn paused_incoming_cancel_reports_local_success_when_cleanup_media_is_temporarily_offline() {
+        let (directory, storage, mut transfer) =
+            acceptance_fixture("cancel-offline-cleanup", u64::from(TRANSFER_CHUNK_BYTES));
+        let media = directory.join("selected-media");
+        let detached_media = directory.join("detached-media");
+        fs::create_dir_all(&media).expect("create selected media");
+        let destination = media.join("archive.bin");
+        let token = "cancel-offline-cleanup-token";
+        reserve_receive_path(&destination, &transfer.transfer_id, token)
+            .expect("reserve incoming destination");
+        transfer.local_path = Some(destination.to_string_lossy().into_owned());
+        transfer.destination_reserved = true;
+        transfer.reservation_token = Some(token.to_string());
+        transfer.status = TransferStatus::Transferring;
+        assert!(
+            storage
+                .try_accept_incoming_transfer(&transfer)
+                .expect("accept incoming transfer")
+        );
+        assert!(
+            storage
+                .try_claim_incoming_transfer(&transfer.transfer_id, &transfer.peer_id)
+                .expect("claim incoming transfer")
+        );
+        assert!(
+            storage
+                .try_pause_claimed_incoming_transfer(
+                    &transfer.transfer_id,
+                    &transfer.peer_id,
+                    "network disconnected",
+                )
+                .expect("pause incoming transfer")
+        );
+        fs::rename(&media, &detached_media).expect("detach selected media");
+
+        let cancelled = cancel_transfer_locally(&storage, &transfer.transfer_id)
+            .expect("durably committed local cancel is successful while cleanup is deferred");
+        assert_eq!(cancelled.status, TransferStatus::Cancelled);
+        assert_eq!(
+            storage
+                .list_pending_terminal_notifications(&transfer.peer_id)
+                .expect("load terminal outbox")
+                .len(),
+            1
+        );
+
+        drop(storage);
+        fs::rename(&detached_media, &media).expect("restore selected media");
+        let storage = Storage::open(&directory.join("localnet.sqlite3"))
+            .expect("restart drains deferred owned cleanup");
+        assert_eq!(
+            storage
+                .get_transfer(&transfer.transfer_id)
+                .expect("reload cancelled transfer")
+                .expect("cancelled transfer exists")
+                .status,
+            TransferStatus::Cancelled
+        );
+
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove offline cleanup fixture");
     }
 
     #[test]

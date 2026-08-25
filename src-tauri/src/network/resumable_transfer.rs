@@ -7,17 +7,17 @@ use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
 use crate::{
     domain::{Direction, TransferRecord, TransferStatus},
     error::AppError,
-    receive_paths::open_owned_resumable_partial_file,
+    receive_paths::{is_storage_full_error, open_owned_resumable_partial_file},
     storage::Storage,
     transfer_manifest::{
         TransferChunk, capture_source_snapshot, decode_sha256, expected_chunk_count,
         expected_chunk_length, manifest_root,
     },
     transfer_policy::{TRANSFER_CHUNK_BYTES, TransferProtocol},
+    volume_preflight::DESTINATION_PREFLIGHT_PAUSE_MARKER,
 };
 
 const CHUNK_FRAME_HEADER_BYTES: usize = 40;
-const DESTINATION_PREFLIGHT_PAUSE_MARKER: &str = "[weline-localnet:destination-preflight:v1]";
 
 #[cfg(test)]
 pub(super) fn claim_paused_incoming_with_preflight<P>(
@@ -670,7 +670,7 @@ fn validate_acknowledgement(
 }
 
 pub(crate) fn is_recoverable_receive_error(error: &AppError) -> bool {
-    matches!(error, AppError::Io(error) if error.kind() == std::io::ErrorKind::NotFound)
+    matches!(error, AppError::Io(error) if error.kind() == std::io::ErrorKind::NotFound || is_storage_full_error(error))
         || is_recoverable_stream_error(error)
 }
 

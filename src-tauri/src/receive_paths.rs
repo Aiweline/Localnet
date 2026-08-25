@@ -47,6 +47,22 @@ pub(crate) enum LegacyStageCleanupPhase {
 }
 
 static LEGACY_STAGE_CLEANUP_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static OWNED_ARTIFACT_CLEANUP_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExactRemovalOutcome {
+    Removed,
+    Missing,
+    NotOwned,
+    ProofLost,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExactCleanupPhase {
+    AfterInitialProof,
+    #[cfg(target_os = "macos")]
+    AfterQuarantineProof,
+}
 
 pub fn commit_without_overwrite(partial: &Path, destination: &Path) -> std::io::Result<()> {
     match fs::hard_link(partial, destination) {
@@ -160,9 +176,10 @@ pub fn reservation_is_owned(
 ) -> io::Result<bool> {
     let reservation_path = reservation_sidecar_path(destination)?;
     let payload = reservation_payload(transfer_id, reservation_token);
-    let mut file = match File::open(&reservation_path) {
+    let mut file = match open_regular_file_no_follow(&reservation_path, false) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if is_no_follow_rejection(&error) => return Ok(false),
         Err(error) => return Err(error),
     };
     let metadata = file.metadata()?;
@@ -183,20 +200,90 @@ pub fn remove_owned_reservation(
     transfer_id: &str,
     reservation_token: &str,
 ) -> io::Result<bool> {
+    let cleanup_token = uuid::Uuid::new_v4().to_string();
+    remove_owned_reservation_internal(
+        destination,
+        transfer_id,
+        reservation_token,
+        &cleanup_token,
+        |_, _| Ok(()),
+    )
+}
+
+pub(crate) fn remove_owned_reservation_with_cleanup_token(
+    destination: &Path,
+    transfer_id: &str,
+    reservation_token: &str,
+    cleanup_token: &str,
+) -> io::Result<bool> {
+    remove_owned_reservation_internal(
+        destination,
+        transfer_id,
+        reservation_token,
+        cleanup_token,
+        |_, _| Ok(()),
+    )
+}
+
+fn remove_owned_reservation_internal<H>(
+    destination: &Path,
+    transfer_id: &str,
+    reservation_token: &str,
+    cleanup_token: &str,
+    mut phase_hook: H,
+) -> io::Result<bool>
+where
+    H: FnMut(ExactCleanupPhase, &Path) -> io::Result<()>,
+{
     let reservation_path = reservation_sidecar_path(destination)?;
-    if !reservation_is_owned(destination, transfer_id, reservation_token)? {
-        if !reservation_path.try_exists()?
-            && !destination.parent().is_some_and(|parent| parent.is_dir())
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "接收目录或磁盘当前不可用",
-            ));
+    let payload = reservation_payload(transfer_id, reservation_token);
+    let mut verify = |file: &mut File| opened_file_matches_payload(file, &payload);
+    let mut hook = |phase, verified: &Path| phase_hook(phase, verified);
+    match remove_exact_verified_file(
+        &reservation_path,
+        cleanup_token,
+        "reservation",
+        &mut verify,
+        &mut hook,
+    )? {
+        ExactRemovalOutcome::Removed => Ok(true),
+        ExactRemovalOutcome::Missing => {
+            if !destination.parent().is_some_and(|parent| parent.is_dir()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "接收目录或磁盘当前不可用",
+                ));
+            }
+            Ok(true)
         }
-        return Ok(false);
+        ExactRemovalOutcome::NotOwned | ExactRemovalOutcome::ProofLost => Ok(false),
     }
-    fs::remove_file(reservation_path)?;
-    Ok(true)
+}
+
+#[cfg(test)]
+fn remove_owned_reservation_with_hook<H>(
+    destination: &Path,
+    transfer_id: &str,
+    reservation_token: &str,
+    after_proof: H,
+) -> io::Result<bool>
+where
+    H: FnMut() -> io::Result<()>,
+{
+    let cleanup_token = uuid::Uuid::new_v4().to_string();
+    let mut after_proof = after_proof;
+    remove_owned_reservation_internal(
+        destination,
+        transfer_id,
+        reservation_token,
+        &cleanup_token,
+        move |phase, _| {
+            if phase == ExactCleanupPhase::AfterInitialProof {
+                after_proof()?;
+            }
+            Ok(())
+        },
+    )
 }
 
 pub fn remove_owned_reservations_in_directory(
@@ -204,30 +291,350 @@ pub fn remove_owned_reservations_in_directory(
     transfer_id: &str,
     reservation_token: &str,
 ) -> io::Result<()> {
+    let cleanup_token = uuid::Uuid::new_v4().to_string();
+    remove_owned_reservations_in_directory_internal(
+        destination,
+        transfer_id,
+        reservation_token,
+        &cleanup_token,
+        |_, _| Ok(()),
+    )?;
+    Ok(())
+}
+
+pub(crate) fn remove_owned_reservations_in_directory_with_cleanup_token(
+    destination: &Path,
+    transfer_id: &str,
+    reservation_token: &str,
+    cleanup_token: &str,
+) -> io::Result<bool> {
+    remove_owned_reservations_in_directory_internal(
+        destination,
+        transfer_id,
+        reservation_token,
+        cleanup_token,
+        |_, _| Ok(()),
+    )
+}
+
+fn remove_owned_reservations_in_directory_internal<H>(
+    destination: &Path,
+    transfer_id: &str,
+    reservation_token: &str,
+    cleanup_token: &str,
+    mut phase_hook: H,
+) -> io::Result<bool>
+where
+    H: FnMut(ExactCleanupPhase, &Path) -> io::Result<()>,
+{
     let directory = destination
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "接收文件保存位置无效"))?;
     let expected = reservation_payload(transfer_id, reservation_token);
+    let mut proof_retained = true;
+    #[cfg(target_os = "macos")]
+    let quarantine_prefix = owned_cleanup_quarantine_prefix(cleanup_token, "reservation-scan");
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
         let file_name = entry.file_name();
         let Some(file_name) = file_name.to_str() else {
             continue;
         };
+        let path = entry.path();
+        let mut verify = |file: &mut File| opened_file_matches_payload(file, &expected);
+        let mut hook = |phase, verified: &Path| phase_hook(phase, verified);
+
+        #[cfg(target_os = "macos")]
+        if file_name.starts_with(&quarantine_prefix) {
+            let outcome = remove_existing_macos_quarantine(&path, &mut verify, &mut hook)?;
+            if outcome == ExactRemovalOutcome::ProofLost {
+                proof_retained = false;
+            }
+            continue;
+        }
+
         if !file_name.starts_with(".weline-localnet-reservation-") {
             continue;
         }
-        let metadata = fs::symlink_metadata(entry.path())?;
-        if !metadata.file_type().is_file() || metadata.len() != expected.len() as u64 {
-            continue;
-        }
-        let mut marker = File::open(entry.path())?;
-        let mut actual = vec![0_u8; expected.len()];
-        if marker.read_exact(&mut actual).is_ok() && actual == expected {
-            fs::remove_file(entry.path())?;
+        let outcome = remove_exact_verified_file(
+            &path,
+            cleanup_token,
+            "reservation-scan",
+            &mut verify,
+            &mut hook,
+        )?;
+        if outcome == ExactRemovalOutcome::ProofLost {
+            proof_retained = false;
         }
     }
+    Ok(proof_retained)
+}
+
+#[cfg(test)]
+fn remove_owned_reservations_in_directory_with_hook<H>(
+    destination: &Path,
+    transfer_id: &str,
+    reservation_token: &str,
+    after_proof: H,
+) -> io::Result<()>
+where
+    H: FnMut(&Path) -> io::Result<()>,
+{
+    let cleanup_token = uuid::Uuid::new_v4().to_string();
+    let mut after_proof = after_proof;
+    remove_owned_reservations_in_directory_internal(
+        destination,
+        transfer_id,
+        reservation_token,
+        &cleanup_token,
+        move |phase, path| {
+            if phase == ExactCleanupPhase::AfterInitialProof {
+                after_proof(path)?;
+            }
+            Ok(())
+        },
+    )?;
     Ok(())
+}
+
+/*
+ * Exact cleanup below keeps proof and namespace authority coupled.  Callers must not replace it
+ * with a proof followed by `remove_file(path)`; that reintroduces a path-substitution window.
+ */
+fn remove_exact_verified_file<V, H>(
+    path: &Path,
+    _cleanup_token: &str,
+    _artifact_kind: &str,
+    verify: &mut V,
+    phase_hook: &mut H,
+) -> io::Result<ExactRemovalOutcome>
+where
+    V: FnMut(&mut File) -> io::Result<bool>,
+    H: FnMut(ExactCleanupPhase, &Path) -> io::Result<()>,
+{
+    let cleanup_lock = OWNED_ARTIFACT_CLEANUP_LOCK.get_or_init(|| Mutex::new(()));
+    let _cleanup_guard = cleanup_lock
+        .lock()
+        .map_err(|_| io::Error::other("接收文件清理锁不可用"))?;
+
+    #[cfg(windows)]
+    {
+        let mut file = match open_regular_file_for_delete_no_follow(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(ExactRemovalOutcome::Missing);
+            }
+            Err(error) if is_no_follow_rejection(&error) => {
+                return Ok(ExactRemovalOutcome::NotOwned);
+            }
+            Err(error) if windows_stage_cleanup_should_defer(&error) => {
+                return Ok(ExactRemovalOutcome::ProofLost);
+            }
+            Err(error) => return Err(error),
+        };
+        if !verify(&mut file)? {
+            return Ok(ExactRemovalOutcome::NotOwned);
+        }
+        let identity = file_identity(&file)?;
+        phase_hook(ExactCleanupPhase::AfterInitialProof, path)?;
+        if file_identity(&file)? != identity {
+            return Ok(ExactRemovalOutcome::ProofLost);
+        }
+        match mark_windows_file_link_for_delete(&file) {
+            Ok(()) => {}
+            Err(error) if windows_stage_cleanup_should_defer(&error) => {
+                return Ok(ExactRemovalOutcome::ProofLost);
+            }
+            Err(error) => return Err(error),
+        }
+        drop(file);
+        return Ok(ExactRemovalOutcome::Removed);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let directory = path
+            .parent()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "接收文件清理位置无效"))?;
+        let quarantine = owned_cleanup_quarantine_path(path, _cleanup_token, _artifact_kind)?;
+        match open_regular_file_no_follow(&quarantine, false) {
+            Ok(mut quarantined) => {
+                if !verify(&mut quarantined)? {
+                    return Ok(ExactRemovalOutcome::ProofLost);
+                }
+                let identity = file_identity(&quarantined)?;
+                phase_hook(ExactCleanupPhase::AfterQuarantineProof, &quarantine)?;
+                if file_identity(&quarantined)? != identity
+                    || !path_has_file_identity(&quarantine, identity)?
+                {
+                    return Ok(ExactRemovalOutcome::ProofLost);
+                }
+                fs::remove_file(&quarantine)?;
+                sync_directory(directory)?;
+                return Ok(ExactRemovalOutcome::Removed);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) if is_no_follow_rejection(&error) => {
+                return Ok(ExactRemovalOutcome::NotOwned);
+            }
+            Err(error) => return Err(error),
+        }
+        let mut file = match open_regular_file_no_follow(path, false) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(ExactRemovalOutcome::Missing);
+            }
+            Err(error) if is_no_follow_rejection(&error) => {
+                return Ok(ExactRemovalOutcome::ProofLost);
+            }
+            Err(error) => return Err(error),
+        };
+        if !verify(&mut file)? {
+            return Ok(ExactRemovalOutcome::NotOwned);
+        }
+        let identity = file_identity(&file)?;
+        phase_hook(ExactCleanupPhase::AfterInitialProof, path)?;
+        drop(file);
+        match macos_rename_no_replace(path, &quarantine) {
+            Ok(()) => sync_directory(directory)?,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) if macos_exclusive_rename_is_unavailable(&error) => {
+                return Ok(ExactRemovalOutcome::ProofLost);
+            }
+            Err(error) => return Err(error),
+        }
+        let mut quarantined = match open_regular_file_no_follow(&quarantine, false) {
+            Ok(file) => file,
+            Err(error) if is_no_follow_rejection(&error) => {
+                macos_restore_quarantine_without_overwrite(&quarantine, path, directory)?;
+                return Ok(ExactRemovalOutcome::ProofLost);
+            }
+            Err(error) => return Err(error),
+        };
+        if file_identity(&quarantined)? != identity || !verify(&mut quarantined)? {
+            drop(quarantined);
+            macos_restore_quarantine_without_overwrite(&quarantine, path, directory)?;
+            return Ok(ExactRemovalOutcome::ProofLost);
+        }
+        phase_hook(ExactCleanupPhase::AfterQuarantineProof, &quarantine)?;
+        if file_identity(&quarantined)? != identity
+            || !path_has_file_identity(&quarantine, identity)?
+        {
+            drop(quarantined);
+            macos_restore_quarantine_without_overwrite(&quarantine, path, directory)?;
+            return Ok(ExactRemovalOutcome::ProofLost);
+        }
+        fs::remove_file(&quarantine)?;
+        sync_directory(directory)?;
+        return Ok(ExactRemovalOutcome::Removed);
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = (path, _cleanup_token, _artifact_kind, verify, phase_hook);
+        Ok(ExactRemovalOutcome::NotOwned)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn remove_existing_macos_quarantine<V, H>(
+    quarantine: &Path,
+    verify: &mut V,
+    phase_hook: &mut H,
+) -> io::Result<ExactRemovalOutcome>
+where
+    V: FnMut(&mut File) -> io::Result<bool>,
+    H: FnMut(ExactCleanupPhase, &Path) -> io::Result<()>,
+{
+    let cleanup_lock = OWNED_ARTIFACT_CLEANUP_LOCK.get_or_init(|| Mutex::new(()));
+    let _cleanup_guard = cleanup_lock
+        .lock()
+        .map_err(|_| io::Error::other("接收文件清理锁不可用"))?;
+    let directory = quarantine
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "接收文件清理位置无效"))?;
+    let mut file = match open_regular_file_no_follow(quarantine, false) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(ExactRemovalOutcome::ProofLost);
+        }
+        Err(error) if is_no_follow_rejection(&error) => {
+            return Ok(ExactRemovalOutcome::ProofLost);
+        }
+        Err(error) => return Err(error),
+    };
+    if !verify(&mut file)? {
+        return Ok(ExactRemovalOutcome::ProofLost);
+    }
+    let identity = file_identity(&file)?;
+    phase_hook(ExactCleanupPhase::AfterQuarantineProof, quarantine)?;
+    if file_identity(&file)? != identity || !path_has_file_identity(quarantine, identity)? {
+        return Ok(ExactRemovalOutcome::ProofLost);
+    }
+    fs::remove_file(quarantine)?;
+    sync_directory(directory)?;
+    Ok(ExactRemovalOutcome::Removed)
+}
+
+fn opened_file_matches_payload(file: &mut File, expected: &[u8]) -> io::Result<bool> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() != expected.len() as u64 {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let mut actual = vec![0_u8; expected.len()];
+    match file.read_exact(&mut actual) {
+        Ok(()) => Ok(actual == expected),
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn opened_partial_marker_has_prefix(
+    file: &mut File,
+    transfer_id: &str,
+    reservation_token: &str,
+) -> io::Result<bool> {
+    if file.metadata()?.len() > 8 * 1024 {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let mut payload = String::new();
+    file.read_to_string(&mut payload)?;
+    let expected_prefix = format!("{PARTIAL_OWNERSHIP_PREFIX}{transfer_id}:{reservation_token}:");
+    Ok(payload.starts_with(&expected_prefix) && payload.ends_with('\n'))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn owned_cleanup_quarantine_prefix(cleanup_token: &str, artifact_kind: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"weline-localnet-owned-cleanup-v2\0");
+    hasher.update(cleanup_token.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(artifact_kind.as_bytes());
+    let digest = hex::encode(hasher.finalize());
+    format!(".weline-localnet-cleanup-{}-", &digest[..32])
+}
+
+#[cfg(target_os = "macos")]
+fn owned_cleanup_quarantine_path(
+    path: &Path,
+    cleanup_token: &str,
+    artifact_kind: &str,
+) -> io::Result<PathBuf> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "接收文件清理位置无效"))?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "接收文件清理名称无效"))?;
+    use std::os::unix::ffi::OsStrExt as _;
+    let file_digest = hex::encode(Sha256::digest(file_name.as_bytes()));
+    Ok(directory.join(format!(
+        "{}{}",
+        owned_cleanup_quarantine_prefix(cleanup_token, artifact_kind),
+        &file_digest[..16]
+    )))
 }
 
 pub fn resumable_partial_path(destination: &Path, transfer_id: &str) -> io::Result<PathBuf> {
@@ -355,23 +762,105 @@ pub fn remove_owned_partial(
     transfer_id: &str,
     reservation_token: &str,
 ) -> io::Result<bool> {
-    if !resumable_partial_is_owned(partial, destination, transfer_id, reservation_token)? {
+    let cleanup_token = uuid::Uuid::new_v4().to_string();
+    remove_owned_partial_internal(
+        partial,
+        destination,
+        transfer_id,
+        reservation_token,
+        &cleanup_token,
+        |_, _| Ok(()),
+    )
+}
+
+pub(crate) fn remove_owned_partial_with_cleanup_token(
+    partial: &Path,
+    destination: &Path,
+    transfer_id: &str,
+    reservation_token: &str,
+    cleanup_token: &str,
+) -> io::Result<bool> {
+    remove_owned_partial_internal(
+        partial,
+        destination,
+        transfer_id,
+        reservation_token,
+        cleanup_token,
+        |_, _| Ok(()),
+    )
+}
+
+fn remove_owned_partial_internal<H>(
+    partial: &Path,
+    destination: &Path,
+    transfer_id: &str,
+    reservation_token: &str,
+    cleanup_token: &str,
+    mut phase_hook: H,
+) -> io::Result<bool>
+where
+    H: FnMut(ExactCleanupPhase, &Path) -> io::Result<()>,
+{
+    if !is_resumable_partial_candidate(partial, destination, transfer_id)? || partial == destination
+    {
         return Ok(false);
     }
-    match fs::remove_file(partial) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+    let owner_path = partial_owner_sidecar_path(partial)?;
+    let mut verify = |file: &mut File| {
+        let identity = file_identity(file)?;
+        let payload = partial_owner_payload(transfer_id, reservation_token, identity);
+        marker_matches(&owner_path, &payload)
+    };
+    let mut hook = |phase, verified: &Path| phase_hook(phase, verified);
+    match remove_exact_verified_file(partial, cleanup_token, "partial", &mut verify, &mut hook)? {
+        ExactRemovalOutcome::Removed => {
+            remove_owned_partial_marker_after_file_cleanup_with_cleanup_token(
+                partial,
+                destination,
+                transfer_id,
+                reservation_token,
+                cleanup_token,
+            )
+        }
+        ExactRemovalOutcome::Missing => {
             if !partial.parent().is_some_and(|parent| parent.is_dir()) {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
                     "接收目录或磁盘当前不可用",
                 ));
             }
+            Ok(false)
         }
-        Err(error) => return Err(error),
+        ExactRemovalOutcome::NotOwned | ExactRemovalOutcome::ProofLost => Ok(false),
     }
-    fs::remove_file(partial_owner_sidecar_path(partial)?)?;
-    Ok(true)
+}
+
+#[cfg(test)]
+fn remove_owned_partial_with_hook<H>(
+    partial: &Path,
+    destination: &Path,
+    transfer_id: &str,
+    reservation_token: &str,
+    after_proof: H,
+) -> io::Result<bool>
+where
+    H: FnMut() -> io::Result<()>,
+{
+    let cleanup_token = uuid::Uuid::new_v4().to_string();
+    let mut after_proof = after_proof;
+    remove_owned_partial_internal(
+        partial,
+        destination,
+        transfer_id,
+        reservation_token,
+        &cleanup_token,
+        move |phase, _| {
+            if phase == ExactCleanupPhase::AfterInitialProof {
+                after_proof()?;
+            }
+            Ok(())
+        },
+    )
 }
 
 pub fn remove_owned_partial_marker_after_file_cleanup(
@@ -380,6 +869,45 @@ pub fn remove_owned_partial_marker_after_file_cleanup(
     transfer_id: &str,
     reservation_token: &str,
 ) -> io::Result<bool> {
+    let cleanup_token = uuid::Uuid::new_v4().to_string();
+    remove_owned_partial_marker_after_file_cleanup_internal(
+        partial,
+        destination,
+        transfer_id,
+        reservation_token,
+        &cleanup_token,
+        |_, _| Ok(()),
+    )
+}
+
+pub(crate) fn remove_owned_partial_marker_after_file_cleanup_with_cleanup_token(
+    partial: &Path,
+    destination: &Path,
+    transfer_id: &str,
+    reservation_token: &str,
+    cleanup_token: &str,
+) -> io::Result<bool> {
+    remove_owned_partial_marker_after_file_cleanup_internal(
+        partial,
+        destination,
+        transfer_id,
+        reservation_token,
+        cleanup_token,
+        |_, _| Ok(()),
+    )
+}
+
+fn remove_owned_partial_marker_after_file_cleanup_internal<H>(
+    partial: &Path,
+    destination: &Path,
+    transfer_id: &str,
+    reservation_token: &str,
+    cleanup_token: &str,
+    mut phase_hook: H,
+) -> io::Result<bool>
+where
+    H: FnMut(ExactCleanupPhase, &Path) -> io::Result<()>,
+{
     if !is_resumable_partial_candidate(partial, destination, transfer_id)? {
         return Ok(false);
     }
@@ -389,22 +917,47 @@ pub fn remove_owned_partial_marker_after_file_cleanup(
         Err(error) => return Err(error),
     }
     let marker = partial_owner_sidecar_path(partial)?;
-    let mut file = match File::open(&marker) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
-        Err(error) => return Err(error),
-    };
-    if file.metadata()?.len() > 8 * 1024 {
-        return Ok(false);
+    let mut verify =
+        |file: &mut File| opened_partial_marker_has_prefix(file, transfer_id, reservation_token);
+    let mut hook = |phase, verified: &Path| phase_hook(phase, verified);
+    match remove_exact_verified_file(
+        &marker,
+        cleanup_token,
+        "partial-owner",
+        &mut verify,
+        &mut hook,
+    )? {
+        ExactRemovalOutcome::Removed | ExactRemovalOutcome::Missing => Ok(true),
+        ExactRemovalOutcome::NotOwned | ExactRemovalOutcome::ProofLost => Ok(false),
     }
-    let mut payload = String::new();
-    file.read_to_string(&mut payload)?;
-    let expected_prefix = format!("{PARTIAL_OWNERSHIP_PREFIX}{transfer_id}:{reservation_token}:");
-    if !payload.starts_with(&expected_prefix) || !payload.ends_with('\n') {
-        return Ok(false);
-    }
-    fs::remove_file(marker)?;
-    Ok(true)
+}
+
+#[cfg(test)]
+fn remove_owned_partial_marker_after_file_cleanup_with_hook<H>(
+    partial: &Path,
+    destination: &Path,
+    transfer_id: &str,
+    reservation_token: &str,
+    after_proof: H,
+) -> io::Result<bool>
+where
+    H: FnMut() -> io::Result<()>,
+{
+    let cleanup_token = uuid::Uuid::new_v4().to_string();
+    let mut after_proof = after_proof;
+    remove_owned_partial_marker_after_file_cleanup_internal(
+        partial,
+        destination,
+        transfer_id,
+        reservation_token,
+        &cleanup_token,
+        move |phase, _| {
+            if phase == ExactCleanupPhase::AfterInitialProof {
+                after_proof()?;
+            }
+            Ok(())
+        },
+    )
 }
 
 #[cfg(test)]
@@ -892,34 +1445,57 @@ where
     }
     let candidate_identity = file_identity(&candidate_file)?;
     let source_length = partial_file.metadata()?.len();
-    phase_hook(FinalizationPhase::BeforeCopy)?;
-    candidate_file.set_len(0)?;
-    candidate_file.seek(SeekFrom::Start(0))?;
-    let mut source = partial_file;
-    source.seek(SeekFrom::Start(0))?;
-    let mut buffer = vec![0_u8; 64 * 1024];
-    let mut injected_during_copy = false;
-    loop {
-        let read = source.read(&mut buffer)?;
-        if read == 0 {
-            break;
+    let copy_result = (|| {
+        phase_hook(FinalizationPhase::BeforeCopy)?;
+        candidate_file.set_len(0)?;
+        candidate_file.seek(SeekFrom::Start(0))?;
+        let mut source = partial_file;
+        source.seek(SeekFrom::Start(0))?;
+        let mut buffer = vec![0_u8; 64 * 1024];
+        let mut injected_during_copy = false;
+        loop {
+            let read = source.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            candidate_file.write_all(&buffer[..read])?;
+            if !injected_during_copy {
+                injected_during_copy = true;
+                phase_hook(FinalizationPhase::DuringCopy)?;
+            }
         }
-        candidate_file.write_all(&buffer[..read])?;
         if !injected_during_copy {
-            injected_during_copy = true;
             phase_hook(FinalizationPhase::DuringCopy)?;
         }
-    }
-    if !injected_during_copy {
-        phase_hook(FinalizationPhase::DuringCopy)?;
-    }
-    candidate_file.flush()?;
-    candidate_file.sync_all()?;
-    if candidate_file.metadata()?.len() != source_length {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "复制目标文件长度不完整",
-        ));
+        candidate_file.flush()?;
+        candidate_file.sync_all()?;
+        if candidate_file.metadata()?.len() != source_length {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "复制目标文件长度不完整",
+            ));
+        }
+        Ok(())
+    })();
+    if let Err(error) = copy_result {
+        if is_storage_full_error(&error) {
+            return match retire_incomplete_copy_candidate(
+                candidate_file,
+                &candidate,
+                candidate_identity,
+            ) {
+                Ok(true) => Err(error),
+                Ok(false) => Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "磁盘空间不足后无法证明并清理未完成的目标副本",
+                )),
+                Err(cleanup_error) => Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("磁盘空间不足，且未完成目标副本无法安全清理：{cleanup_error}"),
+                )),
+            };
+        }
+        return Err(error);
     }
     phase_hook(FinalizationPhase::AfterCopySync)?;
     if !reservation_is_owned(&candidate, transfer_id, reservation_token)?
@@ -960,6 +1536,76 @@ where
         path: candidate,
         reservation_released: false,
     })
+}
+
+pub(crate) fn is_storage_full_error(error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::StorageFull {
+        return true;
+    }
+    #[cfg(windows)]
+    if matches!(error.raw_os_error(), Some(39 | 112)) {
+        return true;
+    }
+    #[cfg(unix)]
+    if error.raw_os_error() == Some(libc::ENOSPC) {
+        return true;
+    }
+    false
+}
+
+fn retire_incomplete_copy_candidate(
+    candidate_file: File,
+    candidate: &Path,
+    expected_identity: FileIdentity,
+) -> io::Result<bool> {
+    if file_identity(&candidate_file)? != expected_identity {
+        return Ok(false);
+    }
+
+    #[cfg(windows)]
+    {
+        if !path_has_file_identity(candidate, expected_identity)? {
+            return Ok(false);
+        }
+        mark_windows_file_link_for_delete(&candidate_file)?;
+        drop(candidate_file);
+        return match open_regular_file_no_follow(candidate, false) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+            Ok(file) if file_identity(&file)? != expected_identity => Ok(true),
+            Ok(_) => Ok(false),
+            Err(error) if is_no_follow_rejection(&error) => Ok(true),
+            Err(error) => Err(error),
+        };
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let directory = candidate
+            .parent()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "复制目标保存位置无效"))?;
+        let quarantine = directory.join(format!(
+            ".weline-localnet-copy-quarantine-{}",
+            uuid::Uuid::new_v4()
+        ));
+        drop(candidate_file);
+        macos_rename_no_replace(candidate, &quarantine)?;
+        let quarantine_file = open_regular_file_no_follow(&quarantine, false)?;
+        if file_identity(&quarantine_file)? != expected_identity {
+            drop(quarantine_file);
+            macos_restore_quarantine_without_overwrite(&quarantine, candidate, directory)?;
+            return Ok(false);
+        }
+        drop(quarantine_file);
+        fs::remove_file(&quarantine)?;
+        sync_directory(directory)?;
+        return Ok(true);
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = (candidate_file, candidate, expected_identity);
+        Ok(false)
+    }
 }
 
 pub fn owned_finalized_receive_path(
@@ -1273,12 +1919,13 @@ fn open_regular_file_for_delete_no_follow(path: &Path) -> io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt as _;
     use windows_sys::Win32::Storage::FileSystem::{
         DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ,
         FILE_SHARE_WRITE,
     };
 
     let file = OpenOptions::new()
-        .access_mode(DELETE | FILE_READ_ATTRIBUTES)
+        .read(true)
+        .access_mode(DELETE | FILE_GENERIC_READ)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)?;
@@ -1979,12 +2626,16 @@ fn create_new_regular_file_no_follow(path: &Path) -> io::Result<File> {
 fn create_new_regular_file_no_follow(path: &Path) -> io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt as _;
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
+        DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
 
     let file = OpenOptions::new()
         .read(true)
         .write(true)
+        .access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .create_new(true)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)?;
@@ -2122,7 +2773,7 @@ fn write_new_marker(path: &Path, payload: &[u8]) -> io::Result<()> {
 }
 
 fn marker_matches(path: &Path, payload: &[u8]) -> io::Result<bool> {
-    let mut file = match File::open(path) {
+    let mut file = match open_regular_file_no_follow(path, false) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             if path.parent().is_some_and(|parent| parent.is_dir()) {
@@ -2133,6 +2784,7 @@ fn marker_matches(path: &Path, payload: &[u8]) -> io::Result<bool> {
                 "接收目录或磁盘当前不可用",
             ));
         }
+        Err(error) if is_no_follow_rejection(&error) => return Ok(false),
         Err(error) => return Err(error),
     };
     let metadata = file.metadata()?;
@@ -2270,6 +2922,12 @@ fn reservation_payload(transfer_id: &str, reservation_token: &str) -> Vec<u8> {
 mod tests {
     use std::{fs, io, io::Write as _};
 
+    #[cfg(target_os = "macos")]
+    use super::{
+        ExactCleanupPhase, remove_owned_partial_internal,
+        remove_owned_partial_marker_after_file_cleanup_internal, remove_owned_reservation_internal,
+        remove_owned_reservations_in_directory_internal,
+    };
     use super::{
         FinalizationPhase, FinalizationState, LegacyStageCleanupPhase, LegacyStageCleanupState,
         append_finalization_record_with_stage, commit_without_overwrite, copy_without_overwrite,
@@ -2279,9 +2937,12 @@ mod tests {
         owned_finalized_receive_path, partial_owner_sidecar_path, read_finalization_record,
         remove_owned_finalization_stage, remove_owned_finalization_stage_with_hook,
         remove_owned_finalization_stage_with_phase_hook, remove_owned_partial,
-        remove_owned_reservation, reservation_is_owned, reserve_available_receive_path,
-        reserve_finalization_stage, reserve_receive_path, reserve_resumable_partial,
-        resumable_partial_is_owned, resumable_partial_path, safe_file_name,
+        remove_owned_partial_marker_after_file_cleanup_with_hook, remove_owned_partial_with_hook,
+        remove_owned_reservation, remove_owned_reservation_with_hook,
+        remove_owned_reservations_in_directory_with_hook, reservation_is_owned,
+        reservation_sidecar_path, reserve_available_receive_path, reserve_finalization_stage,
+        reserve_receive_path, reserve_resumable_partial, resumable_partial_is_owned,
+        resumable_partial_path, safe_file_name,
     };
 
     fn temporary_directory(label: &str) -> std::path::PathBuf {
@@ -2340,6 +3001,20 @@ mod tests {
     }
 
     #[test]
+    fn owned_cleanup_quarantine_prefix_is_generation_and_artifact_scoped() {
+        let first = super::owned_cleanup_quarantine_prefix("cleanup-a", "reservation-scan");
+        let restarted = super::owned_cleanup_quarantine_prefix("cleanup-a", "reservation-scan");
+        let other_generation =
+            super::owned_cleanup_quarantine_prefix("cleanup-b", "reservation-scan");
+        let other_artifact = super::owned_cleanup_quarantine_prefix("cleanup-a", "partial");
+
+        assert_eq!(first, restarted);
+        assert_ne!(first, other_generation);
+        assert_ne!(first, other_artifact);
+        assert!(first.starts_with(".weline-localnet-cleanup-"));
+    }
+
+    #[test]
     fn automatic_receive_atomically_reserves_numbered_destinations() {
         let directory = temporary_directory("reservation");
         fs::create_dir_all(&directory).expect("create receive directory");
@@ -2362,6 +3037,376 @@ mod tests {
                 .expect("inspect second reservation")
         );
         fs::remove_dir_all(directory).expect("remove receive fixture");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_partial_cleanup_deletes_the_verified_handle_not_a_path_replacement() {
+        let directory = temporary_directory("partial-exact-handle-race");
+        fs::create_dir_all(&directory).expect("create receive directory");
+        let destination = directory.join("report.bin");
+        reserve_receive_path(&destination, "partial-race", "race-token")
+            .expect("reserve destination");
+        let partial = reserve_resumable_partial(&destination, "partial-race", "race-token")
+            .expect("reserve partial");
+        fs::write(&partial, b"owned partial").expect("write owned partial");
+        let retired = directory.join("retired-owned-partial");
+
+        assert!(
+            !remove_owned_partial_with_hook(
+                &partial,
+                &destination,
+                "partial-race",
+                "race-token",
+                || {
+                    fs::rename(&partial, &retired)?;
+                    fs::write(&partial, b"replacement")?;
+                    Ok(())
+                },
+            )
+            .expect("remove exact opened partial"),
+            "the partial was retired, but the replacement prevents marker cleanup"
+        );
+        assert_eq!(
+            fs::read(&partial).expect("replacement remains"),
+            b"replacement"
+        );
+        assert!(
+            !retired.exists(),
+            "the opened owned file is retired exactly"
+        );
+
+        fs::remove_dir_all(directory).expect("remove partial race fixture");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_partial_sidecar_cleanup_preserves_a_path_replacement() {
+        let directory = temporary_directory("partial-sidecar-exact-handle-race");
+        fs::create_dir_all(&directory).expect("create receive directory");
+        let destination = directory.join("report.bin");
+        reserve_receive_path(&destination, "sidecar-race", "race-token")
+            .expect("reserve destination");
+        let partial = reserve_resumable_partial(&destination, "sidecar-race", "race-token")
+            .expect("reserve partial");
+        fs::remove_file(&partial).expect("simulate already-cleaned partial");
+        let marker = partial_owner_sidecar_path(&partial).expect("partial marker path");
+        let retired = directory.join("retired-owned-sidecar");
+
+        assert!(
+            remove_owned_partial_marker_after_file_cleanup_with_hook(
+                &partial,
+                &destination,
+                "sidecar-race",
+                "race-token",
+                || {
+                    fs::rename(&marker, &retired)?;
+                    fs::write(&marker, b"replacement")?;
+                    Ok(())
+                },
+            )
+            .expect("remove exact opened owner sidecar")
+        );
+        assert_eq!(
+            fs::read(&marker).expect("replacement remains"),
+            b"replacement"
+        );
+        assert!(
+            !retired.exists(),
+            "the opened owned sidecar is retired exactly"
+        );
+
+        fs::remove_dir_all(directory).expect("remove sidecar race fixture");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_reservation_cleanup_preserves_a_path_replacement() {
+        let directory = temporary_directory("reservation-exact-handle-race");
+        fs::create_dir_all(&directory).expect("create receive directory");
+        let destination = directory.join("report.bin");
+        reserve_receive_path(&destination, "reservation-race", "race-token")
+            .expect("reserve destination");
+        let marker = reservation_sidecar_path(&destination).expect("reservation marker path");
+        let retired = directory.join("retired-owned-reservation");
+
+        assert!(
+            remove_owned_reservation_with_hook(
+                &destination,
+                "reservation-race",
+                "race-token",
+                || {
+                    fs::rename(&marker, &retired)?;
+                    fs::write(&marker, b"replacement")?;
+                    Ok(())
+                },
+            )
+            .expect("remove exact opened reservation")
+        );
+        assert_eq!(
+            fs::read(&marker).expect("replacement remains"),
+            b"replacement"
+        );
+        assert!(!retired.exists(), "opened reservation is retired exactly");
+
+        fs::remove_dir_all(directory).expect("remove reservation race fixture");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_directory_scan_cleanup_preserves_a_replaced_marker() {
+        let directory = temporary_directory("reservation-scan-exact-handle-race");
+        fs::create_dir_all(&directory).expect("create receive directory");
+        let first = directory.join("first.bin");
+        let second = directory.join("second.bin");
+        reserve_receive_path(&first, "scan-race", "race-token").expect("reserve first");
+        reserve_receive_path(&second, "scan-race", "race-token").expect("reserve second");
+        let first_marker = reservation_sidecar_path(&first).expect("first reservation marker");
+        let retired = directory.join("retired-scan-reservation");
+        let injected = std::cell::Cell::new(false);
+
+        remove_owned_reservations_in_directory_with_hook(
+            &first,
+            "scan-race",
+            "race-token",
+            |path| {
+                if path == first_marker && !injected.replace(true) {
+                    fs::rename(path, &retired)?;
+                    fs::write(path, b"replacement")?;
+                }
+                Ok(())
+            },
+        )
+        .expect("scan removes exact opened reservations");
+        assert_eq!(
+            fs::read(&first_marker).expect("scan replacement remains"),
+            b"replacement"
+        );
+        assert!(!retired.exists(), "opened scan marker is retired exactly");
+        assert!(
+            !reservation_is_owned(&second, "scan-race", "race-token")
+                .expect("second owned reservation was cleaned")
+        );
+
+        fs::remove_dir_all(directory).expect("remove scan race fixture");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_partial_cleanup_retains_authority_when_quarantine_is_replaced_before_unlink() {
+        let directory = temporary_directory("macos-partial-quarantine-race");
+        fs::create_dir_all(&directory).expect("create receive directory");
+        let destination = directory.join("report.bin");
+        reserve_receive_path(&destination, "partial-race", "race-token")
+            .expect("reserve destination");
+        let partial = reserve_resumable_partial(&destination, "partial-race", "race-token")
+            .expect("reserve partial");
+        fs::write(&partial, b"owned partial").expect("write owned partial");
+        let retired = directory.join("retired-owned-partial");
+
+        let cleaned = remove_owned_partial_internal(
+            &partial,
+            &destination,
+            "partial-race",
+            "race-token",
+            "durable-cleanup-token",
+            |phase, quarantine| {
+                if phase == ExactCleanupPhase::AfterQuarantineProof {
+                    fs::rename(quarantine, &retired)?;
+                    fs::write(quarantine, b"replacement")?;
+                }
+                Ok(())
+            },
+        )
+        .expect("partial cleanup fails closed");
+
+        assert!(!cleaned);
+        assert_eq!(
+            fs::read(&partial).expect("replacement remains"),
+            b"replacement"
+        );
+        assert_eq!(
+            fs::read(&retired).expect("owned inode remains"),
+            b"owned partial"
+        );
+
+        fs::remove_dir_all(directory).expect("remove partial race fixture");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_partial_sidecar_cleanup_preserves_quarantine_replacement() {
+        let directory = temporary_directory("macos-sidecar-quarantine-race");
+        fs::create_dir_all(&directory).expect("create receive directory");
+        let destination = directory.join("report.bin");
+        reserve_receive_path(&destination, "sidecar-race", "race-token")
+            .expect("reserve destination");
+        let partial = reserve_resumable_partial(&destination, "sidecar-race", "race-token")
+            .expect("reserve partial");
+        fs::remove_file(&partial).expect("simulate already-cleaned partial");
+        let marker = partial_owner_sidecar_path(&partial).expect("partial marker path");
+        let retired = directory.join("retired-owned-sidecar");
+
+        let cleaned = remove_owned_partial_marker_after_file_cleanup_internal(
+            &partial,
+            &destination,
+            "sidecar-race",
+            "race-token",
+            "durable-cleanup-token",
+            |phase, quarantine| {
+                if phase == ExactCleanupPhase::AfterQuarantineProof {
+                    fs::rename(quarantine, &retired)?;
+                    fs::write(quarantine, b"replacement")?;
+                }
+                Ok(())
+            },
+        )
+        .expect("sidecar cleanup fails closed");
+
+        assert!(!cleaned);
+        assert_eq!(
+            fs::read(&marker).expect("replacement remains"),
+            b"replacement"
+        );
+        assert!(retired.exists(), "opened owned sidecar remains quarantined");
+
+        fs::remove_dir_all(directory).expect("remove sidecar race fixture");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_reservation_cleanup_preserves_quarantine_replacement() {
+        let directory = temporary_directory("macos-reservation-quarantine-race");
+        fs::create_dir_all(&directory).expect("create receive directory");
+        let destination = directory.join("report.bin");
+        reserve_receive_path(&destination, "reservation-race", "race-token")
+            .expect("reserve destination");
+        let marker = reservation_sidecar_path(&destination).expect("reservation marker path");
+        let retired = directory.join("retired-owned-reservation");
+
+        let cleaned = remove_owned_reservation_internal(
+            &destination,
+            "reservation-race",
+            "race-token",
+            "durable-cleanup-token",
+            |phase, quarantine| {
+                if phase == ExactCleanupPhase::AfterQuarantineProof {
+                    fs::rename(quarantine, &retired)?;
+                    fs::write(quarantine, b"replacement")?;
+                }
+                Ok(())
+            },
+        )
+        .expect("reservation cleanup fails closed");
+
+        assert!(!cleaned);
+        assert_eq!(
+            fs::read(&marker).expect("replacement remains"),
+            b"replacement"
+        );
+        assert!(retired.exists(), "opened reservation remains quarantined");
+
+        fs::remove_dir_all(directory).expect("remove reservation race fixture");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_directory_scan_retains_cleanup_when_quarantine_proof_is_lost() {
+        let directory = temporary_directory("macos-reservation-scan-quarantine-race");
+        fs::create_dir_all(&directory).expect("create receive directory");
+        let first = directory.join("first.bin");
+        let second = directory.join("second.bin");
+        reserve_receive_path(&first, "scan-race", "race-token").expect("reserve first");
+        reserve_receive_path(&second, "scan-race", "race-token").expect("reserve second");
+        let first_marker = reservation_sidecar_path(&first).expect("first reservation marker");
+        let first_quarantine = super::owned_cleanup_quarantine_path(
+            &first_marker,
+            "durable-cleanup-token",
+            "reservation-scan",
+        )
+        .expect("first quarantine path");
+        let retired = directory.join("retired-scan-reservation");
+        let injected = std::cell::Cell::new(false);
+
+        let cleaned = remove_owned_reservations_in_directory_internal(
+            &first,
+            "scan-race",
+            "race-token",
+            "durable-cleanup-token",
+            |phase, quarantine| {
+                if phase == ExactCleanupPhase::AfterQuarantineProof
+                    && quarantine == first_quarantine
+                    && !injected.replace(true)
+                {
+                    fs::rename(quarantine, &retired)?;
+                    fs::write(quarantine, b"replacement")?;
+                }
+                Ok(())
+            },
+        )
+        .expect("directory cleanup fails closed");
+
+        assert!(!cleaned);
+        assert_eq!(
+            fs::read(&first_marker).expect("replacement remains"),
+            b"replacement"
+        );
+        assert!(retired.exists(), "opened scan marker remains quarantined");
+        assert!(
+            !reservation_is_owned(&second, "scan-race", "race-token")
+                .expect("second owned reservation was cleaned")
+        );
+
+        fs::remove_dir_all(directory).expect("remove scan race fixture");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_directory_scan_restarts_a_durable_quarantine_after_crash() {
+        let directory = temporary_directory("macos-reservation-scan-quarantine-restart");
+        fs::create_dir_all(&directory).expect("create receive directory");
+        let destination = directory.join("target.bin");
+        let extra = directory.join("extra.bin");
+        let cleanup_token = "durable-cleanup-token";
+        reserve_receive_path(&extra, "scan-restart", "race-token")
+            .expect("reserve extra destination");
+        let marker = reservation_sidecar_path(&extra).expect("extra reservation marker");
+        let quarantine =
+            super::owned_cleanup_quarantine_path(&marker, cleanup_token, "reservation-scan")
+                .expect("durable quarantine path");
+
+        let crashed = remove_owned_reservations_in_directory_internal(
+            &destination,
+            "scan-restart",
+            "race-token",
+            cleanup_token,
+            |phase, path| {
+                if phase == ExactCleanupPhase::AfterQuarantineProof && path == quarantine {
+                    return Err(io::Error::other("simulated crash after quarantine proof"));
+                }
+                Ok(())
+            },
+        );
+        assert!(crashed.is_err());
+        assert!(!marker.exists(), "the owned marker was durably quarantined");
+        assert!(quarantine.exists(), "the crash left the quarantine pending");
+
+        assert!(
+            remove_owned_reservations_in_directory_internal(
+                &destination,
+                "scan-restart",
+                "race-token",
+                cleanup_token,
+                |_, _| Ok(()),
+            )
+            .expect("restart directory cleanup")
+        );
+        assert!(
+            !quarantine.exists(),
+            "restart must rediscover and retire the durable quarantine"
+        );
+
+        fs::remove_dir_all(directory).expect("remove scan restart fixture");
     }
 
     #[test]
@@ -2606,7 +3651,9 @@ mod tests {
         fs::remove_file(&partial).expect("remove originally owned inode");
         #[cfg(windows)]
         if let Err(error) = std::os::windows::fs::symlink_file(&user_file, &partial) {
-            if error.kind() == io::ErrorKind::PermissionDenied {
+            // Rust may expose Windows ERROR_PRIVILEGE_NOT_HELD as Uncategorized.
+            if error.kind() == io::ErrorKind::PermissionDenied || error.raw_os_error() == Some(1314)
+            {
                 fs::remove_dir_all(directory).expect("remove unsupported symlink fixture");
                 return;
             }
@@ -2922,6 +3969,95 @@ mod tests {
                 "new copy fallback never persists a hidden stage pathname"
             );
             fs::remove_dir_all(directory).expect("remove fixture");
+        }
+    }
+
+    #[test]
+    fn copy_fallback_storage_full_retires_visible_candidate_and_retries_from_full_partial() {
+        let directory = temporary_directory("copy-fallback-storage-full");
+        fs::create_dir_all(&directory).expect("create receive directory");
+        let destination = directory.join("large.bin");
+        reserve_receive_path(&destination, "low-space-copy", "copy-token")
+            .expect("reserve destination");
+        let partial = reserve_resumable_partial(&destination, "low-space-copy", "copy-token")
+            .expect("reserve partial");
+        let payload = vec![0x6c; 192 * 1024];
+        fs::write(&partial, &payload).expect("write complete verified partial");
+        let injected = std::cell::Cell::new(false);
+
+        let error = finalize_reserved_receive_copy_fallback_with_hooks(
+            &partial,
+            &destination,
+            "large.bin",
+            "low-space-copy",
+            "copy-token",
+            |_, _| Ok(()),
+            |_, _| {
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "filesystem does not support hard links",
+                ))
+            },
+            |phase| {
+                if phase == FinalizationPhase::DuringCopy && !injected.replace(true) {
+                    return Err(injected_storage_full_error());
+                }
+                Ok(())
+            },
+        )
+        .err()
+        .expect("injected storage exhaustion pauses finalization");
+        assert!(
+            super::is_storage_full_error(&error),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(fs::read(&partial).expect("full partial remains"), payload);
+        assert!(
+            !destination.exists(),
+            "a truncated final-name candidate must not remain visible"
+        );
+        assert!(
+            reservation_is_owned(&destination, "low-space-copy", "copy-token")
+                .expect("reservation remains for retry")
+        );
+        assert_eq!(
+            owned_finalized_receive_path(&destination, "low-space-copy", "copy-token")
+                .expect("incomplete copy is not finalized"),
+            None
+        );
+
+        let finalized = finalize_reserved_receive_copy_fallback_with_hooks(
+            &partial,
+            &destination,
+            "large.bin",
+            "low-space-copy",
+            "copy-token",
+            |_, _| Ok(()),
+            |_, _| panic!("CopyPrepared restart must not retry the unsupported hard-link probe"),
+            |_| Ok(()),
+        )
+        .expect("retry after space returns materializes from the retained partial");
+        assert_eq!(finalized.path, destination);
+        assert_eq!(
+            fs::read(&destination).expect("read completed retry"),
+            payload
+        );
+
+        fs::remove_dir_all(directory).expect("remove copy storage-full fixture");
+    }
+
+    fn injected_storage_full_error() -> io::Error {
+        #[cfg(windows)]
+        {
+            io::Error::from_raw_os_error(112)
+        }
+        #[cfg(unix)]
+        {
+            io::Error::from_raw_os_error(libc::ENOSPC)
+        }
+        #[cfg(not(any(windows, unix)))]
+        {
+            io::Error::new(io::ErrorKind::StorageFull, "storage full")
         }
     }
 

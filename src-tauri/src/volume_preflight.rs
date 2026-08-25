@@ -12,6 +12,8 @@ use crate::{
 const DESTINATION_SPACE_RESERVE_CHUNKS: u64 = 16;
 const FAT32_MAX_FILE_BYTES: u64 = (4 * 1024 * 1024 * 1024) - 1;
 const WRITE_PROBE_ATTEMPTS: u8 = 3;
+pub(crate) const DESTINATION_PREFLIGHT_PAUSE_MARKER: &str =
+    "[weline-localnet:destination-preflight:v1]";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VolumeSnapshot {
@@ -68,13 +70,26 @@ pub fn validate_volume(
         .ok_or_else(|| {
             AppError::Storage("无法计算接收目录所需的预留空间，请重新选择目录后重试".to_string())
         })?;
-    let required_bytes = remaining_bytes.checked_add(reserve_bytes).ok_or_else(|| {
-        AppError::InvalidInput("文件大小过大，无法计算接收目录所需空间".to_string())
-    })?;
+    let final_copy_bytes = if filesystem_supports_hard_links(&filesystem) {
+        0
+    } else {
+        file_size
+    };
+    let required_bytes = remaining_bytes
+        .checked_add(final_copy_bytes)
+        .and_then(|bytes| bytes.checked_add(reserve_bytes))
+        .ok_or_else(|| {
+            AppError::InvalidInput("文件大小过大，无法计算接收目录所需空间".to_string())
+        })?;
 
     if snapshot.available_bytes < required_bytes {
+        let final_copy_requirement = if final_copy_bytes == 0 {
+            String::new()
+        } else {
+            format!("，最终文件副本需要 {final_copy_bytes} 字节")
+        };
         return Err(AppError::InvalidInput(format!(
-            "接收目录位于 {filesystem} 文件系统，可用空间不足：继续接收需要 {remaining_bytes} 字节，并需保留 {reserve_bytes} 字节；请选择可用空间更多的目录后重试"
+            "接收目录位于 {filesystem} 文件系统，可用空间不足：继续接收需要 {remaining_bytes} 字节{final_copy_requirement}，并需保留 {reserve_bytes} 字节；请选择可用空间更多的目录后重试"
         )));
     }
 
@@ -173,6 +188,13 @@ fn maximum_file_bytes(filesystem: &str) -> Option<u64> {
         "FAT32" | "MSDOS" => Some(FAT32_MAX_FILE_BYTES),
         _ => None,
     }
+}
+
+fn filesystem_supports_hard_links(filesystem: &str) -> bool {
+    matches!(
+        normalize_filesystem_name(filesystem).as_str(),
+        "NTFS" | "REFS" | "APFS" | "HFS" | "HFS+" | "HFSX"
+    )
 }
 
 #[cfg(target_os = "windows")]
@@ -399,11 +421,55 @@ mod tests {
     }
 
     #[test]
-    fn ntfs_apfs_and_exfat_accept_100_gib() {
-        for filesystem in ["NTFS", "APFS", "exFAT"] {
+    fn known_hard_link_filesystems_accept_100_gib_at_remaining_plus_margin() {
+        for filesystem in ["NTFS", "APFS"] {
             let snapshot = VolumeSnapshot::known(filesystem, 100 * GIB + RESERVE_BYTES, None);
             validate_volume(&snapshot, 100 * GIB, 0).unwrap();
         }
+    }
+
+    #[test]
+    fn unsupported_or_unknown_hard_link_filesystems_reserve_a_full_copy_candidate() {
+        let file_size = 3 * GIB;
+        let committed_bytes = GIB;
+        let exact = (file_size - committed_bytes) + file_size + RESERVE_BYTES;
+
+        for filesystem in ["EXFAT", "FAT32", "MSDOS", "UNKNOWNFS"] {
+            let snapshot = VolumeSnapshot::known(filesystem, exact, maximum_file_bytes(filesystem));
+            validate_volume(&snapshot, file_size, committed_bytes)
+                .expect("copy-fallback filesystems accept the exact full workspace margin");
+            let one_byte_short =
+                VolumeSnapshot::known(filesystem, exact - 1, maximum_file_bytes(filesystem));
+            assert!(
+                validate_volume(&one_byte_short, file_size, committed_bytes)
+                    .expect_err("one byte below copy workspace must fail")
+                    .to_string()
+                    .contains("最终文件副本")
+            );
+        }
+    }
+
+    #[test]
+    fn exfat_100_gib_checked_workspace_math_requires_two_full_files_without_allocating() {
+        let file_size = 100 * GIB;
+        let required = file_size
+            .checked_mul(2)
+            .and_then(|bytes| bytes.checked_add(RESERVE_BYTES))
+            .expect("100 GiB workspace fits u64");
+        validate_volume(
+            &VolumeSnapshot::known("EXFAT", required, None),
+            file_size,
+            0,
+        )
+        .expect("exact 100 GiB copy workspace is accepted");
+        assert!(
+            validate_volume(
+                &VolumeSnapshot::known("EXFAT", required - 1, None),
+                file_size,
+                0,
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -20,17 +20,19 @@ use crate::{
         open_owned_resumable_partial_file, owned_finalization_reservations,
         owned_finalized_receive_path, remove_owned_finalization_marker,
         remove_owned_finalization_stage, remove_owned_partial,
-        remove_owned_partial_marker_after_file_cleanup, remove_owned_reservation,
-        remove_owned_reservations_in_directory, reserve_resumable_partial,
+        remove_owned_partial_marker_after_file_cleanup,
+        remove_owned_partial_marker_after_file_cleanup_with_cleanup_token,
+        remove_owned_partial_with_cleanup_token, remove_owned_reservation,
+        remove_owned_reservation_with_cleanup_token, remove_owned_reservations_in_directory,
+        remove_owned_reservations_in_directory_with_cleanup_token, reserve_resumable_partial,
         resumable_partial_is_owned, resumable_partial_path,
     },
     transfer_manifest::{
         TransferChunk, decode_sha256, expected_chunk_count, expected_chunk_length, manifest_root,
         validate_transfer_metadata,
     },
+    volume_preflight::DESTINATION_PREFLIGHT_PAUSE_MARKER,
 };
-
-const DESTINATION_PREFLIGHT_PAUSE_MARKER: &str = "[weline-localnet:destination-preflight:v1]";
 
 #[derive(Clone)]
 pub struct Storage {
@@ -47,6 +49,14 @@ pub(crate) struct PreparedIncomingDecision {
 pub(crate) struct ClaimedOutgoingResume {
     pub transfer: TransferRecord,
     pub query_token: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingTerminalNotification {
+    pub transfer_id: String,
+    pub peer_id: String,
+    pub generation: String,
+    pub state: TransferStatus,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -713,6 +723,36 @@ impl Storage {
         Ok(changed == 1)
     }
 
+    pub fn try_claim_legacy_incoming_transfer(
+        &self,
+        transfer_id: &str,
+        peer_id: &str,
+    ) -> Result<bool, AppError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE transfers
+             SET receive_claimed = 1,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE transfer_id = ?1 AND peer_id = ?2 AND direction = 'incoming'
+               AND transfer_protocol = 1 AND status = 'transferring'
+               AND receive_claimed = 0
+               AND NOT EXISTS (
+                   SELECT 1 FROM transfer_cleanup WHERE transfer_id = ?1
+               )",
+            params![transfer_id, peer_id],
+        )?;
+        if changed == 1 {
+            transaction.execute(
+                "DELETE FROM incoming_transfer_decisions
+                 WHERE transfer_id = ?1 AND peer_id = ?2",
+                params![transfer_id, peer_id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(changed == 1)
+    }
+
     pub(crate) fn prepare_incoming_acceptance_decision(
         &self,
         transfer_id: &str,
@@ -938,6 +978,46 @@ impl Storage {
         Ok(changed == 1)
     }
 
+    pub(crate) fn try_fail_pending_outgoing_resume_query(
+        &self,
+        transfer_id: &str,
+        peer_id: &str,
+        expected_bytes: u64,
+        query_token: &str,
+        error: &str,
+    ) -> Result<bool, AppError> {
+        let expected_bytes = i64::try_from(expected_bytes)
+            .map_err(|_| AppError::Storage("发送进度超出存储范围".to_string()))?;
+        let generation = uuid::Uuid::now_v7().to_string();
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE transfers
+             SET status = 'failed', error = ?5, send_claimed = 0,
+                 resume_query_token = NULL,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE transfer_id = ?1 AND peer_id = ?2 AND direction = 'outgoing'
+               AND transfer_protocol = 2 AND status = 'paused' AND send_claimed = 0
+               AND transferred_bytes = ?3 AND resume_query_token = ?4",
+            params![transfer_id, peer_id, expected_bytes, query_token, error],
+        )?;
+        if changed == 1 {
+            Self::insert_terminal_notification_in_transaction(
+                &transaction,
+                transfer_id,
+                peer_id,
+                &generation,
+                TransferStatus::Failed,
+            )?;
+            transaction.execute(
+                "DELETE FROM transfer_chunks WHERE transfer_id = ?1",
+                [transfer_id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(changed == 1)
+    }
+
     pub(crate) fn try_claim_outgoing_resume_query(
         &self,
         transfer_id: &str,
@@ -1083,16 +1163,32 @@ impl Storage {
         peer_id: &str,
         error: &str,
     ) -> Result<bool, AppError> {
-        let changed = self.try_transition_claimed_incoming_transfer(
-            transfer_id,
-            peer_id,
-            TransferStatus::Failed,
-            Some(error),
+        let generation = uuid::Uuid::now_v7().to_string();
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE transfers
+             SET status = 'failed', error = ?3, receive_claimed = 0,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE transfer_id = ?1 AND peer_id = ?2 AND direction = 'incoming'
+               AND transfer_protocol = 2 AND status = 'transferring' AND receive_claimed = 1",
+            params![transfer_id, peer_id, error],
         )?;
-        if changed {
+        if changed == 1 {
+            Self::insert_terminal_notification_in_transaction(
+                &transaction,
+                transfer_id,
+                peer_id,
+                &generation,
+                TransferStatus::Failed,
+            )?;
+        }
+        transaction.commit()?;
+        drop(connection);
+        if changed == 1 {
             self.cleanup_owned_transfer_artifacts(transfer_id)?;
         }
-        Ok(changed)
+        Ok(changed == 1)
     }
 
     pub fn try_complete_claimed_incoming_transfer(
@@ -1199,16 +1295,32 @@ impl Storage {
         peer_id: &str,
         error: &str,
     ) -> Result<bool, AppError> {
-        let changed = self.try_transition_claimed_outgoing_transfer(
-            transfer_id,
-            peer_id,
-            TransferStatus::Failed,
-            Some(error),
+        let generation = uuid::Uuid::now_v7().to_string();
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE transfers
+             SET status = 'failed', error = ?3, send_claimed = 0,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE transfer_id = ?1 AND peer_id = ?2 AND direction = 'outgoing'
+               AND transfer_protocol = 2 AND status = 'transferring' AND send_claimed = 1",
+            params![transfer_id, peer_id, error],
         )?;
-        if changed {
+        if changed == 1 {
+            Self::insert_terminal_notification_in_transaction(
+                &transaction,
+                transfer_id,
+                peer_id,
+                &generation,
+                TransferStatus::Failed,
+            )?;
+        }
+        transaction.commit()?;
+        drop(connection);
+        if changed == 1 {
             self.delete_terminal_transfer_chunks(transfer_id)?;
         }
-        Ok(changed)
+        Ok(changed == 1)
     }
 
     pub fn try_complete_claimed_outgoing_transfer(
@@ -1284,17 +1396,33 @@ impl Storage {
         query_token: &str,
         error: &str,
     ) -> Result<bool, AppError> {
-        let changed = self.try_transition_claimed_outgoing_resume_transfer(
-            transfer_id,
-            peer_id,
-            query_token,
-            TransferStatus::Failed,
-            error,
+        let generation = uuid::Uuid::now_v7().to_string();
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE transfers
+             SET status = 'failed', error = ?4, send_claimed = 0, resume_query_token = NULL,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE transfer_id = ?1 AND peer_id = ?2 AND direction = 'outgoing'
+               AND transfer_protocol = 2 AND status = 'transferring' AND send_claimed = 1
+               AND resume_query_token = ?3",
+            params![transfer_id, peer_id, query_token, error],
         )?;
-        if changed {
+        if changed == 1 {
+            Self::insert_terminal_notification_in_transaction(
+                &transaction,
+                transfer_id,
+                peer_id,
+                &generation,
+                TransferStatus::Failed,
+            )?;
+        }
+        transaction.commit()?;
+        drop(connection);
+        if changed == 1 {
             self.delete_terminal_transfer_chunks(transfer_id)?;
         }
-        Ok(changed)
+        Ok(changed == 1)
     }
 
     fn try_transition_claimed_outgoing_resume_transfer(
@@ -1358,8 +1486,10 @@ impl Storage {
         peer_id: &str,
         error: &str,
     ) -> Result<bool, AppError> {
-        let connection = self.connection()?;
-        let changed = connection.execute(
+        let generation = uuid::Uuid::now_v7().to_string();
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
             "UPDATE transfers
              SET status = 'cancelled', error = ?3, send_claimed = 0,
                  resume_query_token = NULL,
@@ -1370,11 +1500,216 @@ impl Storage {
                AND send_claimed = 0",
             params![transfer_id, peer_id, error],
         )?;
-        drop(connection);
         if changed == 1 {
-            self.delete_terminal_transfer_chunks(transfer_id)?;
+            Self::insert_terminal_notification_in_transaction(
+                &transaction,
+                transfer_id,
+                peer_id,
+                &generation,
+                TransferStatus::Cancelled,
+            )?;
+            transaction.execute(
+                "DELETE FROM transfer_chunks WHERE transfer_id = ?1",
+                [transfer_id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(changed == 1)
+    }
+
+    pub(crate) fn try_fail_unclaimed_outgoing_transfer(
+        &self,
+        transfer_id: &str,
+        peer_id: &str,
+        error: &str,
+    ) -> Result<bool, AppError> {
+        let generation = uuid::Uuid::now_v7().to_string();
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE transfers
+             SET status = 'failed', error = ?3, send_claimed = 0,
+                 resume_query_token = NULL,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE transfer_id = ?1 AND peer_id = ?2 AND direction = 'outgoing'
+               AND transfer_protocol = 2
+               AND status IN ('awaitingAcceptance', 'transferring', 'paused')
+               AND send_claimed = 0",
+            params![transfer_id, peer_id, error],
+        )?;
+        if changed == 1 {
+            Self::insert_terminal_notification_in_transaction(
+                &transaction,
+                transfer_id,
+                peer_id,
+                &generation,
+                TransferStatus::Failed,
+            )?;
+            transaction.execute(
+                "DELETE FROM transfer_chunks WHERE transfer_id = ?1",
+                [transfer_id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(changed == 1)
+    }
+
+    pub(crate) fn list_pending_terminal_notifications(
+        &self,
+        peer_id: &str,
+    ) -> Result<Vec<PendingTerminalNotification>, AppError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT transfer_id, peer_id, generation, terminal_status
+             FROM transfer_terminal_notifications
+             WHERE peer_id = ?1 ORDER BY created_at, transfer_id",
+        )?;
+        statement
+            .query_map([peer_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .map(|row| {
+                let (transfer_id, peer_id, generation, terminal_status) = row?;
+                let state = TransferStatus::from_str(&terminal_status)?;
+                if !matches!(state, TransferStatus::Cancelled | TransferStatus::Failed) {
+                    return Err(AppError::Storage("待通知文件传输包含无效终态".to_string()));
+                }
+                Ok(PendingTerminalNotification {
+                    transfer_id,
+                    peer_id,
+                    generation,
+                    state,
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn acknowledge_terminal_notification(
+        &self,
+        transfer_id: &str,
+        peer_id: &str,
+        generation: &str,
+    ) -> Result<bool, AppError> {
+        let changed = self.connection()?.execute(
+            "DELETE FROM transfer_terminal_notifications
+             WHERE transfer_id = ?1 AND peer_id = ?2 AND generation = ?3",
+            params![transfer_id, peer_id, generation],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub(crate) fn apply_remote_terminal_transfer(
+        &self,
+        transfer_id: &str,
+        peer_id: &str,
+        state: TransferStatus,
+        error: &str,
+    ) -> Result<bool, AppError> {
+        if !matches!(state, TransferStatus::Cancelled | TransferStatus::Failed) {
+            return Err(AppError::InvalidInput(
+                "远端文件终态通知状态无效".to_string(),
+            ));
+        }
+
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transfer = transaction
+            .query_row(
+                "SELECT direction, transfer_protocol, status
+                 FROM transfers WHERE transfer_id = ?1 AND peer_id = ?2",
+                params![transfer_id, peer_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, u8>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((direction, transfer_protocol, previous_status)) = transfer else {
+            transaction.commit()?;
+            return Ok(false);
+        };
+        if transfer_protocol != 2 {
+            transaction.commit()?;
+            return Ok(false);
+        }
+        let direction = Direction::from_str(&direction)?;
+        let previous_status = TransferStatus::from_str(&previous_status)?;
+        let changed = transaction.execute(
+            "UPDATE transfers
+             SET status = ?3, error = ?4, send_claimed = 0, receive_claimed = 0,
+                 resume_query_token = NULL,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE transfer_id = ?1 AND peer_id = ?2 AND transfer_protocol = 2
+               AND status IN ('awaitingAcceptance', 'transferring', 'paused')",
+            params![transfer_id, peer_id, state.as_str(), error],
+        )?;
+        if changed == 1 {
+            transaction.execute(
+                "DELETE FROM incoming_transfer_decisions
+                 WHERE transfer_id = ?1 AND peer_id = ?2",
+                params![transfer_id, peer_id],
+            )?;
+        }
+        if changed == 1
+            || matches!(
+                previous_status,
+                TransferStatus::Cancelled | TransferStatus::Failed
+            )
+        {
+            transaction.execute(
+                "DELETE FROM transfer_chunks WHERE transfer_id = ?1",
+                [transfer_id],
+            )?;
+        }
+        transaction.commit()?;
+        drop(connection);
+
+        if direction == Direction::Incoming
+            && (changed == 1
+                || matches!(
+                    previous_status,
+                    TransferStatus::Cancelled | TransferStatus::Failed
+                ))
+        {
+            self.cleanup_owned_transfer_artifacts(transfer_id)?;
         }
         Ok(changed == 1)
+    }
+
+    fn insert_terminal_notification_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        transfer_id: &str,
+        peer_id: &str,
+        generation: &str,
+        state: TransferStatus,
+    ) -> Result<(), AppError> {
+        if !matches!(state, TransferStatus::Cancelled | TransferStatus::Failed)
+            || generation.trim().is_empty()
+        {
+            return Err(AppError::InvalidInput(
+                "文件终态通知代次或状态无效".to_string(),
+            ));
+        }
+        transaction.execute(
+            "INSERT INTO transfer_terminal_notifications
+               (transfer_id, peer_id, generation, terminal_status, created_at)
+             VALUES (?1, ?2, ?3, ?4, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+             ON CONFLICT(transfer_id) DO UPDATE SET
+               peer_id = excluded.peer_id,
+               generation = excluded.generation,
+               terminal_status = excluded.terminal_status,
+               created_at = excluded.created_at",
+            params![transfer_id, peer_id, generation, state.as_str()],
+        )?;
+        Ok(())
     }
 
     #[allow(dead_code)] // Task 7 queries resumable sends after reconnect.
@@ -1754,6 +2089,7 @@ impl Storage {
         transfer_protocol: u8,
         error: &str,
     ) -> Result<bool, AppError> {
+        let generation = uuid::Uuid::now_v7().to_string();
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let changed = transaction.execute(
@@ -1772,11 +2108,30 @@ impl Storage {
                  WHERE transfer_id = ?1 AND peer_id = ?2",
                 params![transfer_id, peer_id],
             )?;
+            if transfer_protocol == 2 {
+                Self::insert_terminal_notification_in_transaction(
+                    &transaction,
+                    transfer_id,
+                    peer_id,
+                    &generation,
+                    TransferStatus::Cancelled,
+                )?;
+            }
         }
         transaction.commit()?;
         drop(connection);
         if changed == 1 {
-            self.cleanup_owned_transfer_artifacts(transfer_id)?;
+            if let Err(error) = self.cleanup_owned_transfer_artifacts(transfer_id) {
+                if transfer_protocol == 2 && self.pending_terminal_cleanup(transfer_id)?.is_some() {
+                    tracing::warn!(
+                        %error,
+                        %transfer_id,
+                        "durably committed incoming cancellation is deferring owned artifact cleanup"
+                    );
+                } else {
+                    return Err(error);
+                }
+            }
         }
         Ok(changed == 1)
     }
@@ -2161,6 +2516,14 @@ impl Storage {
                state TEXT NOT NULL,
                created_at TEXT NOT NULL,
                updated_at TEXT NOT NULL,
+               FOREIGN KEY (transfer_id) REFERENCES transfers(transfer_id) ON DELETE CASCADE
+             );
+             CREATE TABLE IF NOT EXISTS transfer_terminal_notifications (
+               transfer_id TEXT PRIMARY KEY NOT NULL,
+               peer_id TEXT NOT NULL,
+               generation TEXT NOT NULL UNIQUE,
+               terminal_status TEXT NOT NULL CHECK(terminal_status IN ('cancelled', 'failed')),
+               created_at TEXT NOT NULL,
                FOREIGN KEY (transfer_id) REFERENCES transfers(transfer_id) ON DELETE CASCADE
              );",
         )?;
@@ -2733,8 +3096,10 @@ impl Storage {
         record: &PartialRecoveryRecord,
         error: &str,
     ) -> Result<(), AppError> {
-        let connection = self.connection()?;
-        let changed = connection.execute(
+        let generation = uuid::Uuid::now_v7().to_string();
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
             "UPDATE transfers
              SET status = 'failed', error = ?3, receive_claimed = 0,
                  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
@@ -2742,6 +3107,16 @@ impl Storage {
                AND transfer_protocol = 2 AND status = 'paused' AND receive_claimed = 1",
             params![record.transfer_id, record.peer_id, error],
         )?;
+        if changed == 1 {
+            Self::insert_terminal_notification_in_transaction(
+                &transaction,
+                &record.transfer_id,
+                &record.peer_id,
+                &generation,
+                TransferStatus::Failed,
+            )?;
+        }
+        transaction.commit()?;
         drop(connection);
         if changed == 1 {
             self.cleanup_owned_transfer_artifacts(&record.transfer_id)?;
@@ -3228,6 +3603,10 @@ impl Storage {
     where
         F: FnOnce(),
     {
+        let cleanup_token = record
+            .cleanup_token
+            .as_deref()
+            .ok_or_else(|| AppError::Storage("待清理文件缺少稳定的清理代次凭据".to_string()))?;
         let mut finalized_destination = None;
         let mut journal_reservations = Vec::new();
         if let (Some(destination), Some(token)) = (
@@ -3242,18 +3621,35 @@ impl Storage {
         let artifact_destination = finalized_destination
             .as_deref()
             .or(record.destination.as_deref());
+        let mut reservation_cleaned = !record.destination_reserved;
         if record.destination_reserved {
             if let (Some(destination), Some(token)) =
                 (artifact_destination, record.reservation_token.as_deref())
             {
+                reservation_cleaned = true;
                 if journal_reservations.is_empty() {
-                    remove_owned_reservation(destination, &record.transfer_id, token)?;
+                    reservation_cleaned &= remove_owned_reservation_with_cleanup_token(
+                        destination,
+                        &record.transfer_id,
+                        token,
+                        cleanup_token,
+                    )?;
                 } else {
                     for destination in &journal_reservations {
-                        remove_owned_reservation(destination, &record.transfer_id, token)?;
+                        reservation_cleaned &= remove_owned_reservation_with_cleanup_token(
+                            destination,
+                            &record.transfer_id,
+                            token,
+                            cleanup_token,
+                        )?;
                     }
                 }
-                remove_owned_reservations_in_directory(destination, &record.transfer_id, token)?;
+                reservation_cleaned &= remove_owned_reservations_in_directory_with_cleanup_token(
+                    destination,
+                    &record.transfer_id,
+                    token,
+                    cleanup_token,
+                )?;
             }
         }
         let mut partial_cleaned = record.partial.is_none();
@@ -3262,16 +3658,22 @@ impl Storage {
             artifact_destination,
             record.reservation_token.as_deref(),
         ) {
-            partial_cleaned =
-                remove_owned_partial(partial, destination, &record.transfer_id, token)?
-                    || remove_owned_partial_marker_after_file_cleanup(
-                        partial,
-                        destination,
-                        &record.transfer_id,
-                        token,
-                    )?;
+            partial_cleaned = remove_owned_partial_with_cleanup_token(
+                partial,
+                destination,
+                &record.transfer_id,
+                token,
+                cleanup_token,
+            )?
+                || remove_owned_partial_marker_after_file_cleanup_with_cleanup_token(
+                    partial,
+                    destination,
+                    &record.transfer_id,
+                    token,
+                    cleanup_token,
+                )?;
         }
-        if !partial_cleaned {
+        if !partial_cleaned || !reservation_cleaned {
             return Ok(());
         }
         if let (Some(destination), Some(token)) = (
@@ -3284,10 +3686,6 @@ impl Storage {
             remove_owned_finalization_marker(destination, &record.transfer_id, token)?;
         }
         after_filesystem_cleanup();
-        let cleanup_token = record
-            .cleanup_token
-            .as_deref()
-            .ok_or_else(|| AppError::Storage("待清理文件缺少稳定的清理代次凭据".to_string()))?;
         self.connection()?.execute(
             "DELETE FROM transfer_cleanup
              WHERE transfer_id = ?1 AND cleanup_token = ?2",
@@ -7371,6 +7769,12 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        let pending_terminal = storage
+            .list_pending_terminal_notifications("peer-one")
+            .expect("load failed-transfer notification");
+        assert_eq!(pending_terminal.len(), 1);
+        assert_eq!(pending_terminal[0].transfer_id, "terminal-failure");
+        assert_eq!(pending_terminal[0].state, TransferStatus::Failed);
         assert_eq!(
             fs::read(&destination).expect("read protected destination"),
             b"completed-or-user-data"
@@ -7561,6 +7965,87 @@ mod tests {
 
         drop(storage);
         fs::remove_dir_all(fixture).expect("remove fixture");
+    }
+
+    #[test]
+    fn unowned_reservation_replacement_keeps_terminal_cleanup_tombstone_pending() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-terminal-reservation-replacement-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&fixture).expect("create reservation replacement fixture");
+        let storage = Storage::open(&fixture.join("localnet.sqlite3")).expect("open storage");
+        let transfer_id = "terminal-reservation-replacement";
+        let token = "terminal-reservation-token";
+        let destination = fixture.join("report.bin");
+        reserve_receive_path(&destination, transfer_id, token).expect("reserve destination");
+        {
+            let connection = storage.connection().expect("insert terminal transfer");
+            connection
+                .execute(
+                    "INSERT INTO transfers
+                       (transfer_id, peer_id, direction, kind, file_name, file_size, mime_type,
+                        sha256, local_path, destination_reserved, reservation_token,
+                        transfer_protocol, transferred_bytes, status, created_at, updated_at)
+                     VALUES (?1, 'peer-one', 'incoming', 'file', 'report.bin', 4,
+                             'application/octet-stream', ?2, ?3, 1, ?4, 2, 0,
+                             'failed', ?5, ?5)",
+                    rusqlite::params![
+                        transfer_id,
+                        "0".repeat(64),
+                        destination.to_string_lossy(),
+                        token,
+                        "2026-08-25T00:00:00.000Z",
+                    ],
+                )
+                .expect("insert terminal transfer");
+        }
+        storage
+            .stage_terminal_cleanup(&OwnedArtifactRecord {
+                transfer_id: transfer_id.to_string(),
+                destination: Some(destination.clone()),
+                partial: None,
+                reservation_token: Some(token.to_string()),
+                destination_reserved: true,
+                transfer_protocol: 2,
+                status: "failed".to_string(),
+                cleanup_token: None,
+            })
+            .expect("stage terminal cleanup");
+        let marker = fs::read_dir(&fixture)
+            .expect("scan reservation marker")
+            .map(|entry| entry.expect("read reservation entry").path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(".weline-localnet-reservation-"))
+            })
+            .expect("reservation marker exists");
+        fs::remove_file(&marker).expect("detach owned reservation marker");
+        fs::write(&marker, b"concurrent user replacement").expect("write replacement marker");
+
+        let staged = storage
+            .pending_terminal_cleanup(transfer_id)
+            .expect("load terminal cleanup")
+            .expect("terminal cleanup exists");
+        storage
+            .cleanup_pending_terminal_artifact(&staged)
+            .expect("fail closed without deleting replacement");
+
+        assert_eq!(
+            fs::read(&marker).expect("replacement remains"),
+            b"concurrent user replacement"
+        );
+        assert!(
+            storage
+                .pending_terminal_cleanup(transfer_id)
+                .expect("reload retained tombstone")
+                .is_some(),
+            "unproven reservation cleanup must retain durable cleanup authority"
+        );
+
+        drop(storage);
+        fs::remove_dir_all(fixture).expect("remove reservation replacement fixture");
     }
 
     #[test]
@@ -8099,6 +8584,12 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        let pending_terminal = storage
+            .list_pending_terminal_notifications("peer-one")
+            .expect("load cancelled-transfer notification");
+        assert_eq!(pending_terminal.len(), 1);
+        assert_eq!(pending_terminal[0].transfer_id, "cancel-cleanup");
+        assert_eq!(pending_terminal[0].state, TransferStatus::Cancelled);
         assert!(
             !reservation_is_owned(&destination, "cancel-cleanup", "token-cancel-cleanup")
                 .expect("inspect cleaned reservation")
@@ -8106,5 +8597,192 @@ mod tests {
 
         drop(storage);
         fs::remove_dir_all(fixture).expect("remove storage fixture");
+    }
+
+    #[test]
+    fn local_v2_terminal_notification_survives_restart_and_only_exact_generation_ack_retires_it() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-terminal-notification-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&fixture).expect("create terminal notification fixture");
+        let database = fixture.join("localnet.sqlite3");
+        let storage = Storage::open(&database).expect("open terminal notification storage");
+        insert_paused_outgoing_resume_fixture(&storage, "offline-cancel");
+
+        assert!(
+            storage
+                .try_cancel_unclaimed_outgoing_transfer(
+                    "offline-cancel",
+                    "peer-one",
+                    "cancelled while offline",
+                )
+                .expect("cancel paused outgoing")
+        );
+        let pending = storage
+            .list_pending_terminal_notifications("peer-one")
+            .expect("list pending terminal notifications");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].transfer_id, "offline-cancel");
+        assert_eq!(pending[0].peer_id, "peer-one");
+        assert_eq!(pending[0].state, TransferStatus::Cancelled);
+        let generation = pending[0].generation.clone();
+        drop(storage);
+
+        let storage = Storage::open(&database).expect("restart terminal notification storage");
+        let restarted = storage
+            .list_pending_terminal_notifications("peer-one")
+            .expect("reload pending terminal notifications");
+        assert_eq!(restarted.len(), 1);
+        assert_eq!(restarted[0].generation, generation);
+        assert!(
+            !storage
+                .acknowledge_terminal_notification(
+                    "offline-cancel",
+                    "peer-one",
+                    "stale-generation",
+                )
+                .expect("reject stale terminal acknowledgement")
+        );
+        assert_eq!(
+            storage
+                .list_pending_terminal_notifications("peer-one")
+                .expect("stale acknowledgement retains pending row")
+                .len(),
+            1
+        );
+        assert!(
+            storage
+                .acknowledge_terminal_notification("offline-cancel", "peer-one", &generation,)
+                .expect("accept exact terminal acknowledgement")
+        );
+        assert!(
+            storage
+                .list_pending_terminal_notifications("peer-one")
+                .expect("exact acknowledgement retires pending row")
+                .is_empty()
+        );
+
+        drop(storage);
+        fs::remove_dir_all(fixture).expect("remove terminal notification fixture");
+    }
+
+    #[test]
+    fn exact_remote_terminal_is_idempotent_cleans_incoming_artifacts_and_never_echoes() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-remote-terminal-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&fixture).expect("create remote terminal fixture");
+        let database = fixture.join("localnet.sqlite3");
+        initialize_database(&database);
+        let storage = Storage::open(&database).expect("open remote terminal storage");
+        let destination = fixture.join("remote-terminal.bin");
+        let partial = seed_resumable_incoming(
+            &database,
+            &destination,
+            "remote-terminal",
+            u64::from(TRANSFER_CHUNK_BYTES),
+            Some(u64::from(TRANSFER_CHUNK_BYTES)),
+        );
+        assert!(
+            storage
+                .try_pause_claimed_incoming_transfer(
+                    "remote-terminal",
+                    "peer-one",
+                    "network disconnected",
+                )
+                .expect("pause remote terminal fixture")
+        );
+
+        assert!(
+            storage
+                .apply_remote_terminal_transfer(
+                    "remote-terminal",
+                    "peer-one",
+                    TransferStatus::Failed,
+                    "对方终止了文件传输",
+                )
+                .expect("apply exact remote terminal")
+        );
+        assert!(
+            !storage
+                .apply_remote_terminal_transfer(
+                    "remote-terminal",
+                    "peer-one",
+                    TransferStatus::Failed,
+                    "对方终止了文件传输",
+                )
+                .expect("repeat exact remote terminal is idempotent")
+        );
+        let failed = storage
+            .get_transfer("remote-terminal")
+            .expect("load remotely failed transfer")
+            .expect("remote terminal transfer exists");
+        assert_eq!(failed.status, TransferStatus::Failed);
+        assert!(!partial.exists());
+        assert!(
+            storage
+                .list_pending_terminal_notifications("peer-one")
+                .expect("remote terminal must not echo")
+                .is_empty()
+        );
+
+        drop(storage);
+        fs::remove_dir_all(fixture).expect("remove remote terminal fixture");
+    }
+
+    #[test]
+    fn rejected_exact_resume_query_becomes_terminal_and_never_reenters_query_loop() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-rejected-resume-terminal-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&fixture).expect("create rejected resume fixture");
+        let storage =
+            Storage::open(&fixture.join("localnet.sqlite3")).expect("open rejected resume storage");
+        insert_paused_outgoing_resume_fixture(&storage, "rejected-resume");
+        assert!(
+            storage
+                .try_prepare_outgoing_resume_query(
+                    "rejected-resume",
+                    "peer-one",
+                    0,
+                    "query-generation",
+                )
+                .expect("prepare exact resume query")
+        );
+
+        assert!(
+            storage
+                .try_fail_pending_outgoing_resume_query(
+                    "rejected-resume",
+                    "peer-one",
+                    0,
+                    "query-generation",
+                    "对方拒绝了恢复请求",
+                )
+                .expect("terminalize rejected exact resume query")
+        );
+        let failed = storage
+            .get_transfer("rejected-resume")
+            .expect("load rejected resume")
+            .expect("rejected resume exists");
+        assert_eq!(failed.status, TransferStatus::Failed);
+        assert!(
+            storage
+                .list_resumable_outgoing("peer-one")
+                .expect("failed resume is no longer queryable")
+                .is_empty()
+        );
+        let pending = storage
+            .list_pending_terminal_notifications("peer-one")
+            .expect("rejected resume schedules peer convergence");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].transfer_id, "rejected-resume");
+        assert_eq!(pending[0].state, TransferStatus::Failed);
+
+        drop(storage);
+        fs::remove_dir_all(fixture).expect("remove rejected resume fixture");
     }
 }

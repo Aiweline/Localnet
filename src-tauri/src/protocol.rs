@@ -58,6 +58,13 @@ pub enum TransferResumeState {
     Completed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TransferTerminalState {
+    Cancelled,
+    Failed,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum ControlRequest {
@@ -95,6 +102,11 @@ pub enum ControlRequest {
     TransferResumeQuery {
         transfer_id: String,
     },
+    TransferTerminal {
+        transfer_id: String,
+        generation: String,
+        state: TransferTerminalState,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,6 +124,10 @@ pub enum ControlResponse {
         transfer_id: String,
         state: TransferResumeState,
         committed_bytes: u64,
+    },
+    TransferTerminalAck {
+        transfer_id: String,
+        generation: String,
     },
 }
 
@@ -221,5 +237,44 @@ mod tests {
         assert_eq!(decoded.version, 2);
         assert_eq!(decoded.start_offset, 8_388_608);
         assert_eq!(decoded.chunk_size, 4_194_304);
+    }
+
+    #[test]
+    fn terminal_notification_protocol_round_trips_exact_generation_and_state() {
+        let request = ControlRequest::TransferTerminal {
+            transfer_id: "terminal-transfer".to_string(),
+            generation: "01991f25-c30d-70f2-b778-d9b67ac4eafe".to_string(),
+            state: super::TransferTerminalState::Failed,
+        };
+        let response = ControlResponse::TransferTerminalAck {
+            transfer_id: "terminal-transfer".to_string(),
+            generation: "01991f25-c30d-70f2-b778-d9b67ac4eafe".to_string(),
+        };
+
+        let decoded_request: ControlRequest =
+            serde_json::from_slice(&serde_json::to_vec(&request).expect("encode terminal request"))
+                .expect("decode terminal request");
+        let decoded_response: ControlResponse = serde_json::from_slice(
+            &serde_json::to_vec(&response).expect("encode terminal acknowledgement"),
+        )
+        .expect("decode terminal acknowledgement");
+
+        assert!(matches!(
+            decoded_request,
+            ControlRequest::TransferTerminal {
+                transfer_id,
+                generation,
+                state: super::TransferTerminalState::Failed,
+            } if transfer_id == "terminal-transfer"
+                && generation == "01991f25-c30d-70f2-b778-d9b67ac4eafe"
+        ));
+        assert!(matches!(
+            decoded_response,
+            ControlResponse::TransferTerminalAck {
+                transfer_id,
+                generation,
+            } if transfer_id == "terminal-transfer"
+                && generation == "01991f25-c30d-70f2-b778-d9b67ac4eafe"
+        ));
     }
 }
