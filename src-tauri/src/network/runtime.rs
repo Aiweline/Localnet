@@ -490,6 +490,7 @@ impl NetworkRuntime {
             }
             NetworkCommand::ResolveFriendRequest { peer_id } => {
                 let peer_id = parse_peer_id(&peer_id)?;
+                self.activate_remembered_friend_target(peer_id)?;
                 self.flush_pending_friend_decisions(peer_id)?;
             }
             NetworkCommand::SendText(message) => {
@@ -804,8 +805,12 @@ impl NetworkRuntime {
 
     #[cfg(not(test))]
     fn flush_due_discovery_dials(&mut self) -> Result<(), AppError> {
+        let due = self.dial_schedule.take_due(Instant::now());
+        if due.is_empty() {
+            return Ok(());
+        }
         let interfaces = eligible_interfaces().unwrap_or_default();
-        for peer_id in self.dial_schedule.take_due(Instant::now()) {
+        for peer_id in due {
             if self.swarm.is_connected(&peer_id) {
                 continue;
             }
@@ -1027,6 +1032,9 @@ impl NetworkRuntime {
                 });
                 self.storage
                     .resolve_friend_request(&request_id, status, friend.as_ref(), &now)?;
+                if accepted {
+                    self.activate_remembered_friend_target(peer_id)?;
+                }
                 let mut resolved = request;
                 resolved.nickname = nickname;
                 resolved.status = status;
@@ -1695,14 +1703,10 @@ impl NetworkRuntime {
             last_seen: now_rfc3339(),
         };
         self.storage.upsert_peer(&peer)?;
-        if let Some(ip) = self.authenticated_connection_ips.get(&peer_id).copied()
-            && self
-                .storage
-                .remember_authenticated_lan_ip(&peer.peer_id, ip)?
-        {
-            self.remembered_peer_ips.insert(peer_id, ip);
-            self.remembered_targets_sender
-                .send_replace(sorted_remembered_targets(&self.remembered_peer_ips));
+        if let Some(ip) = self.authenticated_connection_ips.get(&peer_id).copied() {
+            self.storage
+                .remember_authenticated_lan_ip(&peer.peer_id, ip)?;
+            self.activate_remembered_friend_target(peer_id)?;
         }
         let supports_resume = peer
             .capabilities
@@ -1714,6 +1718,19 @@ impl NetworkRuntime {
             self.retry_terminal_notifications_for_connected_peers()?;
             self.resume_outgoing_for_peer(peer_id)?;
         }
+        Ok(())
+    }
+
+    fn activate_remembered_friend_target(&mut self, peer_id: PeerId) -> Result<(), AppError> {
+        let Some(ip) = self.authenticated_connection_ips.get(&peer_id).copied() else {
+            return Ok(());
+        };
+        if !self.storage.is_friend(&peer_id.to_string())? {
+            return Ok(());
+        }
+        self.remembered_peer_ips.insert(peer_id, ip);
+        self.remembered_targets_sender
+            .send_replace(sorted_remembered_targets(&self.remembered_peer_ips));
         Ok(())
     }
 
@@ -7190,5 +7207,80 @@ mod tests {
         drop(runtime);
         drop(storage);
         fs::remove_dir_all(directory).expect("remove friend fast probe fixture");
+    }
+
+    #[test]
+    fn authenticated_nonfriend_is_persisted_but_only_fast_probed_after_acceptance() {
+        let (directory, storage, _) = automatic_fixture("nonfriend-fast-probe-gate");
+        let remote_peer = deterministic_peer_id(95);
+        let mut runtime = production_test_runtime(storage.clone(), &directory, remote_peer);
+        let remembered = Ipv4Addr::new(192, 168, 31, 95);
+        runtime
+            .authenticated_connection_ips
+            .insert(remote_peer, remembered);
+        let receiver = runtime.remembered_targets_sender.subscribe();
+
+        runtime
+            .record_hello(
+                remote_peer,
+                PROTOCOL_VERSION,
+                "Nearby Peer".to_string(),
+                Platform::current(),
+                Vec::new(),
+            )
+            .expect("authenticated nonfriend Hello persists endpoint");
+        assert!(receiver.borrow().is_empty());
+        assert!(
+            storage
+                .list_friend_lan_targets()
+                .expect("nonfriend target stays out of startup set")
+                .is_empty()
+        );
+
+        let request_id = uuid::Uuid::now_v7().to_string();
+        let now = now_rfc3339();
+        storage
+            .put_friend_request(&FriendRequest {
+                request_id: request_id.clone(),
+                peer_id: remote_peer.to_string(),
+                nickname: "Nearby Peer".to_string(),
+                direction: Direction::Incoming,
+                status: FriendRequestStatus::Pending,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            })
+            .expect("persist incoming friend request");
+        storage
+            .resolve_friend_request(
+                &request_id,
+                FriendRequestStatus::Accepted,
+                Some(&Friend {
+                    peer_id: remote_peer.to_string(),
+                    nickname: "Nearby Peer".to_string(),
+                    platform: Platform::current(),
+                    online: true,
+                    added_at: now.clone(),
+                    last_seen: now.clone(),
+                }),
+                &now,
+            )
+            .expect("accept nearby peer");
+        runtime
+            .handle_command(NetworkCommand::ResolveFriendRequest {
+                peer_id: remote_peer.to_string(),
+            })
+            .expect("friend acceptance activates fast probe target");
+
+        assert_eq!(receiver.borrow().as_slice(), &[remembered]);
+        assert_eq!(
+            storage
+                .list_friend_lan_targets()
+                .expect("accepted friend loads remembered endpoint"),
+            vec![(remote_peer.to_string(), remembered)]
+        );
+
+        drop(runtime);
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove nonfriend fast probe fixture");
     }
 }

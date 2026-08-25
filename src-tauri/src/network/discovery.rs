@@ -467,7 +467,11 @@ pub(super) fn ranked_dial_addresses(
             Protocol::Ip4(ip) => Some(ip),
             _ => None,
         });
-        let remembered = u8::from(ip != preferred_ip);
+        let remembered = match (ip, preferred_ip) {
+            (Some(ip), Some(preferred)) if ip == preferred => 0,
+            (Some(_), _) => 1,
+            (None, _) => 2,
+        };
         let interface = ip
             .and_then(|ip| {
                 interfaces
@@ -675,6 +679,27 @@ mod tests {
                 &interfaces,
             ),
             vec![physical, virtual_path],
+        );
+    }
+
+    #[test]
+    fn discovery_candidate_places_non_ipv4_after_physical_ipv4_without_history() {
+        let peer_id = PeerId::random();
+        let physical = dial_address(Ipv4Addr::new(192, 168, 31, 22), 45_001, peer_id);
+        let ipv6 = Multiaddr::empty()
+            .with(Protocol::Ip6(std::net::Ipv6Addr::LOCALHOST))
+            .with(Protocol::Tcp(45_002))
+            .with(Protocol::P2p(peer_id));
+        let interfaces = vec![LanInterface {
+            name: "Wi-Fi".to_string(),
+            ip: Ipv4Addr::new(192, 168, 31, 213),
+            broadcast: Ipv4Addr::new(192, 168, 31, 255),
+            prefixlen: 24,
+        }];
+
+        assert_eq!(
+            ranked_dial_addresses(vec![ipv6.clone(), physical.clone()], None, &interfaces),
+            vec![physical, ipv6],
         );
     }
 
