@@ -31,6 +31,13 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Validate release source ref
+        shell: bash
+        run: |
+          set -euo pipefail
+          source scripts/release-decision.sh
+          validate_release_ref "$GITHUB_EVENT_NAME" "$GITHUB_REF"
+
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
@@ -41,6 +48,9 @@ jobs:
 
       - name: Run transfer status regression test
         run: node --test --experimental-strip-types tests/transfer-status.test.ts
+
+      - name: Run release workflow regression test
+        run: node --test tests/release-workflow.test.mjs
 
       - name: Validate synchronized versions
         id: version
@@ -56,66 +66,11 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_EVENT_BEFORE: ${{ github.event.before }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          version="${{ steps.version.outputs.version }}"
-          tag="v$version"
-          app_changed=false
-
-          if [[ "${{ github.event_name }}" == "push" ]]; then
-            before="${{ github.event.before }}"
-            if [[ "$before" =~ ^0+$ ]] || ! git cat-file -e "$before^{commit}" 2>/dev/null; then
-              changed_files="$(git diff-tree --no-commit-id --name-only -r "$GITHUB_SHA")"
-            else
-              changed_files="$(git diff --name-only "$before" "$GITHUB_SHA")"
-            fi
-
-            echo "Changed files:"
-            printf '%s\n' "$changed_files"
-            while IFS= read -r file; do
-              if [[ "$file" =~ ^(\.cargo/|assets/|src/|src-tauri/|index\.html$|package\.json$|pnpm-lock\.yaml$|tsconfig(\..+)?\.json$|vite\.config\.ts$) ]]; then
-                app_changed=true
-                break
-              fi
-            done <<< "$changed_files"
-          fi
-
-          if git rev-parse --verify --quiet "$tag^{commit}" >/dev/null; then
-            tag_commit="$(git rev-list -n 1 "$tag")"
-            release_complete=false
-            release_json="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease,assets 2>/dev/null || true)"
-            if [[ -n "$release_json" ]]; then
-              expected_assets="$(printf '%s\n' \
-                "Weline_Localnet_${version}_SHA256SUMS.txt" \
-                "Weline_Localnet_${version}_universal.dmg" \
-                "Weline_Localnet_${version}_universal.dmg.sha256" \
-                "Weline_Localnet_${version}_x64-portable.exe" \
-                "Weline_Localnet_${version}_x64-setup.exe" | sort)"
-              actual_assets="$(jq -r '.assets[].name' <<< "$release_json" | sort)"
-              is_draft="$(jq -r '.isDraft' <<< "$release_json")"
-              is_prerelease="$(jq -r '.isPrerelease' <<< "$release_json")"
-              if [[ "$is_draft" == "false" && "$is_prerelease" == "false" && "$actual_assets" == "$expected_assets" ]]; then
-                release_complete=true
-              fi
-            fi
-
-            if [[ "$release_complete" == "false" && "$app_changed" == "true" && "$tag_commit" != "$GITHUB_SHA" ]]; then
-              echo "::error::Application files changed, but $tag already points to $tag_commit. Run pnpm release:version with a higher version before merging."
-              exit 1
-            elif [[ "$release_complete" == "false" ]]; then
-              echo "Release $tag is missing or incomplete; it will be rebuilt."
-              echo "should_release=true" >> "$GITHUB_OUTPUT"
-            elif [[ "$app_changed" == "true" ]]; then
-              echo "::error::Application files changed, but $tag is already published. Run pnpm release:version with a higher version before merging."
-              exit 1
-            else
-              echo "Release $tag is already complete and no application files changed."
-              echo "should_release=false" >> "$GITHUB_OUTPUT"
-            fi
-          else
-            echo "No tag exists for $tag; release build is required."
-            echo "should_release=true" >> "$GITHUB_OUTPUT"
-          fi
+          bash scripts/release-decision.sh "$RELEASE_VERSION"
 
   windows:
     name: Build Windows x64
@@ -392,6 +347,13 @@ jobs:
           set -euo pipefail
           version="${{ needs.prepare.outputs.version }}"
           tag="v${version}"
+          if git rev-parse --verify --quiet "$tag^{commit}" >/dev/null; then
+            tag_commit="$(git rev-list -n 1 "$tag")"
+            if [[ "$tag_commit" != "$GITHUB_SHA" ]]; then
+              echo "::error::Refusing to repair $tag from $GITHUB_SHA because the tag points to $tag_commit."
+              exit 1
+            fi
+          fi
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             while IFS= read -r asset; do
               case "$asset" in
