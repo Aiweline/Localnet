@@ -54,6 +54,42 @@ export function mergePresenceSnapshot<
   };
 }
 
+export function mergePeerDiscoverySnapshot<
+  TSnapshot extends {
+    peers: Array<{ peerId: string; nickname: string; online: boolean }>;
+    friends: Array<{ peerId: string; nickname: string; online: boolean }>;
+  },
+>(
+  current: TSnapshot,
+  peer: { peerId: string; nickname: string; online: boolean },
+): TSnapshot {
+  const peers = current.peers.some((item) => item.peerId === peer.peerId)
+    ? current.peers.map((item) => item.peerId === peer.peerId ? peer : item)
+    : [peer, ...current.peers];
+  const friends = current.friends.map((friend) => friend.peerId === peer.peerId
+    ? { ...friend, nickname: peer.nickname, online: peer.online }
+    : friend);
+  return { ...current, peers, friends };
+}
+
+export function mergePeerOfflineSnapshot<
+  TPeer extends { peerId: string; online: boolean },
+  TFriend extends { peerId: string; online: boolean; lastSeen: string },
+  TSnapshot extends { peers: TPeer[]; friends: TFriend[] },
+>(
+  current: TSnapshot,
+  peerId: string,
+  lastSeen: string,
+): TSnapshot {
+  const peers = current.peers.map((peer) => peer.peerId === peerId
+    ? { ...peer, online: false }
+    : peer);
+  const friends = current.friends.map((friend) => friend.peerId === peerId
+    ? { ...friend, online: false, lastSeen }
+    : friend);
+  return { ...current, peers, friends };
+}
+
 export function mergeResolvedFriendSnapshot<
   TFriend extends { peerId: string },
   TRequest extends { requestId: string },

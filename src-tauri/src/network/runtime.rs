@@ -58,6 +58,14 @@ const TERMINAL_NOTIFICATIONS_GLOBAL: usize = 32;
 const DIAL_BATCH_DELAY: Duration = Duration::from_millis(75);
 const DIAL_RETRY_DELAY: Duration = Duration::from_millis(500);
 
+fn active_connection_count_after_established(num_established: u32) -> usize {
+    num_established as usize
+}
+
+fn active_connection_count_after_close(num_established: u32) -> usize {
+    num_established as usize
+}
+
 #[derive(Default)]
 struct DiscoveryDialSchedule {
     deadlines: HashMap<PeerId, Instant>,
@@ -734,13 +742,19 @@ impl NetworkRuntime {
             }
             SwarmEvent::Behaviour(LocalnetBehaviourEvent::Stream(())) => {}
             SwarmEvent::ConnectionEstablished {
-                peer_id, endpoint, ..
+                peer_id,
+                endpoint,
+                num_established,
+                ..
             } => {
                 self.dial_schedule.remove(&peer_id);
                 if let Some(ip) = private_ipv4_from_multiaddr(endpoint.get_remote_address()) {
                     self.authenticated_connection_ips.insert(peer_id, ip);
                 }
-                *self.active_connections.entry(peer_id).or_default() += 1;
+                self.active_connections.insert(
+                    peer_id,
+                    active_connection_count_after_established(num_established.get()),
+                );
                 let outbound_id = self.swarm.behaviour_mut().control.send_request(
                     &peer_id,
                     ControlRequest::Hello {
@@ -753,12 +767,16 @@ impl NetworkRuntime {
                 self.pending
                     .insert(PendingRequestId::Network(outbound_id), PendingAction::Hello);
             }
-            SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                if let Some(count) = self.active_connections.get_mut(&peer_id) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        self.active_connections.remove(&peer_id);
-                    }
+            SwarmEvent::ConnectionClosed {
+                peer_id,
+                num_established,
+                ..
+            } => {
+                let remaining = active_connection_count_after_close(num_established);
+                if remaining == 0 {
+                    self.active_connections.remove(&peer_id);
+                } else {
+                    self.active_connections.insert(peer_id, remaining);
                 }
                 self.mark_offline_if_unreachable(peer_id)?;
             }
@@ -2985,6 +3003,7 @@ mod tests {
         AcceptedSubmissionOutcome, DIAL_BATCH_DELAY, DiscoveryDialSchedule, DiscoveryRefresh,
         NetworkCommand, NetworkEvent, NetworkRuntime, PendingAction, PendingRequestId,
         TestControlTransport, TestResumableTransport, accept_file_protocol_streams,
+        active_connection_count_after_close, active_connection_count_after_established,
         automatic_receive_path, finalize_accepted_transfer_submission,
         persist_incoming_offer_with_preflight, persist_incoming_offer_with_preflight_and_accept,
         validate_transfer_offer,
@@ -3006,6 +3025,13 @@ mod tests {
         transfer_policy::{TRANSFER_CHUNK_BYTES, TransferProtocol},
         volume_preflight::{VolumeSnapshot, validate_volume},
     };
+
+    #[test]
+    fn connection_close_keeps_remaining_connections_online() {
+        assert_eq!(active_connection_count_after_established(2), 2);
+        assert_eq!(active_connection_count_after_close(2), 2);
+        assert_eq!(active_connection_count_after_close(0), 0);
+    }
 
     const MIB: u64 = 1024 * 1024;
     const GIB: u64 = 1024 * MIB;
