@@ -1067,6 +1067,7 @@ test("release workflow is valid YAML and wires provenance checks before decision
   const clientRegressionIndex = prepareSteps.findIndex((step) => step.name === "Run client experience regression tests");
   const rubySetupIndex = prepareSteps.findIndex((step) => step.name === "Set up Ruby for release workflow validation");
   const releaseRegressionIndex = prepareSteps.findIndex((step) => step.name === "Run release workflow regression test");
+  assert.ok(transferStatusIndex >= 0, "prepare must run the transfer status regression test");
   assert.ok(rubySetupIndex >= 0, "prepare must install the YAML validator's pinned Ruby runtime");
   assert.ok(
     clientRegressionIndex > transferStatusIndex && clientRegressionIndex < rubySetupIndex,

@@ -45,10 +45,11 @@ interface GithubFetchResponse {
 
 export type GithubFetch = (
   input: string,
-  init?: { headers?: Record<string, string> },
+  init?: { headers?: Record<string, string>; signal?: AbortSignal },
 ) => Promise<GithubFetchResponse>;
 
 const LATEST_RELEASE_URL = "https://api.github.com/repos/Aiweline/Localnet/releases/latest";
+const UPDATE_CHECK_TIMEOUT_MS = 10_000;
 const MAX_UPDATE_BYTES = 512 * 1024 * 1024;
 const STABLE_VERSION = /^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 const SHA256_DIGEST = /^sha256:[0-9a-f]{64}$/;
@@ -120,16 +121,23 @@ export async function checkForUpdate(
   platform: ClientPlatform,
   fetchImpl: GithubFetch = (input, init) => fetch(input, init),
 ): Promise<UpdateInfo | null> {
-  const response = await fetchImpl(LATEST_RELEASE_URL, {
-    headers: {
-      Accept: "application/vnd.github+json",
-      "X-GitHub-Api-Version": "2022-11-28",
-    },
-  });
-  if (!response.ok) throw new Error("GitHub release check failed");
-  const payload = await response.json();
-  if (!isGithubRelease(payload)) throw new Error("GitHub release response is invalid");
-  return selectAvailableUpdate(payload, currentVersion, platform);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), UPDATE_CHECK_TIMEOUT_MS);
+  try {
+    const response = await fetchImpl(LATEST_RELEASE_URL, {
+      headers: {
+        Accept: "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+      },
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error("GitHub release check failed");
+    const payload = await response.json();
+    if (!isGithubRelease(payload)) throw new Error("GitHub release response is invalid");
+    return selectAvailableUpdate(payload, currentVersion, platform);
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 export function createUpdateDownloadRequest(update: UpdateInfo): UpdateDownloadRequest {

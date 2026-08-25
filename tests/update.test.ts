@@ -135,6 +135,34 @@ test("fails closed when GitHub returns an unsuccessful response", async () => {
   );
 });
 
+test("aborts a stalled GitHub release check at the fixed request deadline", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  let capturedSignal: AbortSignal | undefined;
+  try {
+    const pending = checkForUpdate(
+      "0.2.2",
+      "windows",
+      async (_input, init?: { headers?: Record<string, string>; signal?: AbortSignal }) => {
+        capturedSignal = init?.signal;
+        if (!capturedSignal) throw new Error("missing update request abort signal");
+        return new Promise((_resolve, reject) => {
+          capturedSignal?.addEventListener(
+            "abort",
+            () => reject(new DOMException("update request timed out", "AbortError")),
+            { once: true },
+          );
+        });
+      },
+    );
+
+    context.mock.timers.tick(10_000);
+    await assert.rejects(pending, (error: unknown) => error instanceof DOMException && error.name === "AbortError");
+    assert.equal(capturedSignal?.aborted, true);
+  } finally {
+    context.mock.timers.reset();
+  }
+});
+
 test("creates the exact verified-download command payload", () => {
   const update = selectAvailableUpdate(release(), "0.2.2", "windows");
   assert.ok(update);
