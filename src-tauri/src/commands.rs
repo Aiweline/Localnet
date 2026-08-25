@@ -707,7 +707,7 @@ where
         .ok_or_else(|| AppError::InvalidInput("接收文件保存位置无效".to_string()))?;
     preflight(parent, transfer.file_size, 0)?;
 
-    let reservation_token = uuid::Uuid::new_v4().to_string();
+    let reservation_token = uuid::Uuid::now_v7().to_string();
     reserve_manual_receive_destination(path, &transfer.transfer_id, &reservation_token)
         .map_err(map_receive_reservation_error)?;
 
@@ -733,11 +733,17 @@ where
     }
 
     if let Err(error) = dispatch(&accepted) {
-        crate::network::return_pending_incoming_decision_to_manual(
+        if let Err(rollback_error) = crate::network::return_pending_incoming_decision_to_manual(
             &accepted.transfer_id,
             storage,
             error.to_string(),
-        )?;
+        ) {
+            tracing::warn!(
+                transfer_id = %accepted.transfer_id,
+                %rollback_error,
+                "failed to return incoming acceptance to manual review"
+            );
+        }
         return Err(error);
     }
     Ok(accepted)
@@ -1464,6 +1470,88 @@ mod tests {
             drop(storage);
             fs::remove_dir_all(directory).expect("remove manual dispatch failure fixture");
         }
+    }
+
+    #[test]
+    fn manual_acceptance_uses_a_time_ordered_reservation_token() {
+        let (directory, storage, transfer) = acceptance_fixture("v7-reservation-token", MIB);
+        let destination = directory.join("archive.bin");
+
+        let accepted = accept_incoming_transfer_with_preflight(
+            &storage,
+            &transfer,
+            &destination,
+            &|_, _, _| Ok(()),
+            &mut |_| Ok(()),
+        )
+        .expect("manual acceptance succeeds");
+
+        let token = uuid::Uuid::parse_str(
+            accepted
+                .reservation_token
+                .as_deref()
+                .expect("accepted transfer has reservation token"),
+        )
+        .expect("reservation token is a UUID");
+        assert_eq!(token.get_version_num(), 7);
+
+        assert!(
+            storage
+                .try_cancel_unclaimed_incoming_transfer(
+                    &accepted.transfer_id,
+                    &accepted.peer_id,
+                    accepted.transfer_protocol,
+                    "test cleanup",
+                )
+                .expect("clean accepted transfer")
+        );
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove v7 reservation token fixture");
+    }
+
+    #[test]
+    fn manual_dispatch_error_remains_primary_when_rollback_also_fails() {
+        let (directory, storage, transfer) =
+            acceptance_fixture("dispatch-and-rollback-failure", MIB);
+        let database = directory.join("localnet.sqlite3");
+        let destination = directory.join("archive.bin");
+        let mut write_blocker = None;
+
+        let error = accept_incoming_transfer_with_preflight(
+            &storage,
+            &transfer,
+            &destination,
+            &|_, _, _| Ok(()),
+            &mut |_| {
+                let connection = rusqlite::Connection::open(&database)
+                    .expect("open independent rollback blocker");
+                connection
+                    .execute_batch("BEGIN IMMEDIATE")
+                    .expect("hold database writer lock across rollback");
+                write_blocker = Some(connection);
+                Err(AppError::Network(
+                    "injected command dispatch failure".to_string(),
+                ))
+            },
+        )
+        .expect_err("dispatch failure is returned even when rollback is blocked");
+
+        assert_eq!(error.code(), "network_error");
+        assert_eq!(error.to_string(), "injected command dispatch failure");
+
+        drop(write_blocker);
+        assert!(
+            storage
+                .try_cancel_unclaimed_incoming_transfer(
+                    &transfer.transfer_id,
+                    &transfer.peer_id,
+                    transfer.transfer_protocol,
+                    "test cleanup",
+                )
+                .expect("clean transfer after releasing rollback blocker")
+        );
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove double failure fixture");
     }
 
     #[test]

@@ -40,8 +40,43 @@ use crate::{
 
 const BUFFER_SIZE: usize = 64 * 1024;
 const PROGRESS_BYTES: u64 = 1024 * 1024;
+const RESUMABLE_PROGRESS_CHUNKS: u64 = 16;
+const PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(400);
 const MAX_HEADER_BYTES: usize = 8 * 1024;
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const TRUSTED_DESTINATION_PAUSE_CODE: &str = "transfer.resume_destination_unavailable";
+
+struct ResumableProgressGate {
+    last_published_offset: u64,
+    last_published_at: Instant,
+    byte_interval: u64,
+}
+
+impl ResumableProgressGate {
+    fn new(start_offset: u64, chunk_size: u32, now: Instant) -> Self {
+        Self {
+            last_published_offset: start_offset,
+            last_published_at: now,
+            byte_interval: u64::from(chunk_size)
+                .saturating_mul(RESUMABLE_PROGRESS_CHUNKS)
+                .max(PROGRESS_BYTES),
+        }
+    }
+
+    fn should_publish(&mut self, offset: u64, file_size: u64, now: Instant) -> bool {
+        let reached_final_offset = offset == file_size;
+        let reached_byte_interval =
+            offset.saturating_sub(self.last_published_offset) >= self.byte_interval;
+        let reached_time_interval =
+            now.saturating_duration_since(self.last_published_at) >= PROGRESS_EMIT_INTERVAL;
+        if !reached_final_offset && !reached_byte_interval && !reached_time_interval {
+            return false;
+        }
+        self.last_published_offset = offset;
+        self.last_published_at = now;
+        true
+    }
+}
 
 pub(super) trait ResumableIo: AsyncRead + AsyncWrite + Unpin + Send {}
 
@@ -440,6 +475,11 @@ where
     stream.write_all(&header).await?;
 
     let mut previous_offset = transfer.transferred_bytes;
+    let mut progress_gate = ResumableProgressGate::new(
+        transfer.transferred_bytes,
+        transfer.chunk_size,
+        Instant::now(),
+    );
     send_acknowledged_chunks(
         &mut stream,
         &source_path,
@@ -447,30 +487,16 @@ where
         &chunks,
         transfer.transferred_bytes,
         |acknowledged_offset| {
-            let committed = match query_token {
-                Some(query_token) => storage.commit_claimed_outgoing_resume_progress(
-                    &transfer.transfer_id,
-                    &transfer.peer_id,
-                    query_token,
-                    previous_offset,
-                    acknowledged_offset,
-                )?,
-                None => storage.commit_claimed_outgoing_progress(
-                    &transfer.transfer_id,
-                    &transfer.peer_id,
-                    previous_offset,
-                    acknowledged_offset,
-                )?,
-            };
-            if !committed {
-                return Err(AppError::Storage(
-                    "可恢复发送进度状态已变化，已停止旧传输回调".to_string(),
-                ));
-            }
-            previous_offset = acknowledged_offset;
-            if let Some(updated) = storage.get_transfer(&transfer.transfer_id)? {
-                publish(NetworkEvent::TransferUpdated { transfer: updated });
-            }
+            previous_offset = commit_and_publish_resumable_ack(
+                storage,
+                transfer,
+                query_token,
+                previous_offset,
+                acknowledged_offset,
+                &mut progress_gate,
+                Instant::now(),
+                publish,
+            )?;
             Ok(())
         },
     )
@@ -529,6 +555,48 @@ where
         tracing::debug!(transfer_id = %transfer.transfer_id, %error, "ignored stream close after resumable send completion");
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn commit_and_publish_resumable_ack<P>(
+    storage: &Storage,
+    transfer: &TransferRecord,
+    query_token: Option<&str>,
+    previous_offset: u64,
+    acknowledged_offset: u64,
+    progress_gate: &mut ResumableProgressGate,
+    now: Instant,
+    publish: &mut P,
+) -> Result<u64, AppError>
+where
+    P: FnMut(NetworkEvent),
+{
+    let committed = match query_token {
+        Some(query_token) => storage.commit_claimed_outgoing_resume_progress(
+            &transfer.transfer_id,
+            &transfer.peer_id,
+            query_token,
+            previous_offset,
+            acknowledged_offset,
+        )?,
+        None => storage.commit_claimed_outgoing_progress(
+            &transfer.transfer_id,
+            &transfer.peer_id,
+            previous_offset,
+            acknowledged_offset,
+        )?,
+    };
+    if !committed {
+        return Err(AppError::Storage(
+            "可恢复发送进度状态已变化，已停止旧传输回调".to_string(),
+        ));
+    }
+    if progress_gate.should_publish(acknowledged_offset, transfer.file_size, now)
+        && let Some(updated) = storage.get_transfer(&transfer.transfer_id)?
+    {
+        publish(NetworkEvent::TransferUpdated { transfer: updated });
+    }
+    Ok(acknowledged_offset)
 }
 
 fn claim_resumable_outgoing(
@@ -762,22 +830,75 @@ async fn receive_resumable_transfer(
     )
     .await;
     if let Err(error) = &result {
-        if let Some(updated) = storage.get_transfer(&transfer_id)? {
+        let updated = storage.get_transfer(&transfer_id)?;
+        if let Some(updated) = updated.as_ref() {
             emit_event(
                 &app_handle,
-                &NetworkEvent::TransferUpdated { transfer: updated },
+                &NetworkEvent::TransferUpdated {
+                    transfer: updated.clone(),
+                },
             );
         }
         emit_event(
             &app_handle,
-            &NetworkEvent::NetworkError {
-                code: "transfer.resume_destination_unavailable".to_string(),
-                message: error.to_string(),
-            },
+            &resumable_receive_network_error_event(error, updated.as_ref()),
         );
         return result;
     }
     Ok(())
+}
+
+fn resumable_receive_network_error_event(
+    error: &AppError,
+    updated: Option<&TransferRecord>,
+) -> NetworkEvent {
+    if matches!(error, AppError::Io(error) if is_storage_full_error(error)) {
+        return NetworkEvent::NetworkError {
+            code: TRUSTED_DESTINATION_PAUSE_CODE.to_string(),
+            message: "接收目录可用空间不足，请释放空间后等待自动恢复".to_string(),
+        };
+    }
+    if let Some(message) = trusted_destination_pause_message(updated) {
+        return NetworkEvent::NetworkError {
+            code: TRUSTED_DESTINATION_PAUSE_CODE.to_string(),
+            message,
+        };
+    }
+    NetworkEvent::NetworkError {
+        code: error.code().to_string(),
+        message: public_resumable_receive_error_message(error).to_string(),
+    }
+}
+
+fn trusted_destination_pause_message(updated: Option<&TransferRecord>) -> Option<String> {
+    let transfer = updated?;
+    if transfer.direction != Direction::Incoming || transfer.status != TransferStatus::Paused {
+        return None;
+    }
+    let message = transfer
+        .error
+        .as_deref()?
+        .strip_prefix(DESTINATION_PREFLIGHT_PAUSE_MARKER)?
+        .trim();
+    if message.is_empty() || message.contains(DESTINATION_PREFLIGHT_PAUSE_MARKER) {
+        return None;
+    }
+    Some(message.to_string())
+}
+
+fn public_resumable_receive_error_message(error: &AppError) -> &'static str {
+    match error {
+        AppError::IntegrityFailure => "文件完整性校验失败，请重新发送",
+        AppError::Network(_) | AppError::OfflinePeer => {
+            "文件传输连接已中断，应用将在网络恢复后自动重试"
+        }
+        AppError::Io(_) => "文件传输读写暂时失败，请稍后重试",
+        AppError::InvalidInput(_) => "收到的文件传输数据无效，本次接收已停止",
+        AppError::Storage(_) => "本地传输状态处理失败，请刷新后重试",
+        AppError::Identity(_) => "本机身份校验失败，请重新启动应用后重试",
+        AppError::Permission(_) | AppError::NotFriend => "文件传输未获授权，连接已拒绝",
+        AppError::IncompatibleProtocol => "双方软件版本不兼容，请升级后重试",
+    }
 }
 
 async fn run_resumable_receive_body_with<P, B, F>(
@@ -1209,15 +1330,20 @@ mod tests {
             atomic::{AtomicBool, Ordering},
         },
         task::{Context, Poll},
+        time::{Duration, Instant},
     };
 
     use futures::io::{AsyncRead, AsyncWrite};
+    use tokio::io::{AsyncRead as TokioAsyncRead, ReadBuf};
 
     use super::{
-        DESTINATION_PREFLIGHT_PAUSE_MARKER, ResumableStreamOpener, authorize_resumable_incoming,
-        claim_legacy_incoming, claim_resumable_outgoing, is_storage_full_error,
-        persist_claimed_outgoing_error, run_resumable_receive_body_with, send_resumable_transfer,
+        DESTINATION_PREFLIGHT_PAUSE_MARKER, NetworkEvent, ResumableProgressGate,
+        ResumableStreamOpener, authorize_resumable_incoming, claim_legacy_incoming,
+        claim_resumable_outgoing, commit_and_publish_resumable_ack, is_storage_full_error,
+        persist_claimed_outgoing_error, resumable_receive_network_error_event,
+        run_resumable_receive_body_with, send_resumable_transfer,
     };
+    use crate::network::resumable_transfer::read_chunk_frame_with_idle_timeout;
     use crate::{
         domain::{
             Direction, Friend, FriendRequest, FriendRequestStatus, Platform, TransferKind,
@@ -1236,6 +1362,23 @@ mod tests {
     const DESTINATION_RESERVE_BYTES: u64 = 64 * MIB;
 
     struct DisconnectingStream;
+
+    struct TokioDuplexReader(tokio::io::DuplexStream);
+
+    impl AsyncRead for TokioDuplexReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            buffer: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            let mut read_buffer = ReadBuf::new(buffer);
+            match Pin::new(&mut self.0).poll_read(context, &mut read_buffer) {
+                Poll::Ready(Ok(())) => Poll::Ready(Ok(read_buffer.filled().len())),
+                Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+    }
 
     struct CancellingAckStream {
         incoming: Vec<u8>,
@@ -1383,6 +1526,13 @@ mod tests {
                 &now,
             )
             .expect("authorize friend fixture");
+    }
+
+    fn network_error_parts(event: NetworkEvent) -> (String, String) {
+        let NetworkEvent::NetworkError { code, message } = event else {
+            panic!("expected NetworkError event");
+        };
+        (code, message)
     }
 
     fn accepted_incoming_transfer(
@@ -1926,6 +2076,12 @@ mod tests {
             .get_transfer(&paused.transfer_id)
             .expect("reload retryable receive")
             .expect("retryable receive exists");
+        let (code, message) = network_error_parts(resumable_receive_network_error_event(
+            &error,
+            Some(&retried),
+        ));
+        assert_eq!(code, "transfer.resume_destination_unavailable");
+        assert_eq!(message, error.to_string());
         let exact = VolumeSnapshot::known("NTFS", remaining + DESTINATION_RESERVE_BYTES, None);
         let observed = Arc::new(Mutex::new(Vec::new()));
         let probe_values = observed.clone();
@@ -2007,6 +2163,12 @@ mod tests {
             .expect("stream pause remains after restart");
         assert_eq!(blocked.status, TransferStatus::Paused);
         assert_eq!(blocked.error.as_deref(), Some(expected));
+        let (code, message) = network_error_parts(resumable_receive_network_error_event(
+            &error,
+            Some(&blocked),
+        ));
+        assert_eq!(code, error.code());
+        assert!(!message.contains(expected));
         assert!(
             restarted
                 .try_cancel_unclaimed_incoming_transfer(
@@ -2020,6 +2182,106 @@ mod tests {
 
         drop(restarted);
         fs::remove_dir_all(directory).expect("remove stream pause fixture");
+    }
+
+    #[tokio::test]
+    async fn production_chunk_idle_timeout_pauses_releases_claim_and_reconnects_at_committed_offset()
+     {
+        let (directory, storage, paused) =
+            paused_receive_with_real_partial("chunk-idle-timeout-reconnect");
+        let committed = paused.transferred_bytes;
+        let expected_index = u32::try_from(committed / u64::from(TRANSFER_CHUNK_BYTES))
+            .expect("small committed chunk index");
+        let (reader, _writer) = tokio::io::duplex(256);
+
+        let error = run_resumable_receive_body_with(
+            &storage,
+            &paused,
+            committed,
+            &|_, _, _| Ok(()),
+            move |claimed, offset| {
+                let mut reader = TokioDuplexReader(reader);
+                Box::pin(async move {
+                    assert_eq!(offset, committed);
+                    read_chunk_frame_with_idle_timeout(
+                        &mut reader,
+                        expected_index,
+                        claimed.file_size,
+                        claimed.chunk_size,
+                        Duration::from_millis(25),
+                    )
+                    .await
+                    .map(|_| ())
+                })
+            },
+        )
+        .await
+        .expect_err("stalled production chunk read must pause the receive claim");
+        assert!(matches!(
+            error,
+            AppError::Io(ref error) if error.kind() == io::ErrorKind::TimedOut
+        ));
+
+        let retry = storage
+            .get_transfer(&paused.transfer_id)
+            .expect("reload timed-out receive")
+            .expect("timed-out receive remains");
+        assert_eq!(retry.status, TransferStatus::Paused);
+        assert_eq!(retry.transferred_bytes, committed);
+        assert!(
+            storage
+                .try_claim_incoming_transfer(&retry.transfer_id, &retry.peer_id)
+                .expect("timeout must atomically release the receive claim")
+        );
+        assert!(
+            storage
+                .try_pause_claimed_incoming_transfer(
+                    &retry.transfer_id,
+                    &retry.peer_id,
+                    "reconnect fixture",
+                )
+                .expect("restore paused state before reconnect")
+        );
+        let retry = storage
+            .get_transfer(&retry.transfer_id)
+            .expect("reload reconnect candidate")
+            .expect("reconnect candidate remains");
+        run_resumable_receive_body_with(
+            &storage,
+            &retry,
+            committed,
+            &|_, _, _| Ok(()),
+            move |_, offset| {
+                Box::pin(async move {
+                    assert_eq!(offset, committed);
+                    Ok(())
+                })
+            },
+        )
+        .await
+        .expect("reconnect continues from the exact committed offset");
+        assert!(
+            storage
+                .try_pause_claimed_incoming_transfer(
+                    &retry.transfer_id,
+                    &retry.peer_id,
+                    "test cleanup",
+                )
+                .expect("release reconnect claim")
+        );
+        assert!(
+            storage
+                .try_cancel_unclaimed_incoming_transfer(
+                    &retry.transfer_id,
+                    &retry.peer_id,
+                    retry.transfer_protocol,
+                    "test cleanup",
+                )
+                .expect("clean timeout fixture")
+        );
+
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove timeout reconnect fixture");
     }
 
     #[tokio::test]
@@ -2050,6 +2312,10 @@ mod tests {
             .expect("load terminal integrity transfer")
             .expect("terminal integrity transfer exists");
         assert_eq!(failed.status, TransferStatus::Failed);
+        let (code, message) =
+            network_error_parts(resumable_receive_network_error_event(&error, Some(&failed)));
+        assert_eq!(code, error.code());
+        assert_eq!(message, error.to_string());
         assert!(!partial.exists());
         let pending = storage
             .list_pending_terminal_notifications(&paused.peer_id)
@@ -2102,6 +2368,13 @@ mod tests {
                 .as_deref()
                 .is_some_and(|error| error.starts_with(DESTINATION_PREFLIGHT_PAUSE_MARKER))
         );
+        let (code, message) = network_error_parts(resumable_receive_network_error_event(
+            &error,
+            Some(&blocked),
+        ));
+        assert_eq!(code, "transfer.resume_destination_unavailable");
+        assert!(message.contains("空间不足"));
+        assert!(!message.contains("os error"));
         assert_eq!(
             fs::metadata(&partial)
                 .expect("full partial remains after storage-full")
@@ -2354,5 +2627,189 @@ mod tests {
 
         drop(storage);
         fs::remove_dir_all(fixture).expect("remove fixture");
+    }
+
+    #[test]
+    fn resumable_ack_ipc_gate_throttles_fast_100_gib_and_honors_time_and_final_boundaries() {
+        let started = Instant::now();
+        let file_size = 100 * 1024 * 1024 * 1024_u64;
+        let chunk_size = u64::from(TRANSFER_CHUNK_BYTES);
+        let chunk_count = file_size / chunk_size;
+        assert_eq!(chunk_count, 25_600);
+        let mut gate = ResumableProgressGate::new(0, TRANSFER_CHUNK_BYTES, started);
+        let mut emitted = Vec::new();
+        for index in 1..=chunk_count {
+            let offset = index * chunk_size;
+            if gate.should_publish(offset, file_size, started) {
+                emitted.push(offset);
+            }
+        }
+
+        assert!(
+            emitted.len() < usize::try_from(chunk_count / 8).expect("bounded chunk count"),
+            "100 GiB fast path must emit far fewer IPC callbacks than its 25,600 ACK commits"
+        );
+        assert_eq!(emitted.last().copied(), Some(file_size));
+
+        let mut timed = ResumableProgressGate::new(0, TRANSFER_CHUNK_BYTES, started);
+        assert!(
+            !timed.should_publish(chunk_size, file_size, started + Duration::from_millis(399),)
+        );
+        assert!(timed.should_publish(
+            chunk_size * 2,
+            file_size,
+            started + Duration::from_millis(400),
+        ));
+        assert!(!timed.should_publish(
+            chunk_size * 3,
+            file_size,
+            started + Duration::from_millis(401),
+        ));
+        assert!(timed.should_publish(file_size, file_size, started + Duration::from_millis(402),));
+    }
+
+    #[test]
+    fn production_resumable_ack_commits_every_chunk_while_throttling_ipc_updates() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-resumable-ack-throttle-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&fixture).expect("create ACK throttle fixture");
+        let storage = Storage::open(&fixture.join("localnet.sqlite3")).expect("open storage");
+        let mut transfer = outgoing_transfer("ack-throttle");
+        transfer.file_size = 17 * u64::from(TRANSFER_CHUNK_BYTES);
+        transfer.chunk_count = 17;
+        storage
+            .upsert_transfer(&transfer)
+            .expect("persist ACK throttle transfer");
+        let claimed = claim_resumable_outgoing(&storage, &transfer.transfer_id, &transfer.peer_id)
+            .expect("claim ACK throttle transfer")
+            .expect("claim winner loads ACK throttle transfer");
+        let started = Instant::now();
+        let mut gate =
+            ResumableProgressGate::new(claimed.transferred_bytes, claimed.chunk_size, started);
+        let mut previous_offset = claimed.transferred_bytes;
+        let mut published_offsets = Vec::new();
+
+        for index in 1..=17_u64 {
+            let acknowledged_offset = index * u64::from(TRANSFER_CHUNK_BYTES);
+            previous_offset = commit_and_publish_resumable_ack(
+                &storage,
+                &claimed,
+                None,
+                previous_offset,
+                acknowledged_offset,
+                &mut gate,
+                started + Duration::from_millis(index),
+                &mut |event| {
+                    if let crate::network::runtime::NetworkEvent::TransferUpdated { transfer } =
+                        event
+                    {
+                        published_offsets.push(transfer.transferred_bytes);
+                    }
+                },
+            )
+            .expect("each chained ACK must commit before the next callback");
+        }
+
+        let persisted = storage
+            .get_transfer(&claimed.transfer_id)
+            .expect("reload ACK throttle transfer")
+            .expect("ACK throttle transfer remains");
+        assert_eq!(persisted.transferred_bytes, claimed.file_size);
+        assert_eq!(
+            published_offsets,
+            vec![16 * u64::from(TRANSFER_CHUNK_BYTES), claimed.file_size]
+        );
+
+        drop(storage);
+        fs::remove_dir_all(fixture).expect("remove ACK throttle fixture");
+    }
+
+    #[test]
+    fn resumable_receive_network_error_table_uses_only_trusted_destination_pause_codes_and_messages()
+     {
+        let mut paused = outgoing_transfer("network-error-table");
+        paused.direction = Direction::Incoming;
+        paused.status = TransferStatus::Paused;
+        paused.error = Some("raw transport detail: peer 10.0.0.7 reset".to_string());
+
+        let disconnect = resumable_receive_network_error_event(
+            &AppError::Network("raw transport detail: peer 10.0.0.7 reset".to_string()),
+            Some(&paused),
+        );
+        let crate::network::runtime::NetworkEvent::NetworkError {
+            code: disconnect_code,
+            message: disconnect_message,
+        } = disconnect
+        else {
+            panic!("disconnect must map to NetworkError");
+        };
+        assert_eq!(disconnect_code, "network_error");
+        assert!(!disconnect_message.contains("10.0.0.7"));
+        assert!(!disconnect_message.contains("raw transport detail"));
+
+        let integrity = resumable_receive_network_error_event(&AppError::IntegrityFailure, None);
+        let crate::network::runtime::NetworkEvent::NetworkError {
+            code: integrity_code,
+            message: integrity_message,
+        } = integrity
+        else {
+            panic!("integrity failure must map to NetworkError");
+        };
+        assert_eq!(integrity_code, "integrity_failure");
+        assert_eq!(integrity_message, AppError::IntegrityFailure.to_string());
+
+        let storage_full = resumable_receive_network_error_event(
+            &AppError::Io(injected_storage_full_error()),
+            None,
+        );
+        let crate::network::runtime::NetworkEvent::NetworkError {
+            code: storage_full_code,
+            message: storage_full_message,
+        } = storage_full
+        else {
+            panic!("storage-full failure must map to NetworkError");
+        };
+        assert_eq!(storage_full_code, "transfer.resume_destination_unavailable");
+        assert!(storage_full_message.contains("空间不足"));
+        assert!(!storage_full_message.contains("os error"));
+
+        let trusted_message = "接收目录可用空间不足，请释放空间后重试";
+        paused.error = Some(format!(
+            "{DESTINATION_PREFLIGHT_PAUSE_MARKER}{trusted_message}"
+        ));
+        let marked_preflight = resumable_receive_network_error_event(
+            &AppError::InvalidInput("raw preflight implementation detail".to_string()),
+            Some(&paused),
+        );
+        let crate::network::runtime::NetworkEvent::NetworkError {
+            code: marked_code,
+            message: marked_message,
+        } = marked_preflight
+        else {
+            panic!("marked preflight failure must map to NetworkError");
+        };
+        assert_eq!(marked_code, "transfer.resume_destination_unavailable");
+        assert_eq!(marked_message, trusted_message);
+        assert!(!marked_message.contains("raw preflight implementation detail"));
+
+        paused.error = Some(format!(
+            "{DESTINATION_PREFLIGHT_PAUSE_MARKER}{DESTINATION_PREFLIGHT_PAUSE_MARKER}forged"
+        ));
+        let malformed = resumable_receive_network_error_event(
+            &AppError::Network("raw malformed-marker detail".to_string()),
+            Some(&paused),
+        );
+        let crate::network::runtime::NetworkEvent::NetworkError {
+            code: malformed_code,
+            message: malformed_message,
+        } = malformed
+        else {
+            panic!("malformed marker must map to NetworkError");
+        };
+        assert_eq!(malformed_code, "network_error");
+        assert!(!malformed_message.contains("raw malformed-marker detail"));
+        assert!(!malformed_message.contains(DESTINATION_PREFLIGHT_PAUSE_MARKER));
     }
 }

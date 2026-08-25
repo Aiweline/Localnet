@@ -1,4 +1,4 @@
-use std::{future::Future, path::Path};
+use std::{future::Future, path::Path, time::Duration};
 
 use futures::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use sha2::{Digest, Sha256};
@@ -18,6 +18,7 @@ use crate::{
 };
 
 const CHUNK_FRAME_HEADER_BYTES: usize = 40;
+const CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[cfg(test)]
 pub(super) fn claim_paused_incoming_with_preflight<P>(
@@ -210,8 +211,35 @@ pub(crate) async fn read_chunk_frame<S>(
 where
     S: AsyncRead + Unpin,
 {
+    read_chunk_frame_with_idle_timeout(
+        stream,
+        expected_index,
+        file_size,
+        chunk_size,
+        CHUNK_IDLE_TIMEOUT,
+    )
+    .await
+}
+
+pub(super) async fn read_chunk_frame_with_idle_timeout<S>(
+    stream: &mut S,
+    expected_index: u32,
+    file_size: u64,
+    chunk_size: u32,
+    idle_timeout: Duration,
+) -> Result<(ChunkFrameHeader, Vec<u8>), AppError>
+where
+    S: AsyncRead + Unpin,
+{
     let mut encoded_header = [0_u8; CHUNK_FRAME_HEADER_BYTES];
-    stream.read_exact(&mut encoded_header).await?;
+    tokio::time::timeout(idle_timeout, stream.read_exact(&mut encoded_header))
+        .await
+        .map_err(|_| {
+            AppError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "等待文件分块头超时",
+            ))
+        })??;
     let header = ChunkFrameHeader::decode(&encoded_header)?;
     validate_frame_header(&header, expected_index, file_size, chunk_size)?;
 
@@ -222,7 +250,14 @@ where
         .try_reserve_exact(payload_len)
         .map_err(|_| AppError::InvalidInput("文件分块缓冲区无法分配".to_string()))?;
     payload.resize(payload_len, 0);
-    stream.read_exact(&mut payload).await?;
+    tokio::time::timeout(idle_timeout, stream.read_exact(&mut payload))
+        .await
+        .map_err(|_| {
+            AppError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "等待文件分块负载超时",
+            ))
+        })??;
     let actual_sha256: [u8; 32] = Sha256::digest(&payload).into();
     if actual_sha256 != header.sha256 {
         return Err(AppError::IntegrityFailure);
@@ -744,9 +779,9 @@ mod tests {
     use super::{
         ChunkFrameHeader, DurableChunkWriter, claim_paused_incoming_with_preflight,
         is_recoverable_receive_error, is_recoverable_send_error, open_owned_resumable_partial,
-        open_resumable_partial, read_chunk_frame, read_source_chunk, receive_acknowledged_chunks,
-        send_acknowledged_chunks, validate_resume_offset, verify_committed_manifest,
-        write_chunk_frame,
+        open_resumable_partial, read_chunk_frame, read_chunk_frame_with_idle_timeout,
+        read_source_chunk, receive_acknowledged_chunks, send_acknowledged_chunks,
+        validate_resume_offset, verify_committed_manifest, write_chunk_frame,
     };
     use crate::{
         domain::{Direction, TransferKind, TransferRecord, TransferStatus},
@@ -1504,6 +1539,96 @@ mod tests {
 
         assert!(matches!(header_error, crate::error::AppError::Io(_)));
         assert!(matches!(payload_error, crate::error::AppError::Io(_)));
+    }
+
+    #[tokio::test]
+    async fn production_chunk_reader_times_out_when_payload_stalls() {
+        let (reader, mut writer) = tokio::io::duplex(256);
+        let mut reader = FuturesDuplex::new(reader);
+        let header = ChunkFrameHeader {
+            index: 0,
+            length: 4,
+            sha256: sha256(b"data"),
+        };
+        writer
+            .write_all(&header.encode())
+            .await
+            .expect("write complete production frame header");
+
+        let error = read_chunk_frame_with_idle_timeout(
+            &mut reader,
+            0,
+            4,
+            TRANSFER_CHUNK_BYTES,
+            Duration::from_millis(25),
+        )
+        .await
+        .expect_err("a stalled payload must hit the per-chunk idle timeout");
+
+        assert!(matches!(
+            error,
+            AppError::Io(ref error) if error.kind() == io::ErrorKind::TimedOut
+        ));
+        assert!(is_recoverable_receive_error(&error));
+    }
+
+    #[tokio::test]
+    async fn production_chunk_reader_times_out_when_header_stalls() {
+        let (reader, _writer) = tokio::io::duplex(256);
+        let mut reader = FuturesDuplex::new(reader);
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            read_chunk_frame_with_idle_timeout(
+                &mut reader,
+                0,
+                4,
+                TRANSFER_CHUNK_BYTES,
+                Duration::from_millis(25),
+            ),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Ok(Err(AppError::Io(ref error))) if error.kind() == io::ErrorKind::TimedOut
+        ));
+    }
+
+    #[tokio::test]
+    async fn production_chunk_reader_resets_idle_timeout_between_header_and_payload() {
+        let (reader, mut writer) = tokio::io::duplex(256);
+        let mut reader = FuturesDuplex::new(reader);
+        let header = ChunkFrameHeader {
+            index: 0,
+            length: 4,
+            sha256: sha256(b"data"),
+        };
+        let writer_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            writer
+                .write_all(&header.encode())
+                .await
+                .expect("write delayed frame header");
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            writer
+                .write_all(b"data")
+                .await
+                .expect("write independently delayed frame payload");
+        });
+
+        let (_, payload) = read_chunk_frame_with_idle_timeout(
+            &mut reader,
+            0,
+            4,
+            TRANSFER_CHUNK_BYTES,
+            Duration::from_millis(100),
+        )
+        .await
+        .expect("header and payload each arrive inside their own idle window");
+
+        assert_eq!(payload, b"data");
+        writer_task.await.expect("delayed frame writer completes");
     }
 
     #[tokio::test]
