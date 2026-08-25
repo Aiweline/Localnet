@@ -12,7 +12,7 @@ import {
   Monitor, Paperclip, RefreshCw, Search, Send, Settings2, ShieldCheck, UserPlus,
   UsersRound, Wifi, WifiOff, X,
 } from "lucide-react";
-import { mergePresenceSnapshot, nearbyPeerEntries, startSnapshotReconciliation } from "./presence";
+import { mergePresenceSnapshot, mergeResolvedFriendSnapshot, nearbyPeerEntries, startSnapshotReconciliation } from "./presence";
 import { transferStatusPresentation, type TransferStatusInput } from "./transfer-status";
 import "./styles.css";
 
@@ -96,7 +96,11 @@ function App() {
         setToast({ tone: "success", message: "好友申请已送达，正在等待对方处理" });
         break;
       case "friendRequestResolved":
-        if (event.friend) setSelectedPeerId(event.friend.peerId);
+        if (event.friend) {
+          const friend = event.friend;
+          setSnapshot((current) => mergeResolvedFriendSnapshot(current, event.request, friend));
+          setSelectedPeerId(friend.peerId);
+        }
         break;
       case "transferUpdated":
         if (event.transfer.direction === "incoming" && event.transfer.status === "completed") {

@@ -14,9 +14,9 @@ use tauri::{AppHandle, State};
 use crate::{
     domain::{
         BootstrapSnapshot, ChatMessage, Direction, Friend, FriendRequest, FriendRequestStatus,
-        LocalProfile, MessageKind, MessageStatus, PROTOCOL_VERSION, Platform, PresenceSnapshot,
-        TransferKind, TransferPreferences, TransferRecord, TransferStatus, now_rfc3339,
-        validate_nickname, validate_text,
+        LocalProfile, MessageKind, MessageStatus, PROTOCOL_VERSION, PeerSummary, Platform,
+        PresenceSnapshot, TransferKind, TransferPreferences, TransferRecord, TransferStatus,
+        now_rfc3339, validate_nickname, validate_text,
     },
     error::AppError,
     network::NetworkCommand,
@@ -133,14 +133,26 @@ pub fn update_transfer_preferences(
 pub fn send_friend_request(
     peer_id: String,
     state: State<'_, AppState>,
-) -> Result<FriendRequest, AppError> {
+) -> Result<Option<FriendRequest>, AppError> {
     validate_peer_id(&peer_id, state.identity.peer_id_string().as_str())?;
     let peer = require_online_peer(&peer_id, &state)?;
-    if state.storage.is_friend(&peer_id)? {
-        return Err(AppError::InvalidInput("双方已经是好友".to_string()));
+    send_friend_request_with_dispatch(&state.storage, peer_id, peer, |request| {
+        state
+            .network()?
+            .try_send(NetworkCommand::SendFriendRequest(request))
+    })
+}
+
+fn send_friend_request_with_dispatch(
+    storage: &Storage,
+    peer_id: String,
+    peer: PeerSummary,
+    mut dispatch: impl FnMut(FriendRequest) -> Result<(), AppError>,
+) -> Result<Option<FriendRequest>, AppError> {
+    if storage.is_friend(&peer_id)? {
+        return Ok(None);
     }
-    if state
-        .storage
+    if storage
         .find_pending_friend_request(&peer_id, Direction::Outgoing)?
         .is_some()
     {
@@ -158,17 +170,12 @@ pub fn send_friend_request(
         created_at: now.clone(),
         updated_at: now,
     };
-    state.storage.put_friend_request(&request)?;
-    if let Err(error) = state
-        .network()?
-        .try_send(NetworkCommand::SendFriendRequest(request.clone()))
-    {
-        state
-            .storage
-            .remove_pending_outgoing_friend_request(&request.request_id)?;
+    storage.put_friend_request(&request)?;
+    if let Err(error) = dispatch(request.clone()) {
+        storage.remove_pending_outgoing_friend_request(&request.request_id)?;
         return Err(error);
     }
-    Ok(request)
+    Ok(Some(request))
 }
 
 #[tauri::command]
@@ -952,12 +959,12 @@ mod tests {
     use super::{
         accept_incoming_transfer_with_preflight, cancel_transfer_locally,
         prepare_receive_directory, prepare_source, prepare_transfer_preferences,
-        reserve_manual_receive_destination,
+        reserve_manual_receive_destination, send_friend_request_with_dispatch,
     };
     use crate::{
         domain::{
-            Direction, TransferKind, TransferPreferences, TransferRecord, TransferStatus,
-            now_rfc3339,
+            Direction, Friend, FriendRequest, FriendRequestStatus, PeerSummary, Platform,
+            TransferKind, TransferPreferences, TransferRecord, TransferStatus, now_rfc3339,
         },
         error::AppError,
         receive_paths::{preflight_receive_directory, reserve_receive_path},
@@ -1009,6 +1016,70 @@ mod tests {
             .upsert_transfer(&transfer)
             .expect("persist incoming acceptance fixture");
         (directory, storage, transfer)
+    }
+
+    #[test]
+    fn existing_friend_request_is_idempotent_and_never_dispatches_a_duplicate() {
+        let directory = std::env::temp_dir().join(format!(
+            "weline-localnet-idempotent-friend-request-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&directory).expect("create friend request fixture");
+        let storage =
+            Storage::open(&directory.join("localnet.sqlite3")).expect("open friend storage");
+        let peer_id = "existing-friend-peer";
+        let now = now_rfc3339();
+        let peer = PeerSummary {
+            peer_id: peer_id.to_string(),
+            nickname: "Mac".to_string(),
+            platform: Platform::Macos,
+            online: true,
+            protocol_version: 1,
+            capabilities: Vec::new(),
+            last_seen: now.clone(),
+        };
+        storage.upsert_peer(&peer).expect("persist online peer");
+        let request = FriendRequest {
+            request_id: uuid::Uuid::now_v7().to_string(),
+            peer_id: peer_id.to_string(),
+            nickname: peer.nickname.clone(),
+            direction: Direction::Incoming,
+            status: FriendRequestStatus::Pending,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        storage
+            .put_friend_request(&request)
+            .expect("persist accepted request fixture");
+        storage
+            .resolve_friend_request(
+                &request.request_id,
+                FriendRequestStatus::Accepted,
+                Some(&Friend {
+                    peer_id: peer_id.to_string(),
+                    nickname: peer.nickname.clone(),
+                    platform: peer.platform,
+                    online: true,
+                    added_at: now.clone(),
+                    last_seen: now,
+                }),
+                &request.updated_at,
+            )
+            .expect("persist existing friendship");
+
+        let dispatched = std::cell::Cell::new(false);
+        let result = send_friend_request_with_dispatch(&storage, peer_id.to_string(), peer, |_| {
+            dispatched.set(true);
+            Ok(())
+        })
+        .expect("an existing friendship is an idempotent success");
+
+        assert!(result.is_none());
+        assert!(!dispatched.get());
+        assert!(storage.is_friend(peer_id).expect("friendship remains"));
+
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove friend request fixture");
     }
 
     fn assert_manual_acceptance_unchanged(

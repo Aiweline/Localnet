@@ -77,3 +77,38 @@ test("nearby relationships allow future protocol peers and never re-offer known 
     ],
   );
 });
+
+test("a resolved friendship immediately removes the peer from the add-friend list", async () => {
+  const { mergeResolvedFriendSnapshot, nearbyPeerEntries } = await import("../src/presence.ts");
+  const messages = [{ messageId: "message-1" }];
+  const current = {
+    peers: [{ peerId: "mac-peer", nickname: "Mac", online: true }],
+    friends: [],
+    friendRequests: [{
+      requestId: "request-1",
+      peerId: "mac-peer",
+      status: "pending",
+    }],
+    messages,
+  };
+  const resolvedRequest = {
+    requestId: "request-1",
+    peerId: "mac-peer",
+    status: "accepted",
+  };
+  const friend = {
+    peerId: "mac-peer",
+    nickname: "Mac",
+    online: true,
+  };
+
+  const next = mergeResolvedFriendSnapshot(current, resolvedRequest, friend);
+
+  assert.deepEqual(next.friends, [friend]);
+  assert.deepEqual(next.friendRequests, [resolvedRequest]);
+  assert.strictEqual(next.messages, messages);
+  assert.deepEqual(
+    nearbyPeerEntries(next.peers, next.friends, next.friendRequests, "win-peer"),
+    [],
+  );
+});
