@@ -42,6 +42,7 @@ pub fn run() {
             commands::bootstrap,
             commands::presence,
             commands::refresh_discovery,
+            commands::update_language_preference,
             commands::complete_onboarding,
             commands::update_nickname,
             commands::update_settings,
@@ -53,6 +54,7 @@ pub fn run() {
             commands::resolve_transfer,
             commands::cancel_transfer,
             commands::image_preview,
+            commands::save_message_file_as,
             commands::update_transfer_preferences,
             update::download_update,
             update::open_downloaded_update,
@@ -92,6 +94,11 @@ fn initialize_state<R: tauri::Runtime>(
     let use_keyring = !(cfg!(debug_assertions) && std::env::var_os("LOCALNET_DATA_DIR").is_some());
     let identity = identity::LocalIdentity::load_or_create(&app_data_dir, use_keyring)?;
     let storage = storage::Storage::open(&app_data_dir.join("localnet.sqlite3"))?;
+    if let Some(language) =
+        storage.import_installer_locale_marker(&app_data_dir.join("installer-locale"))?
+    {
+        tracing::info!(%language, "applied installer-selected interface language");
+    }
     let default_receive_directory = app
         .path()
         .download_dir()

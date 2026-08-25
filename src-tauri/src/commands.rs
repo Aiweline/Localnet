@@ -16,7 +16,7 @@ use crate::{
         BootstrapSnapshot, ChatMessage, Direction, Friend, FriendRequest, FriendRequestStatus,
         LocalProfile, MessageKind, MessageStatus, PROTOCOL_VERSION, PeerSummary, Platform,
         PresenceSnapshot, TransferKind, TransferPreferences, TransferRecord, TransferStatus,
-        now_rfc3339, validate_nickname, validate_text,
+        now_rfc3339, validate_language_preference, validate_nickname, validate_text,
     },
     error::AppError,
     network::NetworkCommand,
@@ -47,6 +47,18 @@ pub fn presence(state: State<'_, AppState>) -> Result<PresenceSnapshot, AppError
 #[tauri::command]
 pub fn refresh_discovery(state: State<'_, AppState>) -> Result<(), AppError> {
     state.network()?.try_send(NetworkCommand::RefreshDiscovery)
+}
+
+#[tauri::command]
+pub fn update_language_preference(
+    language_preference: String,
+    state: State<'_, AppState>,
+) -> Result<String, AppError> {
+    let language_preference = validate_language_preference(&language_preference)?;
+    state
+        .storage
+        .save_language_preference(&language_preference)?;
+    Ok(language_preference)
 }
 
 #[tauri::command]
@@ -666,6 +678,308 @@ pub async fn image_preview(
     .map_err(|error| AppError::Io(std::io::Error::other(error.to_string())))?
 }
 
+#[tauri::command]
+pub async fn save_message_file_as(
+    message_id: String,
+    destination_path: String,
+    state: State<'_, AppState>,
+) -> Result<u64, AppError> {
+    let storage = state.storage.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        save_message_file_as_with_storage(&storage, &message_id, Path::new(&destination_path))
+    })
+    .await
+    .map_err(|error| AppError::Io(std::io::Error::other(error.to_string())))?
+}
+
+fn save_message_file_as_with_storage(
+    storage: &Storage,
+    message_id: &str,
+    destination: &Path,
+) -> Result<u64, AppError> {
+    save_message_file_as_with_storage_and_hook(storage, message_id, destination, |_| {})
+}
+
+fn save_message_file_as_with_storage_and_hook<F>(
+    storage: &Storage,
+    message_id: &str,
+    destination: &Path,
+    before_finalize: F,
+) -> Result<u64, AppError>
+where
+    F: FnOnce(&Path),
+{
+    let message = storage
+        .get_message(message_id)?
+        .ok_or_else(|| AppError::InvalidInput("找不到这条文件消息".to_string()))?;
+    if !matches!(message.kind, MessageKind::Image | MessageKind::File)
+        || message.status != MessageStatus::Delivered
+    {
+        return Err(AppError::InvalidInput(
+            "只有已完成传输的图片或文件可以另存".to_string(),
+        ));
+    }
+    let source = message
+        .local_path
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+        .ok_or_else(|| AppError::InvalidInput("这条文件消息没有可用的本地文件".to_string()))?;
+    let source = std::fs::canonicalize(source)?;
+    let mut source_file = File::open(&source)?;
+    let source_metadata = source_file.metadata()?;
+    if !source_metadata.is_file() {
+        return Err(AppError::InvalidInput(
+            "消息对应的本地文件不可用".to_string(),
+        ));
+    }
+    if !destination.is_absolute() {
+        return Err(AppError::InvalidInput("另存位置必须是绝对路径".to_string()));
+    }
+    let parent = destination
+        .parent()
+        .filter(|parent| parent.is_dir())
+        .ok_or_else(|| AppError::InvalidInput("另存目录不存在".to_string()))?;
+    destination
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| AppError::InvalidInput("另存文件名无效".to_string()))?;
+
+    if destination.exists() {
+        if destination.is_dir() {
+            return Err(AppError::InvalidInput("另存位置不能是目录".to_string()));
+        }
+        if std::fs::canonicalize(destination)? == source {
+            return Ok(source_metadata.len());
+        }
+    }
+
+    let (temporary, staging_directory, mut temporary_file) = create_save_temporary(parent)?;
+    let temporary_identity = save_file_identity(&temporary_file)?;
+    let copy_result = (|| -> Result<u64, AppError> {
+        let copied = std::io::copy(&mut source_file, &mut temporary_file)?;
+        if copied != source_metadata.len() {
+            return Err(AppError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "source file changed while saving a copy",
+            )));
+        }
+        temporary_file.sync_all()?;
+        before_finalize(&temporary);
+        if !save_path_has_identity(&temporary, temporary_identity)? {
+            return Err(AppError::Io(std::io::Error::other(
+                "save-as staging file identity changed before finalization",
+            )));
+        }
+        replace_saved_copy(&temporary_file, &temporary, destination, temporary_identity)?;
+        Ok(copied)
+    })();
+    if copy_result.is_err() {
+        remove_save_temporary_if_owned(&temporary, temporary_identity);
+    }
+    drop(temporary_file);
+    if let Some(staging_directory) = staging_directory {
+        let _ = std::fs::remove_dir(staging_directory);
+    }
+    copy_result
+}
+
+#[cfg(windows)]
+fn create_save_temporary(parent: &Path) -> Result<(PathBuf, Option<PathBuf>, File), AppError> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let temporary = parent.join(format!(".weline-save-{}.part", uuid::Uuid::now_v7()));
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .create_new(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(&temporary)?;
+    Ok((temporary, None, file))
+}
+
+#[cfg(unix)]
+fn create_save_temporary(parent: &Path) -> Result<(PathBuf, Option<PathBuf>, File), AppError> {
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+
+    let staging_directory = parent.join(format!(".weline-save-{}.staging", uuid::Uuid::now_v7()));
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700).create(&staging_directory)?;
+    let temporary = staging_directory.join("payload");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&temporary)?;
+    Ok((temporary, Some(staging_directory), file))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SaveFileIdentity {
+    volume: u64,
+    file: u64,
+}
+
+#[cfg(windows)]
+fn save_file_identity(file: &File) -> Result<SaveFileIdentity, AppError> {
+    use std::{mem::MaybeUninit, os::windows::io::AsRawHandle as _};
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+    let succeeded =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle(), information.as_mut_ptr()) };
+    if succeeded == 0 {
+        return Err(AppError::Io(std::io::Error::last_os_error()));
+    }
+    let information = unsafe { information.assume_init() };
+    Ok(SaveFileIdentity {
+        volume: u64::from(information.dwVolumeSerialNumber),
+        file: (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+    })
+}
+
+#[cfg(unix)]
+fn save_file_identity(file: &File) -> Result<SaveFileIdentity, AppError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = file.metadata()?;
+    Ok(SaveFileIdentity {
+        volume: metadata.dev(),
+        file: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+fn open_save_path_no_follow(path: &Path) -> std::io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+#[cfg(unix)]
+fn open_save_path_no_follow(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+fn save_path_has_identity(path: &Path, expected: SaveFileIdentity) -> Result<bool, AppError> {
+    match open_save_path_no_follow(path) {
+        Ok(file) => Ok(save_file_identity(&file)? == expected),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(AppError::Io(error)),
+    }
+}
+
+fn remove_save_temporary_if_owned(path: &Path, expected: SaveFileIdentity) {
+    if matches!(save_path_has_identity(path, expected), Ok(true)) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(windows)]
+fn replace_saved_copy(
+    source_file: &File,
+    _source: &Path,
+    destination: &Path,
+    expected: SaveFileIdentity,
+) -> Result<(), AppError> {
+    use std::{
+        mem::size_of,
+        os::windows::{ffi::OsStrExt as _, io::AsRawHandle as _},
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_RENAME_INFO, FILE_RENAME_INFO_0, FileRenameInfo, FileRenameInfoEx,
+        SetFileInformationByHandle,
+    };
+
+    let destination_wide: Vec<u16> = destination.as_os_str().encode_wide().collect();
+    let header_size = size_of::<FILE_RENAME_INFO>() - size_of::<u16>();
+    let byte_length = header_size
+        .checked_add(destination_wide.len().saturating_mul(size_of::<u16>()))
+        .ok_or_else(|| AppError::InvalidInput("另存位置过长".to_string()))?;
+    let mut buffer = vec![0usize; byte_length.div_ceil(size_of::<usize>())];
+    let information = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    unsafe {
+        (*information).Anonymous = FILE_RENAME_INFO_0 { Flags: 1 };
+        (*information).RootDirectory = std::ptr::null_mut();
+        (*information).FileNameLength = u32::try_from(destination_wide.len() * size_of::<u16>())
+            .map_err(|_| AppError::InvalidInput("另存位置过长".to_string()))?;
+        std::ptr::copy_nonoverlapping(
+            destination_wide.as_ptr(),
+            std::ptr::addr_of_mut!((*information).FileName).cast::<u16>(),
+            destination_wide.len(),
+        );
+    }
+
+    let mut renamed = unsafe {
+        SetFileInformationByHandle(
+            source_file.as_raw_handle(),
+            FileRenameInfoEx,
+            information.cast(),
+            u32::try_from(byte_length).expect("rename buffer length fits in u32"),
+        )
+    };
+    if renamed == 0 {
+        unsafe {
+            (*information).Anonymous = FILE_RENAME_INFO_0 {
+                ReplaceIfExists: true,
+            }
+        };
+        renamed = unsafe {
+            SetFileInformationByHandle(
+                source_file.as_raw_handle(),
+                FileRenameInfo,
+                information.cast(),
+                u32::try_from(byte_length).expect("rename buffer length fits in u32"),
+            )
+        };
+    }
+    if renamed == 0 {
+        return Err(AppError::Io(std::io::Error::last_os_error()));
+    }
+    if !save_path_has_identity(destination, expected)? {
+        return Err(AppError::Io(std::io::Error::other(
+            "save-as destination identity changed during finalization",
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn replace_saved_copy(
+    _source_file: &File,
+    source: &Path,
+    destination: &Path,
+    expected: SaveFileIdentity,
+) -> Result<(), AppError> {
+    std::fs::rename(source, destination)?;
+    if !save_path_has_identity(destination, expected)? {
+        return Err(AppError::Io(std::io::Error::other(
+            "save-as destination identity changed during finalization",
+        )));
+    }
+    Ok(())
+}
+
 fn save_nickname(
     nickname: &str,
     app_handle: &AppHandle,
@@ -980,12 +1294,14 @@ mod tests {
     use super::{
         accept_incoming_transfer_with_preflight, cancel_transfer_locally,
         prepare_receive_directory, prepare_source, prepare_transfer_preferences,
-        reserve_manual_receive_destination, send_friend_request_if_needed,
+        reserve_manual_receive_destination, save_message_file_as_with_storage,
+        save_message_file_as_with_storage_and_hook, send_friend_request_if_needed,
     };
     use crate::{
         domain::{
-            Direction, Friend, FriendRequest, FriendRequestStatus, PeerSummary, Platform,
-            TransferKind, TransferPreferences, TransferRecord, TransferStatus, now_rfc3339,
+            ChatMessage, Direction, Friend, FriendRequest, FriendRequestStatus, MessageKind,
+            MessageStatus, PeerSummary, Platform, TransferKind, TransferPreferences,
+            TransferRecord, TransferStatus, now_rfc3339,
         },
         error::AppError,
         receive_paths::{preflight_receive_directory, reserve_receive_path},
@@ -997,6 +1313,224 @@ mod tests {
     const MIB: u64 = 1024 * 1024;
     const GIB: u64 = 1024 * MIB;
     const DESTINATION_RESERVE_BYTES: u64 = 64 * MIB;
+
+    #[test]
+    fn save_as_copies_only_the_authoritative_delivered_attachment_source() {
+        let directory =
+            std::env::temp_dir().join(format!("weline-localnet-save-as-{}", uuid::Uuid::now_v7()));
+        fs::create_dir_all(&directory).expect("create save-as fixture");
+        let storage =
+            Storage::open(&directory.join("localnet.sqlite3")).expect("open save-as storage");
+        let source = directory.join("authoritative-source.bin");
+        fs::write(&source, b"trusted attachment bytes").expect("write attachment source");
+        let message = ChatMessage {
+            message_id: "save-as-delivered-file".to_string(),
+            peer_id: "save-as-peer".to_string(),
+            direction: Direction::Incoming,
+            kind: MessageKind::File,
+            body: None,
+            local_path: Some(source.to_string_lossy().into_owned()),
+            file_name: Some("report.bin".to_string()),
+            file_size: Some(24),
+            status: MessageStatus::Delivered,
+            error: None,
+            created_at: now_rfc3339(),
+        };
+        storage
+            .insert_message(&message)
+            .expect("persist attachment message");
+        let destination = directory.join("saved-copy.bin");
+
+        let copied = save_message_file_as_with_storage(&storage, &message.message_id, &destination)
+            .expect("save delivered attachment");
+
+        assert_eq!(copied, 24);
+        assert_eq!(
+            fs::read(&destination).expect("read saved attachment"),
+            b"trusted attachment bytes"
+        );
+        fs::write(&destination, b"old destination bytes").expect("replace destination fixture");
+        let replaced =
+            save_message_file_as_with_storage(&storage, &message.message_id, &destination)
+                .expect("replace the user-confirmed destination");
+        assert_eq!(replaced, 24);
+        assert_eq!(
+            fs::read(&destination).expect("read replaced attachment"),
+            b"trusted attachment bytes"
+        );
+        assert_eq!(
+            save_message_file_as_with_storage(&storage, &message.message_id, &source)
+                .expect("saving to the source path is a safe no-op"),
+            24
+        );
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove save-as fixture");
+    }
+
+    #[test]
+    fn save_as_fails_closed_if_the_staging_path_is_replaced_before_finalize() {
+        let directory = std::env::temp_dir().join(format!(
+            "weline-localnet-save-as-swap-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&directory).expect("create save-as swap fixture");
+        let storage =
+            Storage::open(&directory.join("localnet.sqlite3")).expect("open save-as swap storage");
+        let source = directory.join("trusted-source.bin");
+        fs::write(&source, b"trusted attachment bytes").expect("write trusted attachment");
+        let message = ChatMessage {
+            message_id: "save-as-staging-swap".to_string(),
+            peer_id: "save-as-peer".to_string(),
+            direction: Direction::Incoming,
+            kind: MessageKind::File,
+            body: None,
+            local_path: Some(source.to_string_lossy().into_owned()),
+            file_name: Some("report.bin".to_string()),
+            file_size: Some(24),
+            status: MessageStatus::Delivered,
+            error: None,
+            created_at: now_rfc3339(),
+        };
+        storage
+            .insert_message(&message)
+            .expect("persist swap attachment message");
+        let destination = directory.join("existing-destination.bin");
+        fs::write(&destination, b"existing destination bytes").expect("write existing destination");
+        let displaced = directory.join("displaced-trusted-copy.bin");
+
+        let error = save_message_file_as_with_storage_and_hook(
+            &storage,
+            &message.message_id,
+            &destination,
+            |temporary| {
+                fs::rename(temporary, &displaced).expect("move the verified staging file");
+                fs::write(temporary, b"attacker replacement bytes")
+                    .expect("replace the staging path");
+            },
+        )
+        .expect_err("a replaced staging path must fail closed");
+
+        assert!(matches!(error, AppError::Io(_)));
+        assert_eq!(
+            fs::read(&destination).expect("read protected destination"),
+            b"existing destination bytes"
+        );
+        assert_ne!(
+            fs::read(&destination).expect("read protected destination again"),
+            b"attacker replacement bytes"
+        );
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove save-as swap fixture");
+    }
+
+    #[test]
+    fn save_as_rejects_text_and_unfinished_attachment_messages() {
+        let directory = std::env::temp_dir().join(format!(
+            "weline-localnet-save-as-reject-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&directory).expect("create save-as reject fixture");
+        let storage = Storage::open(&directory.join("localnet.sqlite3"))
+            .expect("open save-as reject storage");
+        let source = directory.join("private.bin");
+        fs::write(&source, b"must not be copied").expect("write private fixture");
+
+        for (message_id, kind, status) in [
+            ("text-message", MessageKind::Text, MessageStatus::Delivered),
+            ("pending-file", MessageKind::File, MessageStatus::Sending),
+        ] {
+            storage
+                .insert_message(&ChatMessage {
+                    message_id: message_id.to_string(),
+                    peer_id: "save-as-peer".to_string(),
+                    direction: Direction::Incoming,
+                    kind,
+                    body: None,
+                    local_path: Some(source.to_string_lossy().into_owned()),
+                    file_name: Some("private.bin".to_string()),
+                    file_size: Some(18),
+                    status,
+                    error: None,
+                    created_at: now_rfc3339(),
+                })
+                .expect("persist rejected message fixture");
+
+            let destination = directory.join(format!("{message_id}-copy.bin"));
+            let error = save_message_file_as_with_storage(&storage, message_id, &destination)
+                .expect_err("ineligible message must be rejected");
+            assert!(matches!(error, AppError::InvalidInput(_)));
+            assert!(!destination.exists());
+        }
+
+        let missing_destination = directory.join("unknown-message-copy.bin");
+        assert!(matches!(
+            save_message_file_as_with_storage(&storage, "unknown-message", &missing_destination),
+            Err(AppError::InvalidInput(_))
+        ));
+        assert!(!missing_destination.exists());
+
+        for (message_id, local_path) in [
+            ("pathless-file", None),
+            (
+                "missing-source-file",
+                Some(
+                    directory
+                        .join("missing-source.bin")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+            ),
+            (
+                "directory-source-file",
+                Some(directory.to_string_lossy().into_owned()),
+            ),
+        ] {
+            storage
+                .insert_message(&ChatMessage {
+                    message_id: message_id.to_string(),
+                    peer_id: "save-as-peer".to_string(),
+                    direction: Direction::Incoming,
+                    kind: MessageKind::File,
+                    body: None,
+                    local_path,
+                    file_name: Some("fixture.bin".to_string()),
+                    file_size: Some(1),
+                    status: MessageStatus::Delivered,
+                    error: None,
+                    created_at: now_rfc3339(),
+                })
+                .expect("persist invalid source fixture");
+            let destination = directory.join(format!("{message_id}-copy.bin"));
+            assert!(
+                save_message_file_as_with_storage(&storage, message_id, &destination).is_err(),
+                "invalid source must be rejected: {message_id}"
+            );
+            assert!(!destination.exists());
+        }
+
+        storage
+            .insert_message(&ChatMessage {
+                message_id: "directory-destination".to_string(),
+                peer_id: "save-as-peer".to_string(),
+                direction: Direction::Incoming,
+                kind: MessageKind::File,
+                body: None,
+                local_path: Some(source.to_string_lossy().into_owned()),
+                file_name: Some("private.bin".to_string()),
+                file_size: Some(18),
+                status: MessageStatus::Delivered,
+                error: None,
+                created_at: now_rfc3339(),
+            })
+            .expect("persist destination validation fixture");
+        assert!(matches!(
+            save_message_file_as_with_storage(&storage, "directory-destination", &directory),
+            Err(AppError::InvalidInput(_))
+        ));
+
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove save-as reject fixture");
+    }
 
     fn acceptance_fixture(name: &str, file_size: u64) -> (PathBuf, Storage, TransferRecord) {
         let directory = std::env::temp_dir().join(format!(

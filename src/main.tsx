@@ -6,21 +6,27 @@ import { getVersion } from "@tauri-apps/api/app";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
-import { openPath, openUrl } from "@tauri-apps/plugin-opener";
+import { openPath, openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import {
   AlertCircle, BellRing, Building2, Check, CheckCheck, ChevronRight, CircleUserRound,
-  File, FileDown, FolderOpen, Image as ImageIcon, LoaderCircle, Mail, MessageCircleMore,
+  ExternalLink, File, FileDown, FolderOpen, Image as ImageIcon, LoaderCircle, Mail, MessageCircleMore,
   Monitor, Paperclip, RefreshCw, Search, Send, Settings2, ShieldCheck, UserPlus,
   UsersRound, Wifi, WifiOff, X,
 } from "lucide-react";
 import { submitDiscoveryRefresh } from "./discovery-refresh";
+import { attachmentActionState } from "./file-actions";
+import {
+  reconcileLanguageSnapshot, resolveLanguagePreference, translate,
+  type LanguagePreference, type TranslationKey,
+} from "./i18n/core";
+import { I18nProvider, useI18n } from "./i18n/react";
 import {
   initializeNotificationPermission,
   requestNotificationPermission,
   type NotificationPermissionState,
 } from "./notifications";
 import { mergePresenceSnapshot, mergeResolvedFriendSnapshot, nearbyPeerEntries, startSnapshotReconciliation } from "./presence";
-import { transferStatusPresentation, type TransferStatusInput } from "./transfer-status";
+import { transferStatusPresentation, type TransferStatusInput, type TransferStatusLabels } from "./transfer-status";
 import { checkForUpdate, createUpdateDownloadRequest, type UpdateInfo } from "./update";
 import "./styles.css";
 
@@ -39,7 +45,7 @@ interface ChatMessage { messageId: string; peerId: string; direction: Direction;
 interface TransferRecord extends TransferStatusInput { transferId: string; peerId: string; kind: TransferKind; fileName: string; mimeType: string; sha256: string; localPath?: string; createdAt: string; updatedAt: string }
 interface TransferPreferences { autoReceiveFiles: boolean; receiveDirectory: string }
 interface PresenceSnapshot { peers: PeerSummary[]; friends: Friend[] }
-interface BootstrapSnapshot { localProfile: LocalProfile | null; transferPreferences: TransferPreferences; peers: PeerSummary[]; friendRequests: FriendRequest[]; friends: Friend[]; messages: ChatMessage[]; transfers: TransferRecord[] }
+interface BootstrapSnapshot { localProfile: LocalProfile | null; languagePreference: string; transferPreferences: TransferPreferences; peers: PeerSummary[]; friendRequests: FriendRequest[]; friends: Friend[]; messages: ChatMessage[]; transfers: TransferRecord[] }
 interface ToastState { tone: "success" | "error" | "info"; message: string }
 interface DownloadedUpdate { path: string; bytes: number }
 interface UpdateDownloadProgress { version: string; downloadedBytes: number; totalBytes: number }
@@ -54,9 +60,10 @@ type NetworkEvent =
   | { type: "transferUpdated"; transfer: TransferRecord }
   | { type: "networkError"; code: string; message: string };
 
-const EMPTY_SNAPSHOT: BootstrapSnapshot = { localProfile: null, transferPreferences: { autoReceiveFiles: false, receiveDirectory: "" }, peers: [], friendRequests: [], friends: [], messages: [], transfers: [] };
+const EMPTY_SNAPSHOT: BootstrapSnapshot = { localProfile: null, languagePreference: "auto", transferPreferences: { autoReceiveFiles: false, receiveDirectory: "" }, peers: [], friendRequests: [], friends: [], messages: [], transfers: [] };
 
 function App() {
+  const { t, preference, setLanguagePreference, relativeTime } = useI18n();
   const [snapshot, setSnapshot] = useState<BootstrapSnapshot>(EMPTY_SNAPSHOT);
   const [loading, setLoading] = useState(true);
   const [fatalError, setFatalError] = useState("");
@@ -79,20 +86,32 @@ function App() {
   const [updateError, setUpdateError] = useState("");
   const [notificationPermission, setNotificationPermission] = useState<NotificationPermissionState>("default");
   const refreshTimer = useRef<number | null>(null);
+  const languagePreferenceRef = useRef<LanguagePreference | null>(null);
+  const translatorRef = useRef(t);
   const hasOnlinePeer = snapshot.peers.some((peer) => peer.online);
+
+  useEffect(() => {
+    translatorRef.current = t;
+  }, [t]);
 
   const refresh = useCallback(async (showLoader = false) => {
     if (showLoader) setLoading(true);
     try {
       const next = await invoke<BootstrapSnapshot>("bootstrap");
-      setSnapshot(next);
+      const effectivePreference = reconcileLanguageSnapshot(
+        next.languagePreference,
+        languagePreferenceRef.current,
+      );
+      languagePreferenceRef.current = effectivePreference;
+      setLanguagePreference(effectivePreference);
+      setSnapshot({ ...next, languagePreference: effectivePreference });
       setFatalError("");
     } catch (error) {
-      setFatalError(errorMessage(error));
+      setFatalError(localizedError(error, translatorRef.current));
     } finally {
       if (showLoader) setLoading(false);
     }
-  }, []);
+  }, [setLanguagePreference]);
 
   const scheduleRefresh = useCallback(() => {
     if (refreshTimer.current !== null) window.clearTimeout(refreshTimer.current);
@@ -105,14 +124,15 @@ function App() {
   }, []);
 
   const handleNetworkEvent = useCallback((event: NetworkEvent) => {
+    const currentT = translatorRef.current;
     scheduleRefresh();
     switch (event.type) {
       case "friendRequestReceived":
-        setAnnouncement(`${event.request.nickname} 发来了好友申请`);
-        void notifyIncomingFriendRequest(event.request);
+        setAnnouncement(currentT("friends.requestFrom", { name: event.request.nickname }));
+        void notifyIncomingFriendRequest(event.request, currentT);
         break;
       case "friendRequestDelivered":
-        setToast({ tone: "success", message: "好友申请已送达，正在等待对方处理" });
+        setToast({ tone: "success", message: currentT("friends.requestDelivered") });
         break;
       case "friendRequestResolved":
         if (event.friend) {
@@ -123,12 +143,12 @@ function App() {
         break;
       case "transferUpdated":
         if (event.transfer.direction === "incoming" && event.transfer.status === "completed") {
-          setAnnouncement(`文件 ${event.transfer.fileName} 已接收完成`);
-          void notifyIncomingTransfer(event.transfer);
+          setAnnouncement(currentT("transfer.receivedComplete", { name: event.transfer.fileName }));
+          void notifyIncomingTransfer(event.transfer, currentT);
         }
         break;
       case "networkError":
-        setToast({ tone: "error", message: event.message });
+        setToast({ tone: "error", message: localizedError(event, currentT) });
         break;
       default:
         break;
@@ -172,17 +192,17 @@ function App() {
       setUpdateProgress(0);
       if (showFeedback) {
         setToast(update
-          ? { tone: "info", message: `发现新版本 v${update.version}` }
-          : { tone: "success", message: "当前已是最新版本" });
+          ? { tone: "info", message: t("update.found", { version: update.version }) }
+          : { tone: "success", message: t("update.latest") });
       }
     } catch {
       setUpdateChecked(true);
-      setUpdateError("检查更新失败，可稍后重试");
-      if (showFeedback) setToast({ tone: "error", message: "检查更新失败，请检查网络后重试" });
+      setUpdateError(t("update.checkFailedShort"));
+      if (showFeedback) setToast({ tone: "error", message: t("update.checkFailed") });
     } finally {
       setUpdateChecking(false);
     }
-  }, [appVersion, profilePlatform]);
+  }, [appVersion, profilePlatform, t]);
 
   useEffect(() => {
     if (appVersion && profilePlatform) void runUpdateCheck();
@@ -244,12 +264,12 @@ function App() {
       await refresh();
       return result;
     } catch (error) {
-      setToast({ tone: "error", message: errorMessage(error) });
+      setToast({ tone: "error", message: localizedError(error, t) });
       return null;
     } finally {
       setBusyKey("");
     }
-  }, [refresh]);
+  }, [refresh, t]);
 
   const enableSystemNotifications = async () => {
     setBusyKey("notifications");
@@ -261,10 +281,30 @@ function App() {
       });
       setNotificationPermission(permission);
       setToast(permission === "granted"
-        ? { tone: "success", message: "系统通知已开启" }
-        : { tone: "info", message: "系统通知未开启；应用内好友申请提醒仍然有效" });
+        ? { tone: "success", message: t("notifications.enabled") }
+        : { tone: "info", message: t("notifications.notEnabled") });
     } catch (error) {
-      setToast({ tone: "error", message: errorMessage(error) });
+      setToast({ tone: "error", message: localizedError(error, t) });
+    } finally {
+      setBusyKey("");
+    }
+  };
+
+  const changeLanguagePreference = async (nextPreference: LanguagePreference, showSuccess = false) => {
+    languagePreferenceRef.current = nextPreference;
+    setLanguagePreference(nextPreference);
+    setSnapshot((current) => ({ ...current, languagePreference: nextPreference }));
+    setBusyKey("language");
+    try {
+      await invoke("update_language_preference", { languagePreference: nextPreference });
+      if (showSuccess) {
+        const nextLocale = resolveLanguagePreference(nextPreference, navigator.languages);
+        setToast({ tone: "success", message: translate(nextLocale, "settings.languageSaved") });
+      }
+    } catch (error) {
+      const nextLocale = resolveLanguagePreference(nextPreference, navigator.languages);
+      const nextTranslator: Translator = (key, params) => translate(nextLocale, key, params);
+      setToast({ tone: "error", message: localizedError(error, nextTranslator) });
     } finally {
       setBusyKey("");
     }
@@ -278,9 +318,9 @@ function App() {
         setRefreshing: setDiscoveryRefreshing,
       });
       setDiscoverySlow(false);
-      setToast({ tone: "info", message: "正在重新扫描附近设备" });
+      setToast({ tone: "info", message: t("nearby.refreshStarted") });
     } catch (error) {
-      setToast({ tone: "error", message: errorMessage(error) });
+      setToast({ tone: "error", message: localizedError(error, t) });
     }
   };
 
@@ -295,9 +335,9 @@ function App() {
       await invoke<DownloadedUpdate>("download_update", { request });
       setUpdateProgress(100);
       setUpdateDownloaded(true);
-      setToast({ tone: "success", message: "更新包下载并校验完成，可以打开安装" });
+      setToast({ tone: "success", message: t("update.downloaded") });
     } catch (error) {
-      const message = errorMessage(error);
+      const message = localizedError(error, t);
       setUpdateError(message);
       setToast({ tone: "error", message });
     } finally {
@@ -310,17 +350,17 @@ function App() {
     try {
       const request = createUpdateDownloadRequest(updateInfo);
       await invoke("open_downloaded_update", { request });
-      setToast({ tone: "info", message: "安装包已打开，请按系统提示完成更新" });
+      setToast({ tone: "info", message: t("update.opened") });
     } catch (error) {
-      setToast({ tone: "error", message: errorMessage(error) });
+      setToast({ tone: "error", message: localizedError(error, t) });
     }
   };
 
   if (loading) return <BootScreen />;
   if (fatalError && !snapshot.localProfile) return <FatalScreen message={fatalError} onRetry={() => void refresh(true)} />;
   if (!snapshot.localProfile) {
-    return <Onboarding busy={busyKey === "onboarding"} onSubmit={async (nickname) => {
-      await act("onboarding", () => invoke("complete_onboarding", { nickname }), "Weline Localnet 已准备好，正在发现附近用户");
+    return <Onboarding busy={busyKey === "onboarding"} languageBusy={busyKey === "language"} onLanguageChange={(nextPreference) => changeLanguagePreference(nextPreference)} onSubmit={async (nickname) => {
+      await act("onboarding", () => invoke("complete_onboarding", { nickname }));
     }} />;
   }
 
@@ -334,7 +374,7 @@ function App() {
   const visibleNearby = nearbyPeers.filter(({ peer }) => peer.nickname.toLocaleLowerCase().includes(normalizedSearch));
 
   const resolveFriend = async (requestId: string, accepted: boolean) => {
-    const result = await act(`request:${requestId}`, () => invoke("resolve_friend_request", { requestId, accepted }), accepted ? "已添加好友，可以开始聊天了" : "已拒绝好友申请");
+    const result = await act(`request:${requestId}`, () => invoke("resolve_friend_request", { requestId, accepted }), accepted ? t("friends.added") : t("friends.rejected"));
     if (accepted && result) {
       const request = incomingRequests.find((item) => item.requestId === requestId);
       if (request) setSelectedPeerId(request.peerId);
@@ -354,10 +394,54 @@ function App() {
     const selected = await open({
       multiple: false,
       directory: false,
-      filters: kind === "image" ? [{ name: "图片", extensions: ["png", "jpg", "jpeg", "gif", "webp", "bmp", "heic", "heif"] }] : undefined,
+      filters: kind === "image" ? [{ name: t("picker.images"), extensions: ["png", "jpg", "jpeg", "gif", "webp", "bmp", "heic", "heif"] }] : undefined,
     });
     if (typeof selected !== "string") return;
-    await act(`send-${kind}`, () => invoke("send_file", { peerId: selectedFriend.peerId, path: selected, kind }), kind === "image" ? "图片已加入发送队列" : "文件请求已发送");
+    await act(`send-${kind}`, () => invoke("send_file", { peerId: selectedFriend.peerId, path: selected, kind }), kind === "image" ? t("chat.sentImage") : t("chat.sentFile"));
+  };
+
+  const openAttachment = async (message: ChatMessage) => {
+    if (!attachmentActionState(message).available || !message.localPath) return;
+    setBusyKey(`attachment:${message.messageId}:open`);
+    try {
+      await openPath(message.localPath);
+    } catch {
+      setToast({ tone: "error", message: t("transfer.openFailed") });
+    } finally {
+      setBusyKey("");
+    }
+  };
+
+  const revealAttachment = async (message: ChatMessage) => {
+    if (!attachmentActionState(message).available || !message.localPath) return;
+    setBusyKey(`attachment:${message.messageId}:reveal`);
+    try {
+      await revealItemInDir(message.localPath);
+    } catch {
+      setToast({ tone: "error", message: t("transfer.revealFailed") });
+    } finally {
+      setBusyKey("");
+    }
+  };
+
+  const saveAttachmentAs = async (message: ChatMessage) => {
+    const actionState = attachmentActionState(message);
+    if (!actionState.available) return;
+    const destinationPath = await save({ defaultPath: actionState.defaultFileName });
+    if (!destinationPath) return;
+    setBusyKey(`attachment:${message.messageId}:save`);
+    try {
+      await invoke<number>("save_message_file_as", {
+        messageId: message.messageId,
+        destinationPath,
+      });
+      const savedName = destinationPath.split(/[\\/]/).pop() || actionState.defaultFileName;
+      setToast({ tone: "success", message: t("transfer.saveSuccess", { name: savedName }) });
+    } catch {
+      setToast({ tone: "error", message: t("transfer.saveFailed") });
+    } finally {
+      setBusyKey("");
+    }
   };
 
   const resolveTransfer = async (transfer: TransferRecord, accepted: boolean) => {
@@ -366,7 +450,7 @@ function App() {
       savePath = await save({ defaultPath: transfer.fileName });
       if (!savePath) return;
     }
-    await act(`transfer:${transfer.transferId}`, () => invoke("resolve_transfer", { transferId: transfer.transferId, accepted, savePath }), accepted ? "已接受文件，正在内网传输" : "已拒绝文件");
+    await act(`transfer:${transfer.transferId}`, () => invoke("resolve_transfer", { transferId: transfer.transferId, accepted, savePath }), accepted ? t("transfer.accepted") : t("transfer.rejected"));
   };
 
   return (
@@ -374,29 +458,29 @@ function App() {
       <aside className="sidebar">
         <header className="brand-row">
           <span className="brand-mark"><MessageCircleMore size={22} /></span>
-          <span><strong>Weline Localnet {appVersion && <span className="version-badge">v{appVersion}</span>}</strong><small>局域网私密传输</small></span>
-          <button className="icon-button" title="设置" onClick={() => setEditingProfile(true)}><Settings2 size={18} /></button>
+          <span><strong>Weline Localnet {appVersion && <span className="version-badge">v{appVersion}</span>}</strong><small>{t("app.subtitle")}</small></span>
+          <button className="icon-button" title={t("common.settings")} aria-label={t("common.settings")} onClick={() => setEditingProfile(true)}><Settings2 size={18} /></button>
         </header>
         <button className="profile-card" onClick={() => setEditingProfile(true)}>
           <Avatar name={profile.nickname} online />
-          <span><strong>{profile.nickname}</strong><small><ShieldCheck size={13} /> 本机身份已保护</small></span>
+          <span><strong>{profile.nickname}</strong><small><ShieldCheck size={13} /> {t("app.identityProtected")}</small></span>
           <ChevronRight size={16} />
         </button>
         <label className="search-box">
           <Search size={16} />
-          <input value={searchText} onChange={(event) => setSearchText(event.target.value)} placeholder="搜索用户" aria-label="搜索用户" />
-          {searchText && <button onClick={() => setSearchText("")} aria-label="清除搜索"><X size={14} /></button>}
+          <input value={searchText} onChange={(event) => setSearchText(event.target.value)} placeholder={t("common.searchUsers")} aria-label={t("common.searchUsers")} />
+          {searchText && <button onClick={() => setSearchText("")} aria-label={t("common.clearSearch")}><X size={14} /></button>}
         </label>
         <div className="sidebar-scroll">
           {incomingRequests.length > 0 && (
-            <SidebarSection title="新的好友申请" count={incomingRequests.length} accent>
+            <SidebarSection title={t("friends.newRequests")} count={incomingRequests.length} accent>
               {incomingRequests.map((request) => (
                 <div className="request-card" key={request.requestId}>
                   <Avatar name={request.nickname} online />
-                  <span><strong>{request.nickname}</strong><small>想添加你为好友</small></span>
+                  <span><strong>{request.nickname}</strong><small>{t("friends.wantsToAdd")}</small></span>
                   <div className="request-actions">
-                    <button className="mini-button reject" disabled={busyKey === `request:${request.requestId}`} onClick={() => void resolveFriend(request.requestId, false)} title="拒绝"><X size={14} /></button>
-                    <button className="mini-button accept" disabled={busyKey === `request:${request.requestId}`} onClick={() => void resolveFriend(request.requestId, true)} title="接受">
+                    <button className="mini-button reject" disabled={busyKey === `request:${request.requestId}`} onClick={() => void resolveFriend(request.requestId, false)} title={t("common.reject")}><X size={14} /></button>
+                    <button className="mini-button accept" disabled={busyKey === `request:${request.requestId}`} onClick={() => void resolveFriend(request.requestId, true)} title={t("common.accept")}>
                       {busyKey === `request:${request.requestId}` ? <LoaderCircle size={14} className="spin" /> : <Check size={14} />}
                     </button>
                   </div>
@@ -405,7 +489,7 @@ function App() {
             </SidebarSection>
           )}
           <SidebarSection
-            title="附近用户"
+            title={t("nearby.title")}
             count={visibleNearby.length}
             icon={<Wifi size={14} />}
             headerAction={(
@@ -414,8 +498,8 @@ function App() {
                 className="section-action"
                 disabled={discoveryRefreshing}
                 onClick={() => void refreshNearby()}
-                title="重新扫描附近设备"
-                aria-label="重新扫描附近设备"
+                title={t("nearby.rescan")}
+                aria-label={t("nearby.rescan")}
               >
                 <RefreshCw size={13} className={discoveryRefreshing ? "spin" : ""} />
               </button>
@@ -424,23 +508,23 @@ function App() {
             {visibleNearby.map(({ peer, relationship }) => (
               <div className="person-row" key={peer.peerId}>
                 <Avatar name={peer.nickname} online />
-                <span><strong>{peer.nickname}</strong><small>{platformLabel(peer.platform)} · 在线</small></span>
-                <button className="add-button" disabled={busyKey === `add:${peer.peerId}` || relationship === "pending"} title={relationship === "pending" ? "好友申请正在等待处理" : "添加好友"} onClick={() => void act(`add:${peer.peerId}`, () => invoke("send_friend_request", { peerId: peer.peerId }))}>
+                <span><strong>{peer.nickname}</strong><small>{platformLabel(peer.platform, t)} · {t("common.online")}</small></span>
+                <button className="add-button" disabled={busyKey === `add:${peer.peerId}` || relationship === "pending"} title={relationship === "pending" ? t("friends.pending") : t("friends.add")} onClick={() => void act(`add:${peer.peerId}`, () => invoke("send_friend_request", { peerId: peer.peerId }))}>
                   {busyKey === `add:${peer.peerId}` ? <LoaderCircle size={15} className="spin" /> : relationship === "pending" ? <Check size={15} /> : <UserPlus size={15} />}
                 </button>
               </div>
             ))}
-            {visibleNearby.length === 0 && <SidebarEmpty icon={discoverySlow ? <AlertCircle size={17} /> : <Wifi size={17} />} text={searchText ? "没有匹配的附近用户" : discoverySlow ? "仍未发现？请允许 Weline Localnet 访问本地网络，并检查 Windows 防火墙" : "正在自动发现同一内网的用户"} />}
+            {visibleNearby.length === 0 && <SidebarEmpty icon={discoverySlow ? <AlertCircle size={17} /> : <Wifi size={17} />} text={searchText ? t("nearby.noMatch") : discoverySlow ? t("nearby.slow") : t("nearby.scanning")} />}
           </SidebarSection>
-          <SidebarSection title="好友" count={visibleFriends.length} icon={<UsersRound size={14} />}>
+          <SidebarSection title={t("friends.title")} count={visibleFriends.length} icon={<UsersRound size={14} />}>
             {visibleFriends.map((friend) => (
               <button key={friend.peerId} className={`friend-row ${friend.peerId === selectedPeerId ? "active" : ""}`} onClick={() => setSelectedPeerId(friend.peerId)}>
                 <Avatar name={friend.nickname} online={friend.online} />
-                <span><strong>{friend.nickname}</strong><small>{friend.online ? "在线" : `离线 · ${relativeTime(friend.lastSeen)}`}</small></span>
+                <span><strong>{friend.nickname}</strong><small>{friend.online ? t("common.online") : t("friends.offlineSince", { time: relativeTime(friend.lastSeen) })}</small></span>
                 {friend.online ? <span className="online-dot" /> : <WifiOff size={14} />}
               </button>
             ))}
-            {visibleFriends.length === 0 && <SidebarEmpty icon={<CircleUserRound size={17} />} text={searchText ? "没有匹配的好友" : "添加附近用户后会显示在这里"} />}
+            {visibleFriends.length === 0 && <SidebarEmpty icon={<CircleUserRound size={17} />} text={searchText ? t("friends.noMatch") : t("friends.empty")} />}
           </SidebarSection>
         </div>
       </aside>
@@ -479,13 +563,16 @@ function App() {
             onSendFile={() => void chooseAndSend("file")}
             onRetry={(messageId) => void act(`retry:${messageId}`, () => invoke("retry_text", { messageId }))}
             onResolveTransfer={resolveTransfer}
-            onCancelTransfer={(transferId) => void act(`transfer:${transferId}`, () => invoke("cancel_transfer", { transferId }), "已取消文件传输")}
+            onCancelTransfer={(transferId) => void act(`transfer:${transferId}`, () => invoke("cancel_transfer", { transferId }), t("transfer.cancelSuccess"))}
+            onOpenAttachment={(message) => void openAttachment(message)}
+            onSaveAttachment={(message) => void saveAttachmentAs(message)}
+            onRevealAttachment={(message) => void revealAttachment(message)}
           />
         ) : <WelcomePanel nearbyCount={nearbyPeers.length} friendCount={snapshot.friends.length} />}
       </section>
 
       {editingProfile && (
-        <ProfileDialog profile={profile} transferPreferences={snapshot.transferPreferences} busy={busyKey === "profile"} directoryBusy={busyKey === "open-receive-directory"} notificationBusy={busyKey === "notifications"} notificationPermission={notificationPermission} appVersion={appVersion} updateChecking={updateChecking} updateStatus={updateInfo ? `发现新版本 v${updateInfo.version}` : updateError || (updateChecked ? "已是最新版" : "尚未检查")} onCheckUpdates={() => runUpdateCheck(true)} onEnableNotifications={enableSystemNotifications} onChooseDirectory={async (currentDirectory) => {
+        <ProfileDialog profile={profile} languagePreference={preference} languageBusy={busyKey === "language"} onLanguageChange={(nextPreference) => changeLanguagePreference(nextPreference, true)} transferPreferences={snapshot.transferPreferences} busy={busyKey === "profile"} directoryBusy={busyKey === "open-receive-directory"} notificationBusy={busyKey === "notifications"} notificationPermission={notificationPermission} appVersion={appVersion} updateChecking={updateChecking} updateStatus={updateInfo ? t("update.found", { version: updateInfo.version }) : updateError || (updateChecked ? t("update.latest") : t("update.notChecked"))} onCheckUpdates={() => runUpdateCheck(true)} onEnableNotifications={enableSystemNotifications} onChooseDirectory={async (currentDirectory) => {
           const selected = await open({ multiple: false, directory: true, defaultPath: currentDirectory || undefined });
           return typeof selected === "string" ? selected : null;
         }} onOpenDirectory={async (path) => {
@@ -497,7 +584,7 @@ function App() {
               autoReceiveFiles: transferPreferences.autoReceiveFiles,
               receiveDirectory: transferPreferences.receiveDirectory,
             });
-          }, "设置已保存");
+          }, t("settings.saved"));
           if (result) setEditingProfile(false);
         }} />
       )}
@@ -514,19 +601,20 @@ function IncomingRequestBanner({ request, platform, count, busy, onResolve }: {
   busy: boolean;
   onResolve: (accepted: boolean) => void;
 }) {
+  const { t } = useI18n();
   return (
-    <section className="incoming-request-banner" role="region" aria-label="新的好友申请">
+    <section className="incoming-request-banner" role="region" aria-label={t("friends.newRequests")}>
       <span className="request-banner-icon"><BellRing size={21} /></span>
       <span className="request-banner-copy">
-        <small>新的好友申请 · {platformLabel(platform)}</small>
-        <strong>{request.nickname} 想添加你为好友</strong>
-        <span>确认后即可互发文字、图片和文件。</span>
+        <small>{t("friends.newRequests")} · {platformLabel(platform, t)}</small>
+        <strong>{t("friends.requestFrom", { name: request.nickname })}</strong>
+        <span>{t("friends.requestInstruction")}</span>
       </span>
-      {count > 1 && <span className="request-banner-count">另有 {count - 1} 条</span>}
+      {count > 1 && <span className="request-banner-count">{t("friends.moreRequests", { count: count - 1 })}</span>}
       <div className="request-banner-actions">
-        <button className="request-banner-reject" disabled={busy} onClick={() => onResolve(false)}>拒绝</button>
+        <button className="request-banner-reject" disabled={busy} onClick={() => onResolve(false)}>{t("common.reject")}</button>
         <button className="request-banner-accept" disabled={busy} onClick={() => onResolve(true)}>
-          {busy ? <LoaderCircle size={15} className="spin" /> : <Check size={15} />} 接受
+          {busy ? <LoaderCircle size={15} className="spin" /> : <Check size={15} />} {t("common.accept")}
         </button>
       </div>
     </section>
@@ -542,25 +630,27 @@ function UpdateBanner({ update, downloading, downloaded, progress, error, onDown
   onDownload: () => void;
   onOpen: () => void;
 }) {
+  const { t } = useI18n();
   return (
-    <section className="update-banner" role="region" aria-label="应用更新">
+    <section className="update-banner" role="region" aria-label={t("update.applicationUpdate")}>
       <span className="update-banner-icon"><FileDown size={19} /></span>
       <span className="update-banner-copy">
-        <strong>发现新版本 v{update.version}</strong>
-        <small>{error || (downloaded ? "更新包已通过 SHA-256 校验" : downloading ? `正在下载 ${progress}%` : "来自 Weline Localnet 官方 GitHub Release")}</small>
-        {downloading && <span role="progressbar" aria-label={`更新下载 ${progress}%`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress}><i style={{ width: `${progress}%` }} /></span>}
+        <strong>{t("update.found", { version: update.version })}</strong>
+        <small>{error || (downloaded ? t("update.verified") : downloading ? t("update.downloading", { progress }) : t("update.official"))}</small>
+        {downloading && <span role="progressbar" aria-label={t("update.downloading", { progress })} aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress}><i style={{ width: `${progress}%` }} /></span>}
       </span>
       <button type="button" disabled={downloading} onClick={downloaded ? onOpen : onDownload}>
         {downloading ? <LoaderCircle size={14} className="spin" /> : downloaded ? <FolderOpen size={14} /> : <FileDown size={14} />}
-        {downloading ? `下载中 ${progress}%` : downloaded ? "打开安装包" : error ? "重新下载" : "下载更新"}
+        {downloading ? t("update.downloading", { progress }) : downloaded ? t("update.openInstaller") : error ? t("update.redownload") : t("update.download")}
       </button>
     </section>
   );
 }
 
-function Conversation({ friend, messages, transfers, messageText, setMessageText, busyKey, onSendText, onSendImage, onSendFile, onRetry, onResolveTransfer, onCancelTransfer }: {
-  friend: Friend; messages: ChatMessage[]; transfers: TransferRecord[]; messageText: string; setMessageText: (value: string) => void; busyKey: string; onSendText: () => void; onSendImage: () => void; onSendFile: () => void; onRetry: (messageId: string) => void; onResolveTransfer: (transfer: TransferRecord, accepted: boolean) => void; onCancelTransfer: (transferId: string) => void;
+function Conversation({ friend, messages, transfers, messageText, setMessageText, busyKey, onSendText, onSendImage, onSendFile, onRetry, onResolveTransfer, onCancelTransfer, onOpenAttachment, onSaveAttachment, onRevealAttachment }: {
+  friend: Friend; messages: ChatMessage[]; transfers: TransferRecord[]; messageText: string; setMessageText: (value: string) => void; busyKey: string; onSendText: () => void; onSendImage: () => void; onSendFile: () => void; onRetry: (messageId: string) => void; onResolveTransfer: (transfer: TransferRecord, accepted: boolean) => void; onCancelTransfer: (transferId: string) => void; onOpenAttachment: (message: ChatMessage) => void; onSaveAttachment: (message: ChatMessage) => void; onRevealAttachment: (message: ChatMessage) => void;
 }) {
+  const { t } = useI18n();
   const bottomRef = useRef<HTMLDivElement>(null);
   const transferMap = new Map(transfers.map((transfer) => [transfer.transferId, transfer]));
   const messageIds = new Set(messages.map((message) => message.messageId));
@@ -576,75 +666,100 @@ function Conversation({ friend, messages, transfers, messageText, setMessageText
     <section className="conversation">
       <header className="conversation-header">
         <Avatar name={friend.nickname} online={friend.online} large />
-        <span><strong>{friend.nickname}</strong><small className={friend.online ? "is-online" : ""}>{friend.online ? <><Wifi size={13} /> 在线 · 内网直连</> : <><WifiOff size={13} /> 当前离线</>}</small></span>
-        <div className="secure-pill"><ShieldCheck size={15} /> 加密连接</div>
+        <span><strong>{friend.nickname}</strong><small className={friend.online ? "is-online" : ""}>{friend.online ? <><Wifi size={13} /> {t("chat.directOnline")}</> : <><WifiOff size={13} /> {t("chat.currentlyOffline")}</>}</small></span>
+        <div className="secure-pill"><ShieldCheck size={15} /> {t("chat.encrypted")}</div>
       </header>
       <div className="message-scroll">
-        <div className="privacy-note"><ShieldCheck size={14} /> 消息和文件只在本地网络中传输</div>
-        {timeline.length === 0 && <div className="conversation-empty"><span><MessageCircleMore size={31} /></span><strong>向 {friend.nickname} 打个招呼</strong><p>可以发送文字、图片和文件，不经过互联网服务器。</p></div>}
+        <div className="privacy-note"><ShieldCheck size={14} /> {t("chat.privacy")}</div>
+        {timeline.length === 0 && <div className="conversation-empty"><span><MessageCircleMore size={31} /></span><strong>{t("chat.sayHello", { name: friend.nickname })}</strong><p>{t("chat.description")}</p></div>}
         {timeline.map((item) => item.type === "message" ? (
-          <MessageBubble key={item.message.messageId} message={item.message} transfer={transferMap.get(item.message.messageId)} busy={busyKey === `retry:${item.message.messageId}` || busyKey === `transfer:${item.message.messageId}`} onRetry={onRetry} onCancelTransfer={onCancelTransfer} />
+          <MessageBubble key={item.message.messageId} message={item.message} transfer={transferMap.get(item.message.messageId)} busy={busyKey === `retry:${item.message.messageId}` || busyKey === `transfer:${item.message.messageId}`} attachmentBusy={busyKey.startsWith(`attachment:${item.message.messageId}:`)} onRetry={onRetry} onCancelTransfer={onCancelTransfer} onOpenAttachment={onOpenAttachment} onSaveAttachment={onSaveAttachment} onRevealAttachment={onRevealAttachment} />
         ) : (
           <TransferOfferCard key={item.transfer.transferId} transfer={item.transfer} busy={busyKey === `transfer:${item.transfer.transferId}`} onResolve={onResolveTransfer} onCancel={onCancelTransfer} />
         ))}
         <div ref={bottomRef} />
       </div>
       <footer className="composer-wrap">
-        {pending && <div className="offline-banner"><WifiOff size={14} /> 对方离线，启动 Weline Localnet 后即可继续发送</div>}
+        {pending && <div className="offline-banner"><WifiOff size={14} /> {t("chat.offlineHint")}</div>}
         <div className="composer-tools">
-          <button onClick={onSendImage} disabled={pending || busyKey === "send-image"}>{busyKey === "send-image" ? <LoaderCircle size={18} className="spin" /> : <ImageIcon size={18} />}图片</button>
-          <button onClick={onSendFile} disabled={pending || busyKey === "send-file"}>{busyKey === "send-file" ? <LoaderCircle size={18} className="spin" /> : <Paperclip size={18} />}文件</button>
-          <span>Enter 发送 · Shift + Enter 换行</span>
+          <button onClick={onSendImage} disabled={pending || busyKey === "send-image"}>{busyKey === "send-image" ? <LoaderCircle size={18} className="spin" /> : <ImageIcon size={18} />}{t("common.image")}</button>
+          <button onClick={onSendFile} disabled={pending || busyKey === "send-file"}>{busyKey === "send-file" ? <LoaderCircle size={18} className="spin" /> : <Paperclip size={18} />}{t("common.file")}</button>
+          <span>{t("chat.enterHint")}</span>
         </div>
         <div className="composer">
           <textarea value={messageText} onChange={(event) => setMessageText(event.target.value)} onKeyDown={(event) => {
             if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); if (!pending && busyKey !== "send-text") onSendText(); }
-          }} placeholder={pending ? "对方当前离线" : `发消息给 ${friend.nickname}`} disabled={pending} rows={1} />
-          <button className="send-button" onClick={onSendText} disabled={pending || busyKey === "send-text" || !messageText.trim()} aria-label="发送消息">{busyKey === "send-text" ? <LoaderCircle size={19} className="spin" /> : <Send size={19} />}</button>
+          }} placeholder={pending ? t("chat.placeholderOffline") : t("chat.placeholderTo", { name: friend.nickname })} disabled={pending} rows={1} />
+          <button className="send-button" onClick={onSendText} disabled={pending || busyKey === "send-text" || !messageText.trim()} aria-label={t("common.sendMessage")}>{busyKey === "send-text" ? <LoaderCircle size={19} className="spin" /> : <Send size={19} />}</button>
         </div>
       </footer>
     </section>
   );
 }
 
-function MessageBubble({ message, transfer, busy, onRetry, onCancelTransfer }: { message: ChatMessage; transfer?: TransferRecord; busy: boolean; onRetry: (messageId: string) => void; onCancelTransfer: (transferId: string) => void }) {
+function MessageBubble({ message, transfer, busy, attachmentBusy, onRetry, onCancelTransfer, onOpenAttachment, onSaveAttachment, onRevealAttachment }: { message: ChatMessage; transfer?: TransferRecord; busy: boolean; attachmentBusy: boolean; onRetry: (messageId: string) => void; onCancelTransfer: (transferId: string) => void; onOpenAttachment: (message: ChatMessage) => void; onSaveAttachment: (message: ChatMessage) => void; onRevealAttachment: (message: ChatMessage) => void }) {
+  const { t, formatTime } = useI18n();
   const outgoing = message.direction === "outgoing";
-  const presentation = transfer ? transferStatusPresentation(transfer) : null;
+  const presentation = transfer ? transferStatusPresentation(transfer, transferStatusLabels(t)) : null;
   return (
     <div className={`message-line ${outgoing ? "outgoing" : "incoming"}`}>
       <div className={`message-bubble ${message.kind !== "text" ? "attachment-bubble" : ""}`}>
-        {message.kind === "text" ? <p>{message.body}</p> : message.kind === "image" ? <ImageMessage message={message} /> : <FileMessage message={message} />}
+        {message.kind === "text" ? <p>{message.body}</p> : message.kind === "image" ? <ImageMessage message={message} busy={attachmentBusy} onOpen={onOpenAttachment} onSaveAs={onSaveAttachment} onReveal={onRevealAttachment} /> : <FileMessage message={message} busy={attachmentBusy} onOpen={onOpenAttachment} onSaveAs={onSaveAttachment} onReveal={onRevealAttachment} />}
         {transfer && <TransferStatusDisplay transfer={transfer} />}
         <div className="message-meta"><span>{formatTime(message.createdAt)}</span>{outgoing && <MessageStatusIcon status={message.status} />}</div>
-        {message.status === "failed" && <div className="message-error"><AlertCircle size={13} /><span>{message.error || transfer?.error || "发送失败"}</span>{message.kind === "text" && <button disabled={busy} onClick={() => onRetry(message.messageId)}>{busy ? <LoaderCircle size={12} className="spin" /> : <RefreshCw size={12} />} 重试</button>}</div>}
-        {transfer && presentation?.showCancel && <button type="button" className="cancel-link" disabled={busy} onClick={() => onCancelTransfer(transfer.transferId)}>取消传输</button>}
+        {message.status === "failed" && <div className="message-error"><AlertCircle size={13} /><span>{t("chat.sendFailed")}</span>{message.kind === "text" && <button disabled={busy} onClick={() => onRetry(message.messageId)}>{busy ? <LoaderCircle size={12} className="spin" /> : <RefreshCw size={12} />} {t("common.retry")}</button>}</div>}
+        {transfer && presentation?.showCancel && <button type="button" className="cancel-link" disabled={busy} onClick={() => onCancelTransfer(transfer.transferId)}>{t("common.cancelTransfer")}</button>}
       </div>
     </div>
   );
 }
 
-function ImageMessage({ message }: { message: ChatMessage }) {
+function ImageMessage({ message, busy, onOpen, onSaveAs, onReveal }: AttachmentMessageProps) {
+  const { t } = useI18n();
   const [preview, setPreview] = useState<string | null>(null);
   useEffect(() => {
     let active = true;
     if (message.status === "delivered") void invoke<string | null>("image_preview", { messageId: message.messageId }).then((value) => active && setPreview(value)).catch(() => undefined);
     return () => { active = false; };
   }, [message.messageId, message.status]);
-  return <div className="image-message">{preview ? <img src={preview} alt={message.fileName || "收到的图片"} /> : <div className="image-placeholder"><ImageIcon size={30} /><span>{message.fileName}</span></div>}{message.status === "delivered" && message.localPath && <button onClick={() => void openPath(message.localPath!)}>打开原图</button>}</div>;
+  return <div className="image-message">{preview ? <img src={preview} alt={message.fileName || t("chat.imageAlt")} /> : <div className="image-placeholder"><ImageIcon size={30} /><span>{message.fileName}</span></div>}<AttachmentActions message={message} busy={busy} onOpen={onOpen} onSaveAs={onSaveAs} onReveal={onReveal} /></div>;
 }
 
-function FileMessage({ message }: { message: ChatMessage }) {
-  return <div className="file-message"><span className="file-icon"><File size={22} /></span><span><strong>{message.fileName || "文件"}</strong><small>{formatBytes(message.fileSize || 0)}</small></span>{message.status === "delivered" && message.localPath && <button title="打开文件" onClick={() => void openPath(message.localPath!)}><FileDown size={17} /></button>}</div>;
+function FileMessage({ message, busy, onOpen, onSaveAs, onReveal }: AttachmentMessageProps) {
+  const { t, formatBytes } = useI18n();
+  return <div className="file-message"><div className="file-summary"><span className="file-icon"><File size={22} /></span><span><strong>{message.fileName || t("common.file")}</strong><small>{formatBytes(message.fileSize || 0)}</small></span></div><AttachmentActions message={message} busy={busy} onOpen={onOpen} onSaveAs={onSaveAs} onReveal={onReveal} /></div>;
+}
+
+interface AttachmentMessageProps {
+  message: ChatMessage;
+  busy: boolean;
+  onOpen: (message: ChatMessage) => void;
+  onSaveAs: (message: ChatMessage) => void;
+  onReveal: (message: ChatMessage) => void;
+}
+
+function AttachmentActions({ message, busy, onOpen, onSaveAs, onReveal }: AttachmentMessageProps) {
+  const { t } = useI18n();
+  if (!attachmentActionState(message).available) return null;
+  return (
+    <div className="attachment-actions" role="group" aria-label={message.fileName || t("common.file")}>
+      <button type="button" disabled={busy} onClick={() => onOpen(message)} title={t("common.open")}><ExternalLink size={14} /> <span>{t("common.open")}</span></button>
+      <button type="button" disabled={busy} onClick={() => onSaveAs(message)} title={t("common.saveAs")}><FileDown size={14} /> <span>{t("common.saveAs")}</span></button>
+      <button type="button" disabled={busy} onClick={() => onReveal(message)} title={t("common.showInFolder")}><FolderOpen size={14} /> <span>{t("common.showInFolder")}</span></button>
+    </div>
+  );
 }
 
 function TransferOfferCard({ transfer, busy, onResolve, onCancel }: { transfer: TransferRecord; busy: boolean; onResolve: (transfer: TransferRecord, accepted: boolean) => void; onCancel: (transferId: string) => void }) {
+  const { t, formatBytes } = useI18n();
   const incoming = transfer.direction === "incoming";
-  const presentation = transferStatusPresentation(transfer);
-  return <div className={`message-line ${incoming ? "incoming" : "outgoing"}`}><div className={`transfer-card ${presentation.tone}`}><span className="file-icon"><FileDown size={22} /></span><span><small>{incoming ? "收到文件" : "正在发送"}</small><strong>{transfer.fileName}</strong><em>{formatBytes(transfer.fileSize)}</em></span>{incoming && transfer.status === "awaitingAcceptance" ? <div className="transfer-actions"><button type="button" disabled={busy} onClick={() => onResolve(transfer, false)}>拒绝</button><button type="button" className="primary" disabled={busy} onClick={() => onResolve(transfer, true)}>{busy ? <LoaderCircle size={14} className="spin" /> : <FileDown size={14} />} 接收</button></div> : <><TransferStatusDisplay transfer={transfer} />{presentation.showCancel && <button type="button" className="cancel-link" disabled={busy} onClick={() => onCancel(transfer.transferId)}>取消传输</button>}</>}</div></div>;
+  const presentation = transferStatusPresentation(transfer, transferStatusLabels(t));
+  return <div className={`message-line ${incoming ? "incoming" : "outgoing"}`}><div className={`transfer-card ${presentation.tone}`}><span className="file-icon"><FileDown size={22} /></span><span><small>{incoming ? t("chat.receivedFile") : t("chat.sendingFile")}</small><strong>{transfer.fileName}</strong><em>{formatBytes(transfer.fileSize)}</em></span>{incoming && transfer.status === "awaitingAcceptance" ? <div className="transfer-actions"><button type="button" disabled={busy} onClick={() => onResolve(transfer, false)}>{t("common.reject")}</button><button type="button" className="primary" disabled={busy} onClick={() => onResolve(transfer, true)}>{busy ? <LoaderCircle size={14} className="spin" /> : <FileDown size={14} />} {t("common.receive")}</button></div> : <><TransferStatusDisplay transfer={transfer} />{presentation.showCancel && <button type="button" className="cancel-link" disabled={busy} onClick={() => onCancel(transfer.transferId)}>{t("common.cancelTransfer")}</button>}</>}</div></div>;
 }
 
 function TransferStatusDisplay({ transfer }: { transfer: TransferRecord }) {
-  const presentation = transferStatusPresentation(transfer);
+  const { t } = useI18n();
+  const presentation = transferStatusPresentation(transfer, transferStatusLabels(t));
   return <div className={`transfer-progress ${transfer.status} ${presentation.tone}`} role="status" aria-live={transfer.status === "paused" ? "polite" : undefined}>{presentation.showProgress && <div role="progressbar" aria-label={presentation.label} aria-valuemin={0} aria-valuemax={100} aria-valuenow={presentation.percent} aria-valuetext={presentation.label}><span style={{ width: `${presentation.percent}%` }} /></div>}<small>{presentation.label}</small></div>;
 }
 
@@ -664,16 +779,21 @@ function Avatar({ name, online, large }: { name: string; online: boolean; large?
 }
 
 function WelcomePanel({ nearbyCount, friendCount }: { nearbyCount: number; friendCount: number }) {
-  return <section className="welcome-panel"><div className="welcome-art"><span className="pulse pulse-one" /><span className="pulse pulse-two" /><span className="welcome-logo"><MessageCircleMore size={40} /></span></div><p className="eyebrow">LOCAL · PRIVATE · FAST</p><h1>和身边的人直接连接</h1><p>Weline Localnet 会自动发现同一内网中的用户。添加好友后，即可发送文字、图片和文件。</p><div className="welcome-stats"><span><Wifi size={18} /><strong>{nearbyCount}</strong><small>附近在线</small></span><span><UsersRound size={18} /><strong>{friendCount}</strong><small>我的好友</small></span><span><ShieldCheck size={18} /><strong>本地</strong><small>数据传输</small></span></div></section>;
+  const { t } = useI18n();
+  return <section className="welcome-panel"><div className="welcome-art"><span className="pulse pulse-one" /><span className="pulse pulse-two" /><span className="welcome-logo"><MessageCircleMore size={40} /></span></div><p className="eyebrow">{t("app.localPrivateFast")}</p><h1>{t("welcome.title")}</h1><p>{t("welcome.description")}</p><div className="welcome-stats"><span><Wifi size={18} /><strong>{nearbyCount}</strong><small>{t("welcome.nearbyOnline")}</small></span><span><UsersRound size={18} /><strong>{friendCount}</strong><small>{t("welcome.myFriends")}</small></span><span><ShieldCheck size={18} /><strong>{t("common.local")}</strong><small>{t("welcome.localTransfer")}</small></span></div></section>;
 }
 
-function Onboarding({ busy, onSubmit }: { busy: boolean; onSubmit: (nickname: string) => Promise<void> }) {
+function Onboarding({ busy, languageBusy, onLanguageChange, onSubmit }: { busy: boolean; languageBusy: boolean; onLanguageChange: (preference: LanguagePreference) => Promise<void>; onSubmit: (nickname: string) => Promise<void> }) {
+  const { t, preference, localeOptions } = useI18n();
   const [nickname, setNickname] = useState("");
-  return <main className="onboarding-screen"><section className="onboarding-card"><div className="onboarding-copy"><span className="brand-mark large"><MessageCircleMore size={30} /></span><p className="eyebrow">欢迎使用 WELINE LOCALNET</p><h1>无需服务器，直接和内网用户连接。</h1><p>设置一个昵称，其他 Weline Localnet 用户就能在附近列表中发现你。</p><ul><li><Wifi size={17} /> 自动发现同一局域网用户</li><li><ShieldCheck size={17} /> 设备身份保存在本机</li><li><Paperclip size={17} /> 文字、图片和文件直传</li></ul></div><form className="nickname-form" onSubmit={(event) => { event.preventDefault(); if (nickname.trim()) void onSubmit(nickname); }}><span className="form-icon"><CircleUserRound size={25} /></span><h2>你希望别人怎么称呼你？</h2><p>昵称只会显示给同一内网中的 Weline Localnet 用户。</p><label>昵称<input autoFocus maxLength={32} value={nickname} onChange={(event) => setNickname(event.target.value)} placeholder="例如：小林" /></label><button className="primary-button" disabled={busy || !nickname.trim()}>{busy ? <LoaderCircle size={18} className="spin" /> : <Wifi size={18} />}{busy ? "正在启动…" : "进入 Weline Localnet"}</button><small><ShieldCheck size={13} /> 不需要账号、手机号或互联网连接</small></form></section></main>;
+  return <main className="onboarding-screen"><section className="onboarding-card"><div className="onboarding-copy"><span className="brand-mark large"><MessageCircleMore size={30} /></span><p className="eyebrow">{t("onboarding.eyebrow")}</p><h1>{t("onboarding.title")}</h1><p>{t("onboarding.description")}</p><ul><li><Wifi size={17} /> {t("onboarding.discovery")}</li><li><ShieldCheck size={17} /> {t("onboarding.identity")}</li><li><Paperclip size={17} /> {t("onboarding.transfer")}</li></ul></div><form className="nickname-form" onSubmit={(event) => { event.preventDefault(); if (nickname.trim()) void onSubmit(nickname); }}><span className="form-icon"><CircleUserRound size={25} /></span><h2>{t("onboarding.question")}</h2><p>{t("onboarding.nicknamePrivacy")}</p><label>{t("common.language")}<select value={preference} disabled={languageBusy} onChange={(event) => void onLanguageChange(event.target.value as LanguagePreference)}><option value="auto">{t("common.systemDefault")}</option>{localeOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label><label>{t("onboarding.nickname")}<input autoFocus maxLength={32} value={nickname} onChange={(event) => setNickname(event.target.value)} placeholder={t("onboarding.nicknameExample")} /></label><button className="primary-button" disabled={busy || !nickname.trim()}>{busy ? <LoaderCircle size={18} className="spin" /> : <Wifi size={18} />}{busy ? t("onboarding.starting") : t("onboarding.enter")}</button><small><ShieldCheck size={13} /> {t("onboarding.noAccount")}</small></form></section></main>;
 }
 
-function ProfileDialog({ profile, transferPreferences, busy, directoryBusy, notificationBusy, notificationPermission, appVersion, updateChecking, updateStatus, onCheckUpdates, onEnableNotifications, onChooseDirectory, onOpenDirectory, onClose, onSave }: {
+function ProfileDialog({ profile, languagePreference, languageBusy, onLanguageChange, transferPreferences, busy, directoryBusy, notificationBusy, notificationPermission, appVersion, updateChecking, updateStatus, onCheckUpdates, onEnableNotifications, onChooseDirectory, onOpenDirectory, onClose, onSave }: {
   profile: LocalProfile;
+  languagePreference: LanguagePreference;
+  languageBusy: boolean;
+  onLanguageChange: (preference: LanguagePreference) => Promise<void>;
   transferPreferences: TransferPreferences;
   busy: boolean;
   directoryBusy: boolean;
@@ -689,6 +809,7 @@ function ProfileDialog({ profile, transferPreferences, busy, directoryBusy, noti
   onClose: () => void;
   onSave: (nickname: string, transferPreferences: TransferPreferences) => Promise<void>;
 }) {
+  const { t, localeOptions } = useI18n();
   const [nickname, setNickname] = useState(profile.nickname);
   const [autoReceiveFiles, setAutoReceiveFiles] = useState(transferPreferences.autoReceiveFiles);
   const [receiveDirectory, setReceiveDirectory] = useState(transferPreferences.receiveDirectory);
@@ -700,88 +821,110 @@ function ProfileDialog({ profile, transferPreferences, busy, directoryBusy, noti
   return (
     <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
       <form className="dialog-card settings-dialog" role="dialog" aria-modal="true" aria-labelledby="profile-title" onSubmit={(event) => { event.preventDefault(); if (nickname.trim() && (!autoReceiveFiles || receiveDirectory.trim())) void onSave(nickname, { autoReceiveFiles, receiveDirectory }); }}>
-        <button type="button" className="dialog-close" onClick={onClose}><X size={18} /></button>
+        <button type="button" className="dialog-close" onClick={onClose} aria-label={t("common.close")}><X size={18} /></button>
         <Avatar name={nickname || profile.nickname} online large />
-        <h2 id="profile-title">本机设置</h2>
-        <p>管理附近用户看到的昵称，以及文件接收方式。</p>
-        <label>昵称<input autoFocus maxLength={32} value={nickname} onChange={(event) => setNickname(event.target.value)} /></label>
-        <div className="device-id"><Monitor size={15} /><span><small>设备身份</small><code>{shortPeerId(profile.peerId)}</code></span></div>
+        <h2 id="profile-title">{t("settings.title")}</h2>
+        <p>{t("settings.description")}</p>
+        <label>{t("common.language")}<select value={languagePreference} disabled={languageBusy} onChange={(event) => void onLanguageChange(event.target.value as LanguagePreference)}><option value="auto">{t("common.systemDefault")}</option>{localeOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
+        <label>{t("onboarding.nickname")}<input autoFocus maxLength={32} value={nickname} onChange={(event) => setNickname(event.target.value)} /></label>
+        <div className="device-id"><Monitor size={15} /><span><small>{t("settings.deviceIdentity")}</small><code>{shortPeerId(profile.peerId)}</code></span></div>
         <div className="auto-receive-setting">
           <FileDown size={17} />
-          <span><strong>自动接收好友文件</strong><small>仅自动接收已添加好友发送的图片和文件。</small></span>
-          <button type="button" className={autoReceiveFiles ? "enabled" : ""} role="switch" aria-checked={autoReceiveFiles} aria-label="自动接收好友文件" onClick={() => setAutoReceiveFiles((enabled) => !enabled)}><i /></button>
+          <span><strong>{t("settings.autoReceive")}</strong><small>{t("settings.autoReceiveDescription")}</small></span>
+          <button type="button" className={autoReceiveFiles ? "enabled" : ""} role="switch" aria-checked={autoReceiveFiles} aria-label={t("settings.autoReceive")} onClick={() => setAutoReceiveFiles((enabled) => !enabled)}><i /></button>
         </div>
         <div className="receive-directory-setting">
           <FolderOpen size={17} />
-          <span><strong>文件接收位置</strong><code title={receiveDirectory}>{receiveDirectory}</code></span>
+          <span><strong>{t("settings.receiveLocation")}</strong><code title={receiveDirectory}>{receiveDirectory}</code></span>
           <div>
-            <button type="button" disabled={!receiveDirectory || directoryBusy} onClick={() => void onOpenDirectory(receiveDirectory)} title="打开接收文件夹">{directoryBusy ? "打开中…" : "打开"}</button>
-            <button type="button" onClick={() => void chooseDirectory()}>更改</button>
+            <button type="button" disabled={!receiveDirectory || directoryBusy} onClick={() => void onOpenDirectory(receiveDirectory)} title={t("settings.openReceiveFolder")}>{directoryBusy ? t("common.opening") : t("common.open")}</button>
+            <button type="button" onClick={() => void chooseDirectory()}>{t("common.change")}</button>
           </div>
         </div>
         <div className="notification-setting">
           <BellRing size={17} />
-          <span><strong>系统通知</strong><small>显示好友申请和文件接收完成提醒；拒绝授权不影响应用内提示。</small></span>
+          <span><strong>{t("settings.notifications")}</strong><small>{t("settings.notificationsDescription")}</small></span>
           <button type="button" disabled={notificationBusy || notificationEnabled} onClick={() => void onEnableNotifications()}>
             {notificationBusy ? <LoaderCircle size={13} className="spin" /> : notificationEnabled ? <Check size={13} /> : null}
-            {notificationEnabled ? "已开启" : notificationPermission === "denied" ? "重新授权" : "开启"}
+            {notificationEnabled ? t("settings.notificationsEnabled") : notificationPermission === "denied" ? t("settings.notificationsAuthorizeAgain") : t("settings.notificationsEnable")}
           </button>
         </div>
         <div className="update-setting">
           <RefreshCw size={17} />
           <span><strong>Weline Localnet {appVersion ? `v${appVersion}` : ""}</strong><small>{updateStatus}</small></span>
           <button type="button" disabled={updateChecking} onClick={() => void onCheckUpdates()}>
-            {updateChecking && <LoaderCircle size={13} className="spin" />}{updateChecking ? "检查中…" : "检查更新"}
+            {updateChecking && <LoaderCircle size={13} className="spin" />}{updateChecking ? t("settings.checkingUpdates") : t("settings.checkUpdates")}
           </button>
         </div>
         <div className="about-setting">
           <Building2 size={17} />
-          <span><strong>成都阿玛云科技有限公司</strong><button type="button" onClick={() => void openUrl("mailto:contact@amayum.com")}><Mail size={12} /> contact@amayum.com</button></span>
+          <span><strong>{t("settings.company")}</strong><button type="button" onClick={() => void openUrl("mailto:contact@amayum.com")}><Mail size={12} /> contact@amayum.com</button></span>
         </div>
-        <button className="primary-button" disabled={busy || !nickname.trim() || (autoReceiveFiles && !receiveDirectory.trim())}>{busy && <LoaderCircle size={16} className="spin" />} 保存设置</button>
+        <button className="primary-button" disabled={busy || !nickname.trim() || (autoReceiveFiles && !receiveDirectory.trim())}>{busy && <LoaderCircle size={16} className="spin" />} {t("settings.save")}</button>
       </form>
     </div>
   );
 }
 
-function BootScreen() { return <main className="boot-screen"><section className="boot-card"><div className="boot-mark"><MessageCircleMore size={34} /></div><p className="eyebrow">LOCAL · PRIVATE · FAST</p><h1>Weline Localnet</h1><p>正在准备你的局域网通信空间…</p><div className="loading-track"><span /></div></section></main>; }
-function FatalScreen({ message, onRetry }: { message: string; onRetry: () => void }) { return <main className="boot-screen"><section className="boot-card fatal-card"><div className="boot-mark error"><AlertCircle size={32} /></div><h1>Weline Localnet 无法启动</h1><p>{message}</p><button className="primary-button" onClick={onRetry}><RefreshCw size={17} /> 重试</button></section></main>; }
+function BootScreen() { const { t } = useI18n(); return <main className="boot-screen"><section className="boot-card"><div className="boot-mark"><MessageCircleMore size={34} /></div><p className="eyebrow">{t("app.localPrivateFast")}</p><h1>Weline Localnet</h1><p>{t("boot.preparing")}</p><div className="loading-track"><span /></div></section></main>; }
+function FatalScreen({ message, onRetry }: { message: string; onRetry: () => void }) { const { t } = useI18n(); return <main className="boot-screen"><section className="boot-card fatal-card"><div className="boot-mark error"><AlertCircle size={32} /></div><h1>{t("boot.failedTitle")}</h1><p>{message}</p><button className="primary-button" onClick={onRetry}><RefreshCw size={17} /> {t("common.retry")}</button></section></main>; }
 function Toast({ toast, onClose }: { toast: ToastState; onClose: () => void }) { return <div className={`toast ${toast.tone}`} role="status">{toast.tone === "success" ? <Check size={17} /> : toast.tone === "error" ? <AlertCircle size={17} /> : <Wifi size={17} />}<span>{toast.message}</span><button onClick={onClose}><X size={14} /></button></div>; }
 
-function errorMessage(error: unknown): string {
-  if (typeof error === "string") return error;
-  if (error && typeof error === "object") {
-    if ("message" in error && typeof error.message === "string") return error.message;
-    try { return JSON.stringify(error); } catch { return "操作失败，请稍后重试"; }
-  }
-  return "操作失败，请稍后重试";
-}
-async function notifyIncomingFriendRequest(request: FriendRequest): Promise<void> {
+async function notifyIncomingFriendRequest(request: FriendRequest, t: Translator): Promise<void> {
   try {
     if (await getCurrentWindow().isFocused() || !(await isPermissionGranted())) return;
     sendNotification({
       title: "Weline Localnet",
-      body: `${request.nickname} 想添加你为好友。打开 Weline Localnet 接受或拒绝。`,
+      body: t("notifications.friendRequestBody", { name: request.nickname }),
     });
   } catch (error) {
     console.debug("Native friend-request notification unavailable", error);
   }
 }
-async function notifyIncomingTransfer(transfer: TransferRecord): Promise<void> {
+async function notifyIncomingTransfer(transfer: TransferRecord, t: Translator): Promise<void> {
   try {
     if (await getCurrentWindow().isFocused() || !(await isPermissionGranted())) return;
     sendNotification({
       title: "Weline Localnet",
-      body: `${transfer.fileName} 已接收完成。`,
+      body: t("notifications.fileReceivedBody", { name: transfer.fileName }),
     });
   } catch (error) {
     console.debug("Native file-received notification unavailable", error);
   }
 }
-function platformLabel(platform: Platform): string { return platform === "windows" ? "Windows" : platform === "macos" ? "macOS" : "桌面设备"; }
+function platformLabel(platform: Platform, t: Translator): string { return platform === "windows" ? "Windows" : platform === "macos" ? "macOS" : t("common.desktopDevice"); }
 function shortPeerId(peerId: string): string { return peerId.length > 20 ? `${peerId.slice(0, 9)}…${peerId.slice(-7)}` : peerId; }
-function formatTime(value: string): string { const date = new Date(value); return Number.isNaN(date.getTime()) ? "" : date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }); }
-function relativeTime(value: string): string { const milliseconds = Date.now() - new Date(value).getTime(); if (!Number.isFinite(milliseconds) || milliseconds < 60_000) return "刚刚"; const minutes = Math.floor(milliseconds / 60_000); if (minutes < 60) return `${minutes} 分钟前`; const hours = Math.floor(minutes / 60); return hours < 24 ? `${hours} 小时前` : `${Math.floor(hours / 24)} 天前`; }
-function formatBytes(bytes: number): string { if (bytes < 1024) return `${bytes} B`; if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KiB`; if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MiB`; return `${(bytes / 1024 ** 3).toFixed(2)} GiB`; }
 
-createRoot(document.getElementById("root")!).render(<StrictMode><App /></StrictMode>);
+type Translator = (key: TranslationKey, params?: Record<string, string | number>) => string;
+
+function localizedError(error: unknown, t: Translator): string {
+  if (error && typeof error === "object" && "code" in error && typeof error.code === "string") {
+    const knownCodes = new Set([
+      "invalid_input", "storage_error", "identity_error", "network_error", "permission_error",
+      "update_error", "peer_offline", "not_friend", "incompatible_protocol", "integrity_failure",
+      "destination_preflight_error", "io_error",
+    ]);
+    if (knownCodes.has(error.code)) return t(`errors.${error.code}` as TranslationKey);
+  }
+  return t("common.operationFailed");
+}
+
+function transferStatusLabels(t: Translator): TransferStatusLabels {
+  return {
+    awaitingAcceptanceIncoming: t("transfer.waitingConfirm"),
+    awaitingAcceptanceOutgoing: t("transfer.waitingPeer"),
+    transferring: (percent) => t("transfer.inProgress", { percent }),
+    paused: t("transfer.paused"),
+    destinationDirectoryUnavailable: t("transfer.destinationDirectoryUnavailable"),
+    destinationPermissionDenied: t("transfer.destinationPermissionDenied"),
+    destinationInsufficientSpace: t("transfer.destinationInsufficientSpace"),
+    destinationFilesystemLimit: t("transfer.destinationFilesystemLimit"),
+    destinationUnsupportedFilesystem: t("transfer.destinationUnsupportedFilesystem"),
+    destinationFileTooLarge: t("transfer.destinationFileTooLarge"),
+    completed: t("transfer.completed"),
+    cancelled: t("transfer.cancelled"),
+    failed: t("transfer.failed"),
+  };
+}
+
+createRoot(document.getElementById("root")!).render(<StrictMode><I18nProvider><App /></I18nProvider></StrictMode>);

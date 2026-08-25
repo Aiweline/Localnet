@@ -52,6 +52,9 @@ jobs:
       - name: Run client experience regression tests
         run: node --test --experimental-strip-types tests/discovery-refresh.test.ts tests/notifications.test.ts tests/update.test.ts
 
+      - name: Run localization and attachment regression tests
+        run: node --test --experimental-strip-types tests/i18n.test.ts tests/file-actions.test.ts tests/macos-localizations.test.mjs
+
       - name: Set up Ruby for release workflow validation
         uses: ruby/setup-ruby@v1
         with:
@@ -126,6 +129,24 @@ jobs:
           $setups = @(Get-ChildItem -LiteralPath "src-tauri/target/release/bundle/nsis" -File -Filter "*_${version}_x64-setup.exe")
           if ($setups.Count -ne 1) {
             throw "Expected exactly one Windows setup package for $version; found $($setups.Count)"
+          }
+
+          $installerScripts = @(Get-ChildItem -LiteralPath "src-tauri/target/release" -Recurse -File -Filter "installer.nsi")
+          if ($installerScripts.Count -ne 1) {
+            throw "Expected exactly one generated installer.nsi; found $($installerScripts.Count)"
+          }
+          $installerText = Get-Content -Raw -LiteralPath $installerScripts[0].FullName
+          if ($installerText -notmatch '!define DISPLAYLANGUAGESELECTOR "true"') {
+            throw "Generated installer does not enable the language selector"
+          }
+          $expectedLanguages = @("English", "SimpChinese", "Spanish", "French", "German", "PortugueseBR", "Russian", "Japanese", "Korean", "Arabic")
+          $actualLanguages = @([regex]::Matches($installerText, '!insertmacro MUI_LANGUAGE "([^"]+)"') | ForEach-Object { $_.Groups[1].Value })
+          if (Compare-Object -ReferenceObject $expectedLanguages -DifferenceObject $actualLanguages -SyncWindow 0) {
+            throw "Generated installer languages do not match the supported ten-language contract: $($actualLanguages -join ', ')"
+          }
+          $installerHooks = Get-Content -Raw -LiteralPath "src-tauri/windows/installer-hooks.nsh"
+          if ($installerHooks -notmatch 'MUI_LANGDLL_ALWAYSSHOW' -or $installerHooks -notmatch 'installer-locale') {
+            throw "Installer must always show language selection and persist the chosen app locale"
           }
 
           $portable = Get-Item -LiteralPath "src-tauri/target/release/localnet.exe"
@@ -226,6 +247,12 @@ jobs:
           test "$bundle_version" = "$version"
           test -n "$local_network_description"
           test "$bonjour_service" = "_p2p._udp"
+          for locale in en.lproj zh-Hans.lproj es.lproj fr.lproj de.lproj pt-BR.lproj ru.lproj ja.lproj ko.lproj ar.lproj; do
+            localized="$app_path/Contents/Resources/$locale/InfoPlist.strings"
+            test -s "$localized"
+            plutil -lint "$localized" >/dev/null
+            grep -Eq '^"NSLocalNetworkUsageDescription" = ".+";$' "$localized"
+          done
           [[ "$archs" == *arm64* ]]
           [[ "$archs" == *x86_64* ]]
 
