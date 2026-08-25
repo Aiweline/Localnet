@@ -7,8 +7,11 @@ use crate::error::AppError;
 
 pub const MAX_NICKNAME_CHARS: usize = 32;
 pub const MAX_TEXT_BYTES: usize = 16 * 1024;
-pub const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const PROTOCOL_VERSION: u16 = 1;
+
+pub const fn default_transfer_protocol() -> u8 {
+    1
+}
 
 macro_rules! string_enum {
     ($name:ident { $($variant:ident => $value:literal),+ $(,)? }) => {
@@ -94,6 +97,7 @@ string_enum!(TransferKind {
 string_enum!(TransferStatus {
     AwaitingAcceptance => "awaitingAcceptance",
     Transferring => "transferring",
+    Paused => "paused",
     Completed => "completed",
     Cancelled => "cancelled",
     Failed => "failed",
@@ -116,6 +120,8 @@ pub struct PeerSummary {
     pub platform: Platform,
     pub online: bool,
     pub protocol_version: u16,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
     pub last_seen: String,
 }
 
@@ -174,6 +180,20 @@ pub struct TransferRecord {
     pub destination_reserved: bool,
     #[serde(default, skip_serializing)]
     pub reservation_token: Option<String>,
+    #[serde(default = "default_transfer_protocol")]
+    pub transfer_protocol: u8,
+    #[serde(default)]
+    pub chunk_size: u32,
+    #[serde(default)]
+    pub chunk_count: u32,
+    #[serde(default)]
+    pub manifest_sha256: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub partial_path: Option<String>,
+    #[serde(default)]
+    pub source_modified_ns: Option<u64>,
+    #[serde(default, skip_serializing)]
+    pub send_claimed: bool,
     pub transferred_bytes: u64,
     pub status: TransferStatus,
     pub error: Option<String>,

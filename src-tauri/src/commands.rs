@@ -3,6 +3,7 @@ use std::{
     io::{BufReader, Read},
     path::{Path, PathBuf},
     str::FromStr,
+    sync::{Arc, Mutex},
 };
 
 use base64::Engine as _;
@@ -13,14 +14,21 @@ use tauri::{AppHandle, State};
 use crate::{
     domain::{
         BootstrapSnapshot, ChatMessage, Direction, Friend, FriendRequest, FriendRequestStatus,
-        LocalProfile, MAX_FILE_BYTES, MessageKind, MessageStatus, PROTOCOL_VERSION, Platform,
-        PresenceSnapshot, TransferKind, TransferPreferences, TransferRecord, TransferStatus,
-        now_rfc3339, validate_nickname, validate_text,
+        LocalProfile, MessageKind, MessageStatus, PROTOCOL_VERSION, Platform, PresenceSnapshot,
+        TransferKind, TransferPreferences, TransferRecord, TransferStatus, now_rfc3339,
+        validate_nickname, validate_text,
     },
     error::AppError,
     network::NetworkCommand,
-    receive_paths::{ensure_writable_directory, remove_owned_reservation, reserve_receive_path},
+    receive_paths::{
+        ensure_writable_directory, preflight_receive_directory, remove_owned_reservation,
+        reserve_receive_path,
+    },
     state::AppState,
+    storage::Storage,
+    transfer_manifest::{TransferChunk, build_manifest_from_snapshot, capture_source_snapshot},
+    transfer_policy::{TRANSFER_CHUNK_BYTES, TransferProtocol, select_transfer_protocol},
+    volume_preflight::sanitize_destination_preflight_error,
 };
 
 #[tauri::command]
@@ -283,14 +291,17 @@ pub async fn send_file(
     state: State<'_, AppState>,
 ) -> Result<TransferRecord, AppError> {
     validate_peer_id(&peer_id, state.identity.peer_id_string().as_str())?;
-    require_online_peer(&peer_id, &state)?;
+    let peer = require_online_peer(&peer_id, &state)?;
     if !state.storage.is_friend(&peer_id)? {
         return Err(AppError::NotFriend);
     }
     let kind = TransferKind::from_str(&kind)?;
-    let source = tauri::async_runtime::spawn_blocking(move || prepare_source(&path, kind))
-        .await
-        .map_err(|error| AppError::Io(std::io::Error::other(error.to_string())))??;
+    let capabilities = peer.capabilities;
+    let source = tauri::async_runtime::spawn_blocking(move || {
+        prepare_source(&path, kind, capabilities.as_slice())
+    })
+    .await
+    .map_err(|error| AppError::Io(std::io::Error::other(error.to_string())))??;
     let now = now_rfc3339();
     let transfer_id = uuid::Uuid::now_v7().to_string();
     let transfer = TransferRecord {
@@ -305,6 +316,13 @@ pub async fn send_file(
         local_path: Some(source.path.to_string_lossy().into_owned()),
         destination_reserved: false,
         reservation_token: None,
+        transfer_protocol: source.transfer_protocol,
+        chunk_size: source.chunk_size,
+        chunk_count: source.chunk_count,
+        manifest_sha256: source.manifest_sha256,
+        partial_path: None,
+        source_modified_ns: source.source_modified_ns,
+        send_claimed: false,
         transferred_bytes: 0,
         status: TransferStatus::AwaitingAcceptance,
         error: None,
@@ -327,7 +345,13 @@ pub async fn send_file(
         error: None,
         created_at: now,
     };
-    state.storage.upsert_transfer(&transfer)?;
+    if transfer.transfer_protocol == TransferProtocol::ResumableV2 as u8 {
+        state
+            .storage
+            .create_outgoing_transfer_with_manifest(&transfer, &source.chunks)?;
+    } else {
+        state.storage.upsert_transfer(&transfer)?;
+    }
     state.storage.insert_message(&message)?;
     if let Err(error) = state
         .network()?
@@ -349,11 +373,10 @@ pub async fn send_file(
 }
 
 #[tauri::command]
-pub fn resolve_transfer(
+pub async fn resolve_transfer(
     transfer_id: String,
     accepted: bool,
     save_path: Option<String>,
-    app_handle: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<TransferRecord, AppError> {
     uuid::Uuid::parse_str(&transfer_id)
@@ -371,6 +394,8 @@ pub fn resolve_transfer(
     }
     require_online_peer(&transfer.peer_id, &state)?;
     if accepted {
+        let (completion_sender, completion_receiver) = tokio::sync::oneshot::channel();
+        let completion = Arc::new(Mutex::new(Some(completion_sender)));
         let path = save_path
             .filter(|path| !path.trim().is_empty())
             .map(PathBuf::from)
@@ -380,52 +405,49 @@ pub fn resolve_transfer(
                 "文件保存位置必须是绝对路径".to_string(),
             ));
         }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let reservation_token = uuid::Uuid::new_v4().to_string();
-        reserve_receive_path(&path, &transfer.transfer_id, &reservation_token).map_err(
-            |error| {
-                if error.kind() == std::io::ErrorKind::AlreadyExists {
-                    AppError::InvalidInput("保存位置已经存在同名文件，请重新选择".to_string())
-                } else {
-                    AppError::Permission(format!("无法占用文件保存位置，请重新选择：{error}"))
-                }
+        transfer = accept_incoming_transfer_with_preflight(
+            &state.storage,
+            &transfer,
+            &path,
+            &preflight_receive_directory,
+            &mut |accepted| {
+                state.network()?.try_send(NetworkCommand::ResolveTransfer {
+                    peer_id: accepted.peer_id.clone(),
+                    transfer_id: accepted.transfer_id.clone(),
+                    accepted: true,
+                    completion: Some(completion.clone()),
+                })
             },
         )?;
-        transfer.local_path = Some(path.to_string_lossy().into_owned());
-        transfer.destination_reserved = true;
-        transfer.reservation_token = Some(reservation_token);
-        transfer.status = TransferStatus::Transferring;
-        transfer.error = None;
-        transfer.updated_at = now_rfc3339();
-        match state.storage.try_accept_incoming_transfer(&transfer) {
-            Ok(true) => {}
-            Ok(false) => {
-                if let (Some(path), Some(token)) = (
-                    transfer.local_path.as_deref(),
-                    transfer.reservation_token.as_deref(),
-                ) {
-                    let _ = remove_owned_reservation(Path::new(path), &transfer.transfer_id, token);
-                }
-                return Err(AppError::InvalidInput(
-                    "这次文件传输已经处理，请刷新后查看".to_string(),
-                ));
+        match completion_receiver.await {
+            Ok(Ok(())) => {
+                return state
+                    .storage
+                    .get_transfer(&transfer.transfer_id)?
+                    .ok_or_else(|| AppError::Storage("接收确认提交后传输记录不存在".to_string()));
             }
+            Ok(Err(message)) => return Err(AppError::Network(message)),
             Err(error) => {
-                if let (Some(path), Some(token)) = (
-                    transfer.local_path.as_deref(),
-                    transfer.reservation_token.as_deref(),
-                ) {
-                    let _ = remove_owned_reservation(Path::new(path), &transfer.transfer_id, token);
+                let message = format!("接收确认未提交，请重新确认：{error}");
+                if state
+                    .storage
+                    .pending_incoming_decision_token(&transfer.transfer_id)?
+                    .is_none()
+                {
+                    crate::network::return_pending_incoming_decision_to_manual(
+                        &transfer.transfer_id,
+                        &state.storage,
+                        message.clone(),
+                    )?;
                 }
-                return Err(error);
+                return Err(AppError::Network(message));
             }
         }
     } else {
         if !state.storage.try_cancel_unclaimed_incoming_transfer(
             &transfer.transfer_id,
             &transfer.peer_id,
+            transfer.transfer_protocol,
             "你拒绝了这次传输",
         )? {
             return Err(AppError::InvalidInput(
@@ -471,6 +493,7 @@ pub fn resolve_transfer(
         peer_id: transfer.peer_id.clone(),
         transfer_id: transfer_id.clone(),
         accepted,
+        completion: None,
     }) {
         if transfer.destination_reserved {
             if let (Some(path), Some(token)) = (
@@ -498,13 +521,6 @@ pub fn resolve_transfer(
         state.storage.upsert_transfer(&transfer)?;
         return Err(error);
     }
-    if accepted {
-        crate::network::spawn_incoming_start_timeout(
-            transfer.transfer_id.clone(),
-            state.storage.clone(),
-            app_handle,
-        );
-    }
     Ok(transfer)
 }
 
@@ -513,36 +529,69 @@ pub fn cancel_transfer(
     transfer_id: String,
     state: State<'_, AppState>,
 ) -> Result<TransferRecord, AppError> {
-    let mut transfer = state
-        .storage
-        .get_transfer(&transfer_id)?
+    let transfer = cancel_transfer_locally(&state.storage, &transfer_id)?;
+    if transfer.transfer_protocol == TransferProtocol::ResumableV2 as u8 {
+        if let Ok(network) = state.network() {
+            let _ = network.try_send(NetworkCommand::FlushTerminalNotifications {
+                peer_id: transfer.peer_id.clone(),
+            });
+        }
+    } else {
+        state.network()?.try_send(NetworkCommand::CancelTransfer {
+            peer_id: transfer.peer_id.clone(),
+            transfer_id,
+        })?;
+    }
+    Ok(transfer)
+}
+
+fn cancel_transfer_locally(
+    storage: &Storage,
+    transfer_id: &str,
+) -> Result<TransferRecord, AppError> {
+    let transfer = storage
+        .get_transfer(transfer_id)?
         .ok_or_else(|| AppError::InvalidInput("找不到这次文件传输".to_string()))?;
-    if transfer.direction != Direction::Outgoing
-        || transfer.status != TransferStatus::AwaitingAcceptance
+    let cancelled = if transfer.transfer_protocol == TransferProtocol::ResumableV2 as u8 {
+        match transfer.direction {
+            Direction::Outgoing => storage.try_cancel_unclaimed_outgoing_transfer(
+                &transfer.transfer_id,
+                &transfer.peer_id,
+                "你取消了传输",
+            )?,
+            Direction::Incoming => storage.try_cancel_unclaimed_incoming_transfer(
+                &transfer.transfer_id,
+                &transfer.peer_id,
+                transfer.transfer_protocol,
+                "你取消了传输",
+            )?,
+        }
+    } else if transfer.direction == Direction::Outgoing
+        && transfer.status == TransferStatus::AwaitingAcceptance
     {
+        storage.try_transition_outgoing_awaiting(
+            &transfer.transfer_id,
+            &transfer.peer_id,
+            TransferStatus::Cancelled,
+            Some("你取消了传输"),
+        )?
+    } else {
+        false
+    };
+    if !cancelled {
         return Err(AppError::InvalidInput("当前传输不能取消".to_string()));
     }
-    if !state.storage.try_transition_outgoing_awaiting(
-        &transfer.transfer_id,
-        &transfer.peer_id,
-        TransferStatus::Cancelled,
-        Some("你取消了传输"),
-    )? {
-        return Err(AppError::InvalidInput("当前传输不能取消".to_string()));
-    }
-    transfer = state
-        .storage
+
+    let transfer = storage
         .get_transfer(&transfer.transfer_id)?
         .ok_or_else(|| AppError::InvalidInput("找不到这次文件传输".to_string()))?;
-    state.storage.update_message_status(
-        &transfer.transfer_id,
-        MessageStatus::Failed,
-        transfer.error.as_deref(),
-    )?;
-    state.network()?.try_send(NetworkCommand::CancelTransfer {
-        peer_id: transfer.peer_id.clone(),
-        transfer_id,
-    })?;
+    if transfer.direction == Direction::Outgoing {
+        storage.update_message_status(
+            &transfer.transfer_id,
+            MessageStatus::Failed,
+            transfer.error.as_deref(),
+        )?;
+    }
     Ok(transfer)
 }
 
@@ -620,6 +669,106 @@ fn prepare_receive_directory(
         .map_err(|error| AppError::Permission(format!("文件接收目录不可写，请重新选择：{error}")))
 }
 
+fn reserve_manual_receive_destination(
+    path: &Path,
+    transfer_id: &str,
+    reservation_token: &str,
+) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "接收文件保存位置无效")
+    })?;
+    if !parent.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "接收目录或磁盘当前不可用",
+        ));
+    }
+    reserve_receive_path(path, transfer_id, reservation_token)
+}
+
+fn accept_incoming_transfer_with_preflight<P, D>(
+    storage: &Storage,
+    transfer: &TransferRecord,
+    path: &Path,
+    preflight: &P,
+    dispatch: &mut D,
+) -> Result<TransferRecord, AppError>
+where
+    P: Fn(&Path, u64, u64) -> Result<(), AppError>,
+    D: FnMut(&TransferRecord) -> Result<(), AppError>,
+{
+    if !path.is_absolute() {
+        return Err(AppError::InvalidInput(
+            "文件保存位置必须是绝对路径".to_string(),
+        ));
+    }
+    storage.drain_incoming_cleanup_before_acceptance(&transfer.transfer_id)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| AppError::InvalidInput("接收文件保存位置无效".to_string()))?;
+    if let Err(error) = preflight(parent, transfer.file_size, 0) {
+        return Err(sanitize_destination_preflight_error(parent, error));
+    }
+
+    let reservation_token = uuid::Uuid::now_v7().to_string();
+    reserve_manual_receive_destination(path, &transfer.transfer_id, &reservation_token)
+        .map_err(map_receive_reservation_error)?;
+
+    let mut accepted = transfer.clone();
+    accepted.local_path = Some(path.to_string_lossy().into_owned());
+    accepted.destination_reserved = true;
+    accepted.reservation_token = Some(reservation_token);
+    accepted.status = TransferStatus::Transferring;
+    accepted.error = None;
+    accepted.updated_at = now_rfc3339();
+    match storage.try_accept_incoming_transfer(&accepted) {
+        Ok(true) => {}
+        Ok(false) => {
+            cleanup_manual_reservation(&accepted);
+            return Err(AppError::InvalidInput(
+                "这次文件传输已经处理，请刷新后查看".to_string(),
+            ));
+        }
+        Err(error) => {
+            cleanup_manual_reservation(&accepted);
+            return Err(error);
+        }
+    }
+
+    if let Err(error) = dispatch(&accepted) {
+        if let Err(rollback_error) = crate::network::return_pending_incoming_decision_to_manual(
+            &accepted.transfer_id,
+            storage,
+            error.to_string(),
+        ) {
+            tracing::warn!(
+                transfer_id = %accepted.transfer_id,
+                %rollback_error,
+                "failed to return incoming acceptance to manual review"
+            );
+        }
+        return Err(error);
+    }
+    Ok(accepted)
+}
+
+fn cleanup_manual_reservation(transfer: &TransferRecord) {
+    if let (Some(path), Some(token)) = (
+        transfer.local_path.as_deref(),
+        transfer.reservation_token.as_deref(),
+    ) {
+        let _ = remove_owned_reservation(Path::new(path), &transfer.transfer_id, token);
+    }
+}
+
+fn map_receive_reservation_error(error: std::io::Error) -> AppError {
+    if error.kind() == std::io::ErrorKind::AlreadyExists {
+        AppError::InvalidInput("保存位置已经存在同名文件，请重新选择".to_string())
+    } else {
+        AppError::Permission(format!("无法占用文件保存位置，请重新选择：{error}"))
+    }
+}
+
 fn prepare_transfer_preferences(
     auto_receive_files: bool,
     receive_directory: &str,
@@ -673,17 +822,22 @@ struct PreparedSource {
     file_size: u64,
     mime_type: String,
     sha256: String,
+    transfer_protocol: u8,
+    chunk_size: u32,
+    chunk_count: u32,
+    manifest_sha256: Option<String>,
+    source_modified_ns: Option<u64>,
+    chunks: Vec<TransferChunk>,
 }
 
-fn prepare_source(path: &str, kind: TransferKind) -> Result<PreparedSource, AppError> {
+fn prepare_source(
+    path: &str,
+    kind: TransferKind,
+    capabilities: &[String],
+) -> Result<PreparedSource, AppError> {
     let path = std::fs::canonicalize(path)?;
-    let metadata = std::fs::metadata(&path)?;
-    if !metadata.is_file() {
-        return Err(AppError::InvalidInput("请选择一个普通文件".to_string()));
-    }
-    if metadata.len() > MAX_FILE_BYTES {
-        return Err(AppError::InvalidInput("单个文件不能超过 2 GiB".to_string()));
-    }
+    let source_snapshot = capture_source_snapshot(&path)?;
+    let transfer_protocol = select_transfer_protocol(capabilities, source_snapshot.file_size)?;
     let file_name = path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -695,7 +849,50 @@ fn prepare_source(path: &str, kind: TransferKind) -> Result<PreparedSource, AppE
             "所选文件不是支持的图片格式".to_string(),
         ));
     }
-    let mut reader = BufReader::new(File::open(&path)?);
+    let (file_size, sha256, chunk_size, chunk_count, manifest_sha256, source_modified_ns, chunks) =
+        match transfer_protocol {
+            TransferProtocol::LegacyV1 => (
+                source_snapshot.file_size,
+                hash_file(&path)?,
+                0,
+                0,
+                None,
+                None,
+                Vec::new(),
+            ),
+            TransferProtocol::ResumableV2 => {
+                let manifest =
+                    build_manifest_from_snapshot(&path, TRANSFER_CHUNK_BYTES, source_snapshot)?;
+                let chunk_count = u32::try_from(manifest.chunks.len())
+                    .map_err(|_| AppError::InvalidInput("分块数量超出协议限制".to_string()))?;
+                (
+                    manifest.file_size,
+                    hex::encode(manifest.file_sha256),
+                    TRANSFER_CHUNK_BYTES,
+                    chunk_count,
+                    Some(hex::encode(manifest.manifest_sha256)),
+                    Some(manifest.source_modified_ns),
+                    manifest.chunks,
+                )
+            }
+        };
+    Ok(PreparedSource {
+        path,
+        file_name,
+        file_size,
+        mime_type,
+        sha256,
+        transfer_protocol: transfer_protocol as u8,
+        chunk_size,
+        chunk_count,
+        manifest_sha256,
+        source_modified_ns,
+        chunks,
+    })
+}
+
+fn hash_file(path: &Path) -> Result<String, AppError> {
+    let mut reader = BufReader::new(File::open(path)?);
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 128 * 1024];
     loop {
@@ -705,13 +902,7 @@ fn prepare_source(path: &str, kind: TransferKind) -> Result<PreparedSource, AppE
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(PreparedSource {
-        path,
-        file_name,
-        file_size: metadata.len(),
-        mime_type,
-        sha256: hex::encode(hasher.finalize()),
-    })
+    Ok(hex::encode(hasher.finalize()))
 }
 
 fn detect_mime_type(path: &Path) -> String {
@@ -741,10 +932,655 @@ fn detect_mime_type(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
 
-    use super::{prepare_receive_directory, prepare_transfer_preferences};
-    use crate::domain::TransferPreferences;
+    use super::{
+        accept_incoming_transfer_with_preflight, cancel_transfer_locally,
+        prepare_receive_directory, prepare_source, prepare_transfer_preferences,
+        reserve_manual_receive_destination,
+    };
+    use crate::{
+        domain::{
+            Direction, TransferKind, TransferPreferences, TransferRecord, TransferStatus,
+            now_rfc3339,
+        },
+        error::AppError,
+        receive_paths::{preflight_receive_directory, reserve_receive_path},
+        storage::Storage,
+        transfer_policy::{FILE_RESUME_V2_CAPABILITY, TRANSFER_CHUNK_BYTES, TransferProtocol},
+        volume_preflight::{VolumeSnapshot, validate_volume},
+    };
+
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+    const DESTINATION_RESERVE_BYTES: u64 = 64 * MIB;
+
+    fn acceptance_fixture(name: &str, file_size: u64) -> (PathBuf, Storage, TransferRecord) {
+        let directory = std::env::temp_dir().join(format!(
+            "weline-localnet-manual-preflight-{name}-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&directory).expect("create manual preflight fixture");
+        let storage = Storage::open(&directory.join("localnet.sqlite3"))
+            .expect("open manual preflight storage");
+        let now = now_rfc3339();
+        let transfer = TransferRecord {
+            transfer_id: uuid::Uuid::now_v7().to_string(),
+            peer_id: "manual-preflight-peer".to_string(),
+            direction: Direction::Incoming,
+            kind: TransferKind::File,
+            file_name: "archive.bin".to_string(),
+            file_size,
+            mime_type: "application/octet-stream".to_string(),
+            sha256: "0".repeat(64),
+            local_path: None,
+            destination_reserved: false,
+            reservation_token: None,
+            transfer_protocol: TransferProtocol::ResumableV2 as u8,
+            chunk_size: TRANSFER_CHUNK_BYTES,
+            chunk_count: u32::try_from(file_size.div_ceil(u64::from(TRANSFER_CHUNK_BYTES)))
+                .expect("fixture chunk count"),
+            manifest_sha256: Some("1".repeat(64)),
+            partial_path: None,
+            source_modified_ns: None,
+            send_claimed: false,
+            transferred_bytes: 0,
+            status: TransferStatus::AwaitingAcceptance,
+            error: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        storage
+            .upsert_transfer(&transfer)
+            .expect("persist incoming acceptance fixture");
+        (directory, storage, transfer)
+    }
+
+    fn assert_manual_acceptance_unchanged(
+        storage: &Storage,
+        transfer_id: &str,
+        destination: &Path,
+    ) {
+        let stored = storage
+            .get_transfer(transfer_id)
+            .expect("reload incoming transfer")
+            .expect("incoming transfer remains");
+        assert_eq!(stored.status, TransferStatus::AwaitingAcceptance);
+        assert!(!stored.destination_reserved);
+        assert!(stored.reservation_token.is_none());
+        assert!(stored.local_path.is_none());
+        assert!(stored.partial_path.is_none());
+        assert!(!destination.exists());
+    }
+
+    fn legacy_acceptance_fixture(name: &str, file_size: u64) -> (PathBuf, Storage, TransferRecord) {
+        let (directory, storage, mut transfer) = acceptance_fixture(name, file_size);
+        transfer.transfer_protocol = TransferProtocol::LegacyV1 as u8;
+        transfer.chunk_size = 0;
+        transfer.chunk_count = 0;
+        transfer.manifest_sha256 = None;
+        storage
+            .upsert_transfer(&transfer)
+            .expect("persist legacy acceptance fixture");
+        (directory, storage, transfer)
+    }
+
+    #[test]
+    fn paused_v2_transfer_can_be_cancelled_locally_without_a_network_handle() {
+        let directory = std::env::temp_dir().join(format!(
+            "weline-localnet-local-cancel-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&directory).expect("create local cancellation fixture");
+        let storage =
+            Storage::open(&directory.join("localnet.sqlite3")).expect("open cancellation storage");
+        let now = now_rfc3339();
+
+        for (transfer_id, direction) in [
+            ("paused-outgoing", Direction::Outgoing),
+            ("paused-incoming", Direction::Incoming),
+        ] {
+            storage
+                .upsert_transfer(&TransferRecord {
+                    transfer_id: transfer_id.to_string(),
+                    peer_id: "cancel-peer".to_string(),
+                    direction,
+                    kind: TransferKind::File,
+                    file_name: "archive.bin".to_string(),
+                    file_size: u64::from(TRANSFER_CHUNK_BYTES),
+                    mime_type: "application/octet-stream".to_string(),
+                    sha256: "0".repeat(64),
+                    local_path: None,
+                    destination_reserved: false,
+                    reservation_token: None,
+                    transfer_protocol: TransferProtocol::ResumableV2 as u8,
+                    chunk_size: TRANSFER_CHUNK_BYTES,
+                    chunk_count: 1,
+                    manifest_sha256: Some("1".repeat(64)),
+                    partial_path: None,
+                    source_modified_ns: None,
+                    send_claimed: false,
+                    transferred_bytes: 0,
+                    status: TransferStatus::Paused,
+                    error: Some("network disconnected".to_string()),
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                })
+                .expect("persist paused cancellable transfer");
+
+            let cancelled = cancel_transfer_locally(&storage, transfer_id)
+                .expect("paused transfer cancellation is local-first");
+            assert_eq!(cancelled.status, TransferStatus::Cancelled);
+        }
+
+        let pending = storage
+            .list_pending_terminal_notifications("cancel-peer")
+            .expect("list durable cancellation notifications");
+        assert_eq!(pending.len(), 2);
+        assert!(pending.iter().all(|notification| {
+            notification.state == TransferStatus::Cancelled
+                && matches!(
+                    notification.transfer_id.as_str(),
+                    "paused-outgoing" | "paused-incoming"
+                )
+        }));
+
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove local cancellation fixture");
+    }
+
+    #[test]
+    fn paused_incoming_cancel_reports_local_success_when_cleanup_media_is_temporarily_offline() {
+        let (directory, storage, mut transfer) =
+            acceptance_fixture("cancel-offline-cleanup", u64::from(TRANSFER_CHUNK_BYTES));
+        let media = directory.join("selected-media");
+        let detached_media = directory.join("detached-media");
+        fs::create_dir_all(&media).expect("create selected media");
+        let destination = media.join("archive.bin");
+        let token = "cancel-offline-cleanup-token";
+        reserve_receive_path(&destination, &transfer.transfer_id, token)
+            .expect("reserve incoming destination");
+        transfer.local_path = Some(destination.to_string_lossy().into_owned());
+        transfer.destination_reserved = true;
+        transfer.reservation_token = Some(token.to_string());
+        transfer.status = TransferStatus::Transferring;
+        assert!(
+            storage
+                .try_accept_incoming_transfer(&transfer)
+                .expect("accept incoming transfer")
+        );
+        assert!(
+            storage
+                .try_claim_incoming_transfer(&transfer.transfer_id, &transfer.peer_id)
+                .expect("claim incoming transfer")
+        );
+        assert!(
+            storage
+                .try_pause_claimed_incoming_transfer(
+                    &transfer.transfer_id,
+                    &transfer.peer_id,
+                    "network disconnected",
+                )
+                .expect("pause incoming transfer")
+        );
+        fs::rename(&media, &detached_media).expect("detach selected media");
+
+        let cancelled = cancel_transfer_locally(&storage, &transfer.transfer_id)
+            .expect("durably committed local cancel is successful while cleanup is deferred");
+        assert_eq!(cancelled.status, TransferStatus::Cancelled);
+        assert_eq!(
+            storage
+                .list_pending_terminal_notifications(&transfer.peer_id)
+                .expect("load terminal outbox")
+                .len(),
+            1
+        );
+
+        drop(storage);
+        fs::rename(&detached_media, &media).expect("restore selected media");
+        let storage = Storage::open(&directory.join("localnet.sqlite3"))
+            .expect("restart drains deferred owned cleanup");
+        assert_eq!(
+            storage
+                .get_transfer(&transfer.transfer_id)
+                .expect("reload cancelled transfer")
+                .expect("cancelled transfer exists")
+                .status,
+            TransferStatus::Cancelled
+        );
+
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove offline cleanup fixture");
+    }
+
+    #[test]
+    fn upgraded_peer_prepares_a_v2_manifest_before_offering_a_source() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-v2-source-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::write(&fixture, b"abc").expect("write source fixture");
+        let capabilities = vec![FILE_RESUME_V2_CAPABILITY.to_string()];
+
+        let source = prepare_source(
+            &fixture.to_string_lossy(),
+            TransferKind::File,
+            &capabilities,
+        )
+        .expect("prepare v2 source");
+
+        assert_eq!(
+            source.transfer_protocol,
+            TransferProtocol::ResumableV2 as u8
+        );
+        assert_eq!(source.chunk_size, TRANSFER_CHUNK_BYTES);
+        assert_eq!(source.chunk_count, 1);
+        assert_eq!(source.manifest_sha256.as_deref().map(str::len), Some(64));
+        assert!(source.source_modified_ns.is_some());
+        assert_eq!(source.chunks.len(), 1);
+
+        fs::remove_file(fixture).expect("remove source fixture");
+    }
+
+    #[test]
+    fn manual_acceptance_never_returns_private_preflight_diagnostics() {
+        let (directory, storage, transfer) = acceptance_fixture("private-diagnostics", GIB);
+        let destination = directory.join("archive.bin");
+        let private_diagnostic =
+            r"unable to inspect E:\Private\客户\Archive: path unavailable (os error 3)";
+        let mut decisions = 0_u8;
+
+        let error = accept_incoming_transfer_with_preflight(
+            &storage,
+            &transfer,
+            &destination,
+            &|_, _, _| Err(AppError::Storage(private_diagnostic.to_string())),
+            &mut |_| {
+                decisions += 1;
+                Ok(())
+            },
+        )
+        .expect_err("private preflight diagnostics must block acceptance safely");
+
+        assert_eq!(error.code(), "destination_preflight_error");
+        assert!(error.to_string().contains("不可用"));
+        assert!(!error.to_string().contains("E:\\Private"));
+        assert!(!error.to_string().contains("os error"));
+        assert_eq!(decisions, 0);
+        assert_manual_acceptance_unchanged(&storage, &transfer.transfer_id, &destination);
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove private diagnostics fixture");
+    }
+
+    #[test]
+    fn manual_acceptance_insufficient_space_has_no_reservation_or_transfer_decision() {
+        let file_size = 5 * GIB;
+        let (directory, storage, transfer) = acceptance_fixture("insufficient", file_size);
+        let destination = directory.join("archive.bin");
+        let decision_sent = Arc::new(AtomicBool::new(false));
+        let decision_sent_for_dispatch = decision_sent.clone();
+        let snapshot =
+            VolumeSnapshot::known("NTFS", file_size + DESTINATION_RESERVE_BYTES - 1, None);
+
+        let error = accept_incoming_transfer_with_preflight(
+            &storage,
+            &transfer,
+            &destination,
+            &|_, size, committed| validate_volume(&snapshot, size, committed),
+            &mut |_| {
+                decision_sent_for_dispatch.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .expect_err("one byte below the required margin must block acceptance");
+
+        assert!(error.to_string().contains("可用空间不足"));
+        assert!(!decision_sent.load(Ordering::SeqCst));
+        assert_manual_acceptance_unchanged(&storage, &transfer.transfer_id, &destination);
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove insufficient-space fixture");
+    }
+
+    #[test]
+    fn manual_acceptance_rejects_fat32_before_reservation_or_transfer_decision() {
+        let file_size = 5 * GIB;
+        let (directory, storage, transfer) = acceptance_fixture("fat32", file_size);
+        let destination = directory.join("archive.bin");
+        let decision_sent = Arc::new(AtomicBool::new(false));
+        let decision_sent_for_dispatch = decision_sent.clone();
+        let snapshot = VolumeSnapshot::known("FAT32", 10 * GIB, Some(4 * GIB - 1));
+
+        let error = accept_incoming_transfer_with_preflight(
+            &storage,
+            &transfer,
+            &destination,
+            &|_, size, committed| validate_volume(&snapshot, size, committed),
+            &mut |_| {
+                decision_sent_for_dispatch.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .expect_err("FAT32 must reject a five GiB destination");
+
+        assert!(error.to_string().contains("磁盘格式"));
+        assert!(!decision_sent.load(Ordering::SeqCst));
+        assert_manual_acceptance_unchanged(&storage, &transfer.transfer_id, &destination);
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove FAT32 fixture");
+    }
+
+    #[test]
+    fn manual_acceptance_allows_exact_remaining_plus_64_mib() {
+        let file_size = 5 * GIB;
+        let (directory, storage, transfer) = acceptance_fixture("exact-margin", file_size);
+        let destination = directory.join("archive.bin");
+        let snapshot = VolumeSnapshot::known("NTFS", file_size + DESTINATION_RESERVE_BYTES, None);
+        let mut decisions = 0_u8;
+
+        let accepted = accept_incoming_transfer_with_preflight(
+            &storage,
+            &transfer,
+            &destination,
+            &|_, size, committed| validate_volume(&snapshot, size, committed),
+            &mut |_| {
+                decisions += 1;
+                Ok(())
+            },
+        )
+        .expect("exact capacity margin must permit acceptance");
+
+        assert_eq!(decisions, 1);
+        assert_eq!(accepted.status, TransferStatus::Transferring);
+        assert!(accepted.destination_reserved);
+        assert!(
+            storage
+                .get_transfer(&accepted.transfer_id)
+                .expect("reload accepted transfer")
+                .expect("accepted transfer remains")
+                .partial_path
+                .is_some()
+        );
+        assert!(
+            storage
+                .try_cancel_unclaimed_incoming_transfer(
+                    &accepted.transfer_id,
+                    &accepted.peer_id,
+                    accepted.transfer_protocol,
+                    "test cleanup",
+                )
+                .expect("clean accepted fixture")
+        );
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove exact-margin fixture");
+    }
+
+    #[test]
+    fn manual_acceptance_missing_or_unwritable_destination_stays_awaiting() {
+        for unavailable in ["missing", "unwritable"] {
+            let file_size = GIB;
+            let (directory, storage, transfer) = acceptance_fixture(unavailable, file_size);
+            let destination = if unavailable == "missing" {
+                directory.join("missing-volume").join("archive.bin")
+            } else {
+                directory.join("archive.bin")
+            };
+            let mut decisions = 0_u8;
+            let error = accept_incoming_transfer_with_preflight(
+                &storage,
+                &transfer,
+                &destination,
+                &|target, size, committed| {
+                    if unavailable == "missing" {
+                        preflight_receive_directory(target, size, committed)
+                    } else {
+                        Err(AppError::Storage(format!(
+                            "无法写入接收目录 {}；请选择可写入的目录后重试",
+                            target.display()
+                        )))
+                    }
+                },
+                &mut |_| {
+                    decisions += 1;
+                    Ok(())
+                },
+            )
+            .expect_err("an unavailable destination must block acceptance");
+
+            assert!(error.to_string().contains("不可用"));
+            assert_eq!(decisions, 0);
+            assert_manual_acceptance_unchanged(&storage, &transfer.transfer_id, &destination);
+            drop(storage);
+            fs::remove_dir_all(directory).expect("remove unavailable fixture");
+        }
+    }
+
+    #[test]
+    fn manual_v1_acceptance_preflights_space_and_missing_directory_before_side_effects() {
+        let file_size = GIB;
+        for unavailable in ["insufficient", "missing"] {
+            let (directory, storage, transfer) = legacy_acceptance_fixture(unavailable, file_size);
+            let destination = if unavailable == "missing" {
+                directory.join("missing-volume").join("archive.bin")
+            } else {
+                directory.join("archive.bin")
+            };
+            let mut decisions = 0_u8;
+            let snapshot =
+                VolumeSnapshot::known("NTFS", file_size + DESTINATION_RESERVE_BYTES - 1, None);
+            let error = accept_incoming_transfer_with_preflight(
+                &storage,
+                &transfer,
+                &destination,
+                &|target, size, committed| {
+                    if unavailable == "missing" {
+                        preflight_receive_directory(target, size, committed)
+                    } else {
+                        validate_volume(&snapshot, size, committed)
+                    }
+                },
+                &mut |_| {
+                    decisions += 1;
+                    Ok(())
+                },
+            )
+            .expect_err("legacy acceptance must fail preflight before reservation");
+
+            let expected = if unavailable == "missing" {
+                "不可用"
+            } else {
+                "可用空间不足"
+            };
+            assert!(error.to_string().contains(expected));
+            assert_eq!(decisions, 0);
+            assert_manual_acceptance_unchanged(&storage, &transfer.transfer_id, &destination);
+            assert!(!directory.join("missing-volume").exists());
+            drop(storage);
+            fs::remove_dir_all(directory).expect("remove legacy preflight fixture");
+        }
+    }
+
+    #[test]
+    fn manual_v1_acceptance_allows_exact_remaining_plus_64_mib() {
+        let file_size = GIB;
+        let (directory, storage, transfer) =
+            legacy_acceptance_fixture("v1-exact-margin", file_size);
+        let destination = directory.join("archive.bin");
+        let snapshot = VolumeSnapshot::known("NTFS", file_size + DESTINATION_RESERVE_BYTES, None);
+        let probes = std::cell::Cell::new(0_u8);
+
+        let accepted = accept_incoming_transfer_with_preflight(
+            &storage,
+            &transfer,
+            &destination,
+            &|_, size, committed| {
+                probes.set(probes.get() + 1);
+                validate_volume(&snapshot, size, committed)
+            },
+            &mut |_| Ok(()),
+        )
+        .expect("legacy acceptance must permit the exact safety margin");
+
+        assert_eq!(probes.get(), 1);
+        assert_eq!(accepted.status, TransferStatus::Transferring);
+        assert!(accepted.destination_reserved);
+        assert!(
+            storage
+                .try_cancel_unclaimed_incoming_transfer(
+                    &accepted.transfer_id,
+                    &accepted.peer_id,
+                    accepted.transfer_protocol,
+                    "test cleanup",
+                )
+                .expect("clean accepted legacy fixture")
+        );
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove exact-margin legacy fixture");
+    }
+
+    #[test]
+    fn manual_decision_enqueue_failure_reverts_v1_and_v2_to_awaiting_without_owned_artifacts() {
+        for protocol in [
+            TransferProtocol::LegacyV1 as u8,
+            TransferProtocol::ResumableV2 as u8,
+        ] {
+            let (directory, storage, transfer) = if protocol == TransferProtocol::LegacyV1 as u8 {
+                legacy_acceptance_fixture("v1-dispatch-failure", MIB)
+            } else {
+                acceptance_fixture("v2-dispatch-failure", MIB)
+            };
+            let destination = directory.join("archive.bin");
+
+            let error = accept_incoming_transfer_with_preflight(
+                &storage,
+                &transfer,
+                &destination,
+                &|_, _, _| Ok(()),
+                &mut |_| {
+                    Err(AppError::Network(
+                        "injected offline command queue failure".to_string(),
+                    ))
+                },
+            )
+            .expect_err("failed network enqueue must compensate acceptance");
+
+            assert!(error.to_string().contains("offline command queue"));
+            let stored = storage
+                .get_transfer(&transfer.transfer_id)
+                .expect("reload compensated manual transfer")
+                .expect("compensated manual transfer exists");
+            assert_eq!(stored.status, TransferStatus::AwaitingAcceptance);
+            assert!(
+                stored
+                    .error
+                    .as_deref()
+                    .is_some_and(|value| value.contains("offline command queue"))
+            );
+            assert!(!stored.destination_reserved);
+            assert!(stored.local_path.is_none());
+            assert!(stored.reservation_token.is_none());
+            assert!(stored.partial_path.is_none());
+            assert!(
+                fs::read_dir(&directory)
+                    .expect("list manual compensation directory")
+                    .filter_map(Result::ok)
+                    .all(|entry| !entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".weline-localnet"))
+            );
+            drop(storage);
+            fs::remove_dir_all(directory).expect("remove manual dispatch failure fixture");
+        }
+    }
+
+    #[test]
+    fn manual_acceptance_uses_a_time_ordered_reservation_token() {
+        let (directory, storage, transfer) = acceptance_fixture("v7-reservation-token", MIB);
+        let destination = directory.join("archive.bin");
+
+        let accepted = accept_incoming_transfer_with_preflight(
+            &storage,
+            &transfer,
+            &destination,
+            &|_, _, _| Ok(()),
+            &mut |_| Ok(()),
+        )
+        .expect("manual acceptance succeeds");
+
+        let token = uuid::Uuid::parse_str(
+            accepted
+                .reservation_token
+                .as_deref()
+                .expect("accepted transfer has reservation token"),
+        )
+        .expect("reservation token is a UUID");
+        assert_eq!(token.get_version_num(), 7);
+
+        assert!(
+            storage
+                .try_cancel_unclaimed_incoming_transfer(
+                    &accepted.transfer_id,
+                    &accepted.peer_id,
+                    accepted.transfer_protocol,
+                    "test cleanup",
+                )
+                .expect("clean accepted transfer")
+        );
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove v7 reservation token fixture");
+    }
+
+    #[test]
+    fn manual_dispatch_error_remains_primary_when_rollback_also_fails() {
+        let (directory, storage, transfer) =
+            acceptance_fixture("dispatch-and-rollback-failure", MIB);
+        let database = directory.join("localnet.sqlite3");
+        let destination = directory.join("archive.bin");
+        let mut write_blocker = None;
+
+        let error = accept_incoming_transfer_with_preflight(
+            &storage,
+            &transfer,
+            &destination,
+            &|_, _, _| Ok(()),
+            &mut |_| {
+                let connection = rusqlite::Connection::open(&database)
+                    .expect("open independent rollback blocker");
+                connection
+                    .execute_batch("BEGIN IMMEDIATE")
+                    .expect("hold database writer lock across rollback");
+                write_blocker = Some(connection);
+                Err(AppError::Network(
+                    "injected command dispatch failure".to_string(),
+                ))
+            },
+        )
+        .expect_err("dispatch failure is returned even when rollback is blocked");
+
+        assert_eq!(error.code(), "network_error");
+        assert_eq!(error.to_string(), "injected command dispatch failure");
+
+        drop(write_blocker);
+        assert!(
+            storage
+                .try_cancel_unclaimed_incoming_transfer(
+                    &transfer.transfer_id,
+                    &transfer.peer_id,
+                    transfer.transfer_protocol,
+                    "test cleanup",
+                )
+                .expect("clean transfer after releasing rollback blocker")
+        );
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove double failure fixture");
+    }
 
     #[test]
     fn disabling_auto_receive_accepts_an_unavailable_absolute_directory() {
@@ -765,6 +1601,21 @@ mod tests {
         assert_eq!(prepared, unavailable);
         assert!(!prepared.exists());
         let _ = fs::remove_dir_all(fixture);
+    }
+
+    #[test]
+    fn manual_v2_acceptance_never_recreates_a_missing_selected_parent() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-manual-v2-missing-parent-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let destination = fixture.join("unplugged-volume").join("report.bin");
+
+        let error = reserve_manual_receive_destination(&destination, "transfer-one", "token-one")
+            .expect_err("missing selected parent must reject v2 acceptance");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(!fixture.exists());
     }
 
     #[test]

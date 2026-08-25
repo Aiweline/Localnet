@@ -1,5 +1,76 @@
 use serde::ser::{Serialize, Serializer};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DestinationPreflightFailure {
+    DirectoryUnavailable,
+    PermissionDenied,
+    InsufficientSpace,
+    FilesystemLimit,
+    UnsupportedFilesystem,
+    FileTooLarge,
+}
+
+impl std::fmt::Display for DestinationPreflightFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.public_message())
+    }
+}
+
+impl std::error::Error for DestinationPreflightFailure {}
+
+impl DestinationPreflightFailure {
+    pub(crate) const fn public_message(self) -> &'static str {
+        match self {
+            Self::DirectoryUnavailable => "接收目录当前不可用，请恢复磁盘或重新选择目录后重试",
+            Self::PermissionDenied => "没有权限写入接收目录，请重新选择可写入的目录",
+            Self::InsufficientSpace => "接收目录可用空间不足，请释放空间后等待自动恢复",
+            Self::FilesystemLimit => "接收目录的磁盘格式不支持这么大的文件，请选择支持大文件的目录",
+            Self::UnsupportedFilesystem => "无法安全检查接收目录所在磁盘，请选择本地磁盘目录后重试",
+            Self::FileTooLarge => "单个文件不能超过 100 GiB",
+        }
+    }
+
+    pub(crate) const fn marker_token(self) -> &'static str {
+        match self {
+            Self::DirectoryUnavailable => "directory-unavailable",
+            Self::PermissionDenied => "permission-denied",
+            Self::InsufficientSpace => "insufficient-space",
+            Self::FilesystemLimit => "filesystem-limit",
+            Self::UnsupportedFilesystem => "unsupported-filesystem",
+            Self::FileTooLarge => "file-too-large",
+        }
+    }
+
+    pub(crate) fn from_marker_token(token: &str) -> Option<Self> {
+        match token {
+            "directory-unavailable" => Some(Self::DirectoryUnavailable),
+            "permission-denied" => Some(Self::PermissionDenied),
+            "insufficient-space" => Some(Self::InsufficientSpace),
+            "filesystem-limit" => Some(Self::FilesystemLimit),
+            "unsupported-filesystem" => Some(Self::UnsupportedFilesystem),
+            "file-too-large" => Some(Self::FileTooLarge),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn from_io_error(error: &std::io::Error) -> Self {
+        match error.kind() {
+            std::io::ErrorKind::PermissionDenied => Self::PermissionDenied,
+            std::io::ErrorKind::StorageFull => Self::InsufficientSpace,
+            _ => Self::DirectoryUnavailable,
+        }
+    }
+
+    pub(crate) fn from_app_error(error: &AppError) -> Self {
+        match error {
+            AppError::DestinationPreflight(failure) => *failure,
+            AppError::Io(error) => Self::from_io_error(error),
+            AppError::Permission(_) => Self::PermissionDenied,
+            _ => Self::DirectoryUnavailable,
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
     #[error("{0}")]
@@ -20,6 +91,8 @@ pub enum AppError {
     IncompatibleProtocol,
     #[error("文件完整性校验失败，请重新发送")]
     IntegrityFailure,
+    #[error("{0}")]
+    DestinationPreflight(DestinationPreflightFailure),
     #[error("{0}")]
     Io(#[from] std::io::Error),
 }
@@ -43,6 +116,7 @@ impl AppError {
             Self::NotFriend => "not_friend",
             Self::IncompatibleProtocol => "incompatible_protocol",
             Self::IntegrityFailure => "integrity_failure",
+            Self::DestinationPreflight(_) => "destination_preflight_error",
             Self::Io(_) => "io_error",
         }
     }

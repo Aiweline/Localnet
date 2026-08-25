@@ -1,9 +1,14 @@
 use serde::{Deserialize, Serialize};
 
-use crate::domain::{Platform, TransferKind};
+use crate::domain::{Platform, TransferKind, default_transfer_protocol};
 
 pub const CONTROL_PROTOCOL: &str = "/localnet/control/1";
 pub const FILE_PROTOCOL: &str = "/localnet/file/1";
+pub const FILE_PROTOCOL_V2: &str = "/localnet/file/2";
+
+const fn default_file_stream_version() -> u16 {
+    1
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -11,6 +16,8 @@ pub struct HelloPayload {
     pub version: u16,
     pub nickname: String,
     pub platform: Platform,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,12 +29,40 @@ pub struct TransferOffer {
     pub file_size: u64,
     pub mime_type: String,
     pub sha256: String,
+    #[serde(default = "default_transfer_protocol")]
+    pub transfer_protocol: u8,
+    #[serde(default)]
+    pub chunk_size: u32,
+    #[serde(default)]
+    pub chunk_count: u32,
+    #[serde(default)]
+    pub manifest_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TransferStreamHeader {
     pub transfer_id: String,
+    #[serde(default = "default_file_stream_version")]
+    pub version: u16,
+    #[serde(default)]
+    pub start_offset: u64,
+    #[serde(default)]
+    pub chunk_size: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TransferResumeState {
+    Receiving,
+    Completed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TransferTerminalState {
+    Cancelled,
+    Failed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +72,8 @@ pub enum ControlRequest {
         version: u16,
         nickname: String,
         platform: Platform,
+        #[serde(default)]
+        capabilities: Vec<String>,
     },
     FriendRequest {
         request_id: String,
@@ -62,12 +99,182 @@ pub enum ControlRequest {
     TransferCancel {
         transfer_id: String,
     },
+    TransferResumeQuery {
+        transfer_id: String,
+    },
+    TransferTerminal {
+        transfer_id: String,
+        generation: String,
+        state: TransferTerminalState,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum ControlResponse {
     Accepted,
-    Rejected { code: String, message: String },
-    Hello { payload: HelloPayload },
+    Rejected {
+        code: String,
+        message: String,
+    },
+    Hello {
+        payload: HelloPayload,
+    },
+    TransferResume {
+        transfer_id: String,
+        state: TransferResumeState,
+        committed_bytes: u64,
+    },
+    TransferTerminalAck {
+        transfer_id: String,
+        generation: String,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ControlRequest, ControlResponse, FILE_PROTOCOL, FILE_PROTOCOL_V2, TransferResumeState,
+        TransferStreamHeader,
+    };
+
+    #[test]
+    fn resume_query_and_typed_response_round_trip_without_control_response_ambiguity() {
+        let query = ControlRequest::TransferResumeQuery {
+            transfer_id: "resume-transfer".to_string(),
+        };
+        let response = ControlResponse::TransferResume {
+            transfer_id: "resume-transfer".to_string(),
+            state: TransferResumeState::Receiving,
+            committed_bytes: 8_388_608,
+        };
+
+        let decoded_query: ControlRequest =
+            serde_json::from_slice(&serde_json::to_vec(&query).expect("encode resume query"))
+                .expect("decode resume query");
+        let decoded_response: ControlResponse =
+            serde_json::from_slice(&serde_json::to_vec(&response).expect("encode resume response"))
+                .expect("decode resume response");
+
+        assert!(matches!(
+            decoded_query,
+            ControlRequest::TransferResumeQuery { transfer_id }
+                if transfer_id == "resume-transfer"
+        ));
+        assert!(matches!(
+            decoded_response,
+            ControlResponse::TransferResume {
+                transfer_id,
+                state: TransferResumeState::Receiving,
+                committed_bytes: 8_388_608,
+            } if transfer_id == "resume-transfer"
+        ));
+
+        let completed: ControlResponse = serde_json::from_str(
+            r#"{"type":"transferResume","transfer_id":"resume-transfer","state":"completed","committed_bytes":8388608}"#,
+        )
+        .expect("decode completed resume response");
+        assert!(matches!(
+            completed,
+            ControlResponse::TransferResume {
+                state: TransferResumeState::Completed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn legacy_hello_messages_default_capabilities_to_empty() {
+        let request: ControlRequest = serde_json::from_str(
+            r#"{"type":"hello","version":1,"nickname":"Legacy","platform":"windows"}"#,
+        )
+        .expect("deserialize legacy hello request");
+        let response: ControlResponse = serde_json::from_str(
+            r#"{"type":"hello","payload":{"version":1,"nickname":"Legacy","platform":"windows"}}"#,
+        )
+        .expect("deserialize legacy hello response");
+
+        let ControlRequest::Hello { capabilities, .. } = request else {
+            panic!("expected hello request");
+        };
+        let ControlResponse::Hello { payload } = response else {
+            panic!("expected hello response");
+        };
+
+        assert!(capabilities.is_empty());
+        assert!(payload.capabilities.is_empty());
+    }
+
+    #[test]
+    fn file_protocol_v2_is_additive_and_legacy_stream_headers_still_decode() {
+        assert_eq!(FILE_PROTOCOL, "/localnet/file/1");
+        assert_eq!(FILE_PROTOCOL_V2, "/localnet/file/2");
+
+        let legacy: TransferStreamHeader =
+            serde_json::from_str(r#"{"transferId":"legacy-transfer"}"#)
+                .expect("decode legacy stream header");
+
+        assert_eq!(legacy.transfer_id, "legacy-transfer");
+        assert_eq!(legacy.version, 1);
+        assert_eq!(legacy.start_offset, 0);
+        assert_eq!(legacy.chunk_size, 0);
+    }
+
+    #[test]
+    fn file_protocol_v2_stream_header_round_trips_resume_geometry() {
+        let header = TransferStreamHeader {
+            transfer_id: "transfer-v2".to_string(),
+            version: 2,
+            start_offset: 8_388_608,
+            chunk_size: 4_194_304,
+        };
+
+        let decoded: TransferStreamHeader =
+            serde_json::from_slice(&serde_json::to_vec(&header).expect("encode v2 stream header"))
+                .expect("decode v2 stream header");
+
+        assert_eq!(decoded.transfer_id, header.transfer_id);
+        assert_eq!(decoded.version, 2);
+        assert_eq!(decoded.start_offset, 8_388_608);
+        assert_eq!(decoded.chunk_size, 4_194_304);
+    }
+
+    #[test]
+    fn terminal_notification_protocol_round_trips_exact_generation_and_state() {
+        let request = ControlRequest::TransferTerminal {
+            transfer_id: "terminal-transfer".to_string(),
+            generation: "01991f25-c30d-70f2-b778-d9b67ac4eafe".to_string(),
+            state: super::TransferTerminalState::Failed,
+        };
+        let response = ControlResponse::TransferTerminalAck {
+            transfer_id: "terminal-transfer".to_string(),
+            generation: "01991f25-c30d-70f2-b778-d9b67ac4eafe".to_string(),
+        };
+
+        let decoded_request: ControlRequest =
+            serde_json::from_slice(&serde_json::to_vec(&request).expect("encode terminal request"))
+                .expect("decode terminal request");
+        let decoded_response: ControlResponse = serde_json::from_slice(
+            &serde_json::to_vec(&response).expect("encode terminal acknowledgement"),
+        )
+        .expect("decode terminal acknowledgement");
+
+        assert!(matches!(
+            decoded_request,
+            ControlRequest::TransferTerminal {
+                transfer_id,
+                generation,
+                state: super::TransferTerminalState::Failed,
+            } if transfer_id == "terminal-transfer"
+                && generation == "01991f25-c30d-70f2-b778-d9b67ac4eafe"
+        ));
+        assert!(matches!(
+            decoded_response,
+            ControlResponse::TransferTerminalAck {
+                transfer_id,
+                generation,
+            } if transfer_id == "terminal-transfer"
+                && generation == "01991f25-c30d-70f2-b778-d9b67ac4eafe"
+        ));
+    }
 }

@@ -5,7 +5,7 @@
 
 [简体中文](#简体中文) · [English](#english) · [Español](#español) · [Français](#français) · [Deutsch](#deutsch) · [Português](#português-brasil) · [Русский](#русский) · [日本語](#日本語) · [한국어](#한국어) · [العربية](#العربية)
 
-> 当前版本：`0.1.5`。README 提供 10 种语言的产品简介；Windows 安装器已配置对应的 10 种安装语言。
+> 当前版本：`0.2.0`。README 提供 10 种语言的产品简介；Windows 安装器已配置对应的 10 种安装语言。
 
 ## 简体中文
 
@@ -18,6 +18,7 @@ Weline Localnet 是一款面向公司、工作室和家庭内网的桌面通信�
 | 自动发现 | 通过 mDNS、兼容 mDNS 和局域网信标发现 Windows/macOS 设备，并针对常见 TUN/代理环境使用多路径探测。 |
 | 好友确认 | 附近设备不能直接发送内容，必须先发起好友申请并由接收方接受。 |
 | 内网直传 | 文字、图片和文件通过设备间加密连接直接传输，不上传到 Weline 服务器。 |
+| 可恢复大文件传输 | 双方均为 v0.2.0 时，v2 默认支持单个文件最高 100 GiB；使用 4 MiB 分块、每块 SHA-256 校验和已确认进度，在可恢复的断网或应用重启后自动续传。 |
 | 自动接收 | 可在设置中开启；默认关闭，仅接收已添加好友的文件，并可指定保存目录。 |
 | 安全落盘 | 清理异常文件名、防止目录穿越、校验 SHA-256；同名文件自动编号且不覆盖已有文件。 |
 | 跨平台 | 支持 Windows 10/11 和 macOS 12 及以上版本，macOS 包同时覆盖 Apple Silicon 与 Intel。 |
@@ -30,14 +31,16 @@ Weline Localnet 是一款面向公司、工作室和家庭内网的桌面通信�
 2. 开启或关闭“自动接收好友文件”。
 3. 直接打开当前接收目录。
 
-自动接收默认关闭。开启后也只接受已经添加为好友的设备；陌生设备仍然无法发送文件。接收请求到达时，如果目录已被删除、不可写或暂时不可用，本次文件会回到手动确认流程。传输过程中不会覆盖已有文件；如果已开始传输后磁盘被拔出或权限被撤销，界面会明确显示失败，可恢复目录后重新发送。
+自动接收默认关闭。开启后也只接受已经添加为好友的设备；陌生设备仍然无法发送文件。接收请求到达时，如果目录已被删除、不可写或暂时不可用，本次文件会回到手动确认流程。传输过程中不会覆盖已有文件；对于 v2 传输，遇到上述目标目录问题时会暂停并保留已确认进度；当目标目录恢复可写且可用后，会在下一次安全重试或重新连接时继续传输。旧版 v1 传输不支持续传，恢复目录后需重新发送。
 
 ### 网络与隐私
 
 - 消息和文件只在本地网络设备之间传输。
 - 设备身份保存在本机，并使用 Noise 认证的加密连接。
-- 文件流在接收完成后进行 SHA-256 完整性校验。
-- 单个文件最大为 2 GiB。
+- v2 传输使用 4 MiB 分块，并对每个分块进行 SHA-256 完整性校验；已确认进度会保留以支持续传。
+- 接收和续传前会检查可用磁盘空间、目标目录是否可写且可用，以及 FAT32/MSDOS 文件系统的单文件大小限制。
+- 双方均为 v0.2.0 时，单个文件默认最高 100 GiB，且 v2 不再有 2 GiB 硬限制。0.1.x 设备仍通过旧版 v1 兼容，单个文件最大为 2 GiB。
+- 可恢复的网络中断或应用重启后，v2 传输会在条件恢复时自动继续，而不是从头开始。
 - 不要求账号、手机号或互联网连接。
 - Windows 防火墙和 macOS“本地网络”授权由操作系统管理；应用不会反复自动弹出授权窗口。
 
@@ -70,7 +73,9 @@ macOS Universal DMG 由仓库中的 GitHub Actions 工作流构建和校验。
 
 Weline Localnet is a private desktop messenger for offices, studios, and home networks. It discovers other Weline Localnet devices on the same LAN. After a friend request is approved, users can exchange text, images, and files directly between Windows and macOS devices without a cloud relay.
 
-Automatic file receiving is optional and disabled by default. It works only for accepted friends, uses a user-selected folder, sanitizes unsafe names, numbers duplicates, and never overwrites an existing file. Multi-path discovery is designed for common TUN and proxy configurations while keeping all transfer traffic on the local network.
+For v0.2.0 peers on both sides, resumable v2 transfers support a single file up to 100 GiB by default, without a 2 GiB protocol hard limit. Each 4 MiB chunk has SHA-256 integrity validation, and confirmed transfer state is retained so a transfer can continue automatically after recoverable network loss or an app restart instead of starting over. Before accepting or resuming, Localnet checks free disk space, destination writability and availability, and single-file limits on FAT32/MSDOS file systems.
+
+Version 0.1.x peers remain supported through legacy v1 with its existing 2 GiB per-file maximum; resumable v2 requires v0.2.0 on both peers. Automatic file receiving is optional and disabled by default. It works only for accepted friends, uses a user-selected folder, sanitizes unsafe names, numbers duplicates, and never overwrites an existing file. Multi-path discovery is designed for common TUN and proxy configurations while keeping all transfer traffic on the local network.
 
 ## Español
 

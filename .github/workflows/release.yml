@@ -31,6 +31,13 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Validate release source ref
+        shell: bash
+        run: |
+          set -euo pipefail
+          source scripts/release-decision.sh
+          validate_release_ref "$GITHUB_EVENT_NAME" "$GITHUB_REF"
+
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
@@ -38,6 +45,17 @@ jobs:
 
       - name: Run presence regression test
         run: node --test --experimental-strip-types tests/presence.test.ts
+
+      - name: Run transfer status regression test
+        run: node --test --experimental-strip-types tests/transfer-status.test.ts
+
+      - name: Set up Ruby for release workflow validation
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+
+      - name: Run release workflow regression test
+        run: node --test tests/release-workflow.test.mjs
 
       - name: Validate synchronized versions
         id: version
@@ -53,66 +71,11 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_EVENT_BEFORE: ${{ github.event.before }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          version="${{ steps.version.outputs.version }}"
-          tag="v$version"
-          app_changed=false
-
-          if [[ "${{ github.event_name }}" == "push" ]]; then
-            before="${{ github.event.before }}"
-            if [[ "$before" =~ ^0+$ ]] || ! git cat-file -e "$before^{commit}" 2>/dev/null; then
-              changed_files="$(git diff-tree --no-commit-id --name-only -r "$GITHUB_SHA")"
-            else
-              changed_files="$(git diff --name-only "$before" "$GITHUB_SHA")"
-            fi
-
-            echo "Changed files:"
-            printf '%s\n' "$changed_files"
-            while IFS= read -r file; do
-              if [[ "$file" =~ ^(\.cargo/|assets/|src/|src-tauri/|index\.html$|package\.json$|pnpm-lock\.yaml$|tsconfig(\..+)?\.json$|vite\.config\.ts$) ]]; then
-                app_changed=true
-                break
-              fi
-            done <<< "$changed_files"
-          fi
-
-          if git rev-parse --verify --quiet "$tag^{commit}" >/dev/null; then
-            tag_commit="$(git rev-list -n 1 "$tag")"
-            release_complete=false
-            release_json="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease,assets 2>/dev/null || true)"
-            if [[ -n "$release_json" ]]; then
-              expected_assets="$(printf '%s\n' \
-                "Weline_Localnet_${version}_SHA256SUMS.txt" \
-                "Weline_Localnet_${version}_universal.dmg" \
-                "Weline_Localnet_${version}_universal.dmg.sha256" \
-                "Weline_Localnet_${version}_x64-portable.exe" \
-                "Weline_Localnet_${version}_x64-setup.exe" | sort)"
-              actual_assets="$(jq -r '.assets[].name' <<< "$release_json" | sort)"
-              is_draft="$(jq -r '.isDraft' <<< "$release_json")"
-              is_prerelease="$(jq -r '.isPrerelease' <<< "$release_json")"
-              if [[ "$is_draft" == "false" && "$is_prerelease" == "false" && "$actual_assets" == "$expected_assets" ]]; then
-                release_complete=true
-              fi
-            fi
-
-            if [[ "$release_complete" == "false" && "$app_changed" == "true" && "$tag_commit" != "$GITHUB_SHA" ]]; then
-              echo "::error::Application files changed, but $tag already points to $tag_commit. Run pnpm release:version with a higher version before merging."
-              exit 1
-            elif [[ "$release_complete" == "false" ]]; then
-              echo "Release $tag is missing or incomplete; it will be rebuilt."
-              echo "should_release=true" >> "$GITHUB_OUTPUT"
-            elif [[ "$app_changed" == "true" ]]; then
-              echo "::error::Application files changed, but $tag is already published. Run pnpm release:version with a higher version before merging."
-              exit 1
-            else
-              echo "Release $tag is already complete and no application files changed."
-              echo "should_release=false" >> "$GITHUB_OUTPUT"
-            fi
-          else
-            echo "No tag exists for $tag; release build is required."
-            echo "should_release=true" >> "$GITHUB_OUTPUT"
-          fi
+          bash scripts/release-decision.sh "$RELEASE_VERSION"
 
   windows:
     name: Build Windows x64
@@ -303,6 +266,11 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Set up Node.js for immutable release policy checks
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
       - name: Download Windows packages
         uses: actions/download-artifact@v4
         with:
@@ -348,34 +316,8 @@ jobs:
         run: |
           set -euo pipefail
           version="${{ needs.prepare.outputs.version }}"
-          previous_tag="$(git tag --sort=-v:refname | grep -Fxv "v${version}" | head -n 1 || true)"
-          if [[ -n "$previous_tag" ]]; then
-            changes="$(git log --format='- %s' "${previous_tag}..${GITHUB_SHA}")"
-          else
-            changes="$(git log --format='- %s' -n 20 "$GITHUB_SHA")"
-          fi
-          cat > release-notes.md <<EOF
-          ## Weline Localnet ${version}
-
-          Windows 与 macOS 局域网私密聊天及文件直传工具。本版本由通过发布门禁的 main 提交自动构建。
-
-          ### 变更
-
-          ${changes}
-
-          ### 下载
-
-          - Windows x64 安装版与便携版
-          - macOS Universal DMG（Apple Silicon + Intel）
-          - SHA-256 完整性校验文件
-
-          ---
-
-          Weline Localnet is a private peer-to-peer LAN messenger and file-transfer app for Windows and macOS. This release was built automatically from a gated main-branch commit.
-
-          Company: 成都阿玛云科技有限公司
-          Contact: contact@amayum.com
-          EOF
+          source scripts/release-decision.sh
+          write_release_notes "$version" "$GITHUB_SHA" release-notes.md
 
       - name: Create or repair GitHub Release
         shell: bash
@@ -385,30 +327,84 @@ jobs:
           set -euo pipefail
           version="${{ needs.prepare.outputs.version }}"
           tag="v${version}"
-          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            while IFS= read -r asset; do
-              case "$asset" in
-                "Weline_Localnet_${version}_SHA256SUMS.txt"|\
-                "Weline_Localnet_${version}_universal.dmg"|\
-                "Weline_Localnet_${version}_universal.dmg.sha256"|\
-                "Weline_Localnet_${version}_x64-portable.exe"|\
-                "Weline_Localnet_${version}_x64-setup.exe") ;;
-                *) gh release delete-asset "$tag" "$asset" --repo "$GITHUB_REPOSITORY" --yes ;;
-              esac
-            done < <(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
-            gh release upload "$tag" release-assets/* --repo "$GITHUB_REPOSITORY" --clobber
-            gh release edit "$tag" \
-              --repo "$GITHUB_REPOSITORY" \
-              --title "Weline Localnet v${version}" \
-              --notes-file release-notes.md \
-              --draft=false \
-              --prerelease=false \
-              --latest
+          repository="$GITHUB_REPOSITORY"
+          source scripts/release-decision.sh
+
+          # This metadata-scoped check is tamper-evident, not self-healing. The
+          # audited no-bypass snapshot is maintained by a repository administrator.
+          verify_audited_release_tag_policy "$repository"
+          if git rev-parse --verify --quiet "$tag^{commit}" >/dev/null; then
+            tag_commit="$(git rev-list -n 1 "$tag")"
+            if [[ "$tag_commit" != "$GITHUB_SHA" ]]; then
+              echo "::error::Refusing to publish $tag from $GITHUB_SHA because the tag points to $tag_commit."
+              exit 1
+            fi
+            verify_remote_release_tag origin "$tag" "$GITHUB_SHA"
           else
-            gh release create "$tag" release-assets/* \
-              --repo "$GITHUB_REPOSITORY" \
+            verify_audited_release_tag_policy "$repository"
+            create_remote_release_tag origin "$tag" "$GITHUB_SHA"
+          fi
+
+          release_json="$(find_release_by_tag "$repository" "$tag")"
+          if [[ -n "$release_json" ]]; then
+            release_id="$(node scripts/release-policy.mjs release-id <<< "$release_json")"
+            release_state="$(node scripts/release-policy.mjs release-state <<< "$release_json")"
+            if [[ "$release_state" == "published" ]]; then
+              if validate_published_immutable_release "$release_json" "$version" release-notes.md; then
+                echo "Published immutable release $tag already matches the exact notes and five assets; no mutation is permitted."
+                exit 0
+              fi
+              echo "::error::Published release $tag is mutable or differs from the exact immutable release contract; published releases are never repaired."
+              exit 1
+            fi
+            if ! validate_resumable_draft_release "$release_json" "$version" release-notes.md; then
+              echo "::error::Existing draft $tag is not an owned, exact release draft and will not be mutated."
+              exit 1
+            fi
+          else
+            guard_release_mutation "$repository" origin "$tag" "$GITHUB_SHA"
+            gh release create "$tag" \
+              --repo "$repository" \
               --target "$GITHUB_SHA" \
               --title "Weline Localnet v${version}" \
               --notes-file release-notes.md \
-              --latest
+              --verify-tag \
+              --draft
+            release_json="$(find_release_by_tag "$repository" "$tag")"
+            if ! validate_resumable_draft_release "$release_json" "$version" release-notes.md; then
+              echo "::error::The newly created release draft could not be read back exactly."
+              exit 1
+            fi
+            release_id="$(node scripts/release-policy.mjs release-id <<< "$release_json")"
+          fi
+
+          assets=(
+            "release-assets/Weline_Localnet_${version}_SHA256SUMS.txt"
+            "release-assets/Weline_Localnet_${version}_universal.dmg"
+            "release-assets/Weline_Localnet_${version}_universal.dmg.sha256"
+            "release-assets/Weline_Localnet_${version}_x64-portable.exe"
+            "release-assets/Weline_Localnet_${version}_x64-setup.exe"
+          )
+          guard_release_mutation "$repository" origin "$tag" "$GITHUB_SHA"
+          gh release upload "$tag" "${assets[@]}" --repo "$repository" --clobber
+
+          release_json="$(read_release_by_id "$repository" "$release_id")"
+          if ! validate_release_common "$release_json" "$version" release-notes.md; then
+            echo "::error::Draft $tag does not contain exactly five uploaded assets; refusing to publish."
+            exit 1
+          fi
+
+          guard_release_mutation "$repository" origin "$tag" "$GITHUB_SHA"
+          gh release edit "$tag" \
+            --repo "$repository" \
+            --title "Weline Localnet v${version}" \
+            --notes-file release-notes.md \
+            --draft=false \
+            --prerelease=false \
+            --latest
+
+          release_json="$(read_release_by_id "$repository" "$release_id")"
+          if ! validate_published_immutable_release "$release_json" "$version" release-notes.md; then
+            echo "::error::Published release $tag did not become immutable with the exact five assets. Administrator action is required; the workflow will not repair it."
+            exit 1
           fi
