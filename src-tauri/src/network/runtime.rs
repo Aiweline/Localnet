@@ -22,7 +22,10 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use super::{
     behaviour::{LocalnetBehaviour, LocalnetBehaviourEvent},
-    discovery::{DiscoveryEvent, DiscoveryService, eligible_interfaces, ranked_dial_addresses},
+    discovery::{
+        DiscoveryEvent, DiscoveryRefresh, DiscoveryService, eligible_interfaces,
+        ranked_dial_addresses,
+    },
     transfer,
 };
 use crate::{
@@ -94,6 +97,7 @@ impl DiscoveryDialSchedule {
 #[derive(Debug, Clone)]
 pub enum NetworkCommand {
     SetProfile(LocalProfile),
+    RefreshDiscovery,
     SendFriendRequest(FriendRequest),
     ResolveFriendRequest {
         peer_id: String,
@@ -322,6 +326,7 @@ struct NetworkRuntime {
     receiver: mpsc::Receiver<NetworkCommand>,
     command_sender: mpsc::WeakSender<NetworkCommand>,
     discovery_receiver: mpsc::Receiver<DiscoveryEvent>,
+    discovery_refresh: DiscoveryRefresh,
     listen_port_sender: watch::Sender<Option<u16>>,
     pending: HashMap<PendingRequestId, PendingAction>,
     mdns_addresses: HashMap<PeerId, HashSet<Multiaddr>>,
@@ -392,7 +397,7 @@ impl NetworkRuntime {
             .collect::<HashMap<_, _>>();
         let (remembered_targets_sender, remembered_targets_receiver) =
             watch::channel(sorted_remembered_targets(&remembered_peer_ips));
-        let discovery_receiver =
+        let (discovery_receiver, discovery_refresh) =
             DiscoveryService::spawn(peer_id, listen_port_receiver, remembered_targets_receiver);
         let mdns_enabled =
             !(cfg!(debug_assertions) && std::env::var_os("LOCALNET_DISABLE_MDNS").is_some());
@@ -408,6 +413,7 @@ impl NetworkRuntime {
             receiver,
             command_sender,
             discovery_receiver,
+            discovery_refresh,
             listen_port_sender,
             pending: HashMap::new(),
             mdns_addresses: HashMap::new(),
@@ -473,6 +479,10 @@ impl NetworkRuntime {
         match command {
             NetworkCommand::SetProfile(profile) => {
                 self.local_profile = profile;
+            }
+            NetworkCommand::RefreshDiscovery => {
+                let generation = self.discovery_refresh.trigger();
+                tracing::debug!(generation, "manual LAN discovery refresh triggered");
             }
             NetworkCommand::SendFriendRequest(request) => {
                 let peer_id = parse_peer_id(&request.peer_id)?;
@@ -670,6 +680,7 @@ impl NetworkRuntime {
                 complete_transfer_decision(completion, Err(error.to_string()));
             }
             NetworkCommand::SetProfile(_)
+            | NetworkCommand::RefreshDiscovery
             | NetworkCommand::SendFriendRequest(_)
             | NetworkCommand::ResolveFriendRequest { .. }
             | NetworkCommand::CancelTransfer { .. }
@@ -2971,11 +2982,12 @@ mod tests {
     use tokio::sync::{mpsc, oneshot, watch};
 
     use super::{
-        AcceptedSubmissionOutcome, DIAL_BATCH_DELAY, DiscoveryDialSchedule, NetworkCommand,
-        NetworkEvent, NetworkRuntime, PendingAction, PendingRequestId, TestControlTransport,
-        TestResumableTransport, accept_file_protocol_streams, automatic_receive_path,
-        finalize_accepted_transfer_submission, persist_incoming_offer_with_preflight,
-        persist_incoming_offer_with_preflight_and_accept, validate_transfer_offer,
+        AcceptedSubmissionOutcome, DIAL_BATCH_DELAY, DiscoveryDialSchedule, DiscoveryRefresh,
+        NetworkCommand, NetworkEvent, NetworkRuntime, PendingAction, PendingRequestId,
+        TestControlTransport, TestResumableTransport, accept_file_protocol_streams,
+        automatic_receive_path, finalize_accepted_transfer_submission,
+        persist_incoming_offer_with_preflight, persist_incoming_offer_with_preflight_and_accept,
+        validate_transfer_offer,
     };
     use crate::{
         domain::{
@@ -3208,6 +3220,7 @@ mod tests {
     ) -> NetworkRuntime {
         let (command_sender, receiver) = mpsc::channel(1);
         let (_discovery_sender, discovery_receiver) = mpsc::channel(1);
+        let discovery_refresh = DiscoveryRefresh::new();
         let (listen_port_sender, _listen_port_receiver) = watch::channel(None);
         let (remembered_targets_sender, _remembered_targets_receiver) = watch::channel(Vec::new());
         let mut active_connections = HashMap::new();
@@ -3224,6 +3237,7 @@ mod tests {
             receiver,
             command_sender: command_sender.downgrade(),
             discovery_receiver,
+            discovery_refresh,
             listen_port_sender,
             pending: HashMap::new(),
             mdns_addresses: HashMap::new(),

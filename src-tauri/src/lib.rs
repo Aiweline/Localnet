@@ -40,6 +40,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::bootstrap,
             commands::presence,
+            commands::refresh_discovery,
             commands::complete_onboarding,
             commands::update_nickname,
             commands::update_settings,

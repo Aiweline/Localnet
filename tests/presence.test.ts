@@ -112,3 +112,58 @@ test("a resolved friendship immediately removes the peer from the add-friend lis
     [],
   );
 });
+
+test("friend identity stays bound to PeerId when either device changes its nickname", async () => {
+  const { nearbyPeerEntries } = await import("../src/presence.ts");
+  const peers = [
+    { peerId: "stable-device-id", nickname: "Mac Renamed Again", online: true },
+    { peerId: "different-device-id", nickname: "Mac", online: true },
+    { peerId: "third-device-id", nickname: "Office PC", online: true },
+  ];
+  const friends = [
+    { peerId: "stable-device-id", nickname: "Old Mac Name", online: false },
+  ];
+
+  const entries = nearbyPeerEntries(peers, friends, [], "local-device-id");
+
+  assert.deepEqual(
+    entries.map(({ peer }) => peer.peerId),
+    ["different-device-id", "third-device-id"],
+    "only the stable PeerId may suppress an already-added device",
+  );
+});
+
+test("discovering one friend never hides other addable devices", async () => {
+  const { nearbyPeerEntries } = await import("../src/presence.ts");
+  const peers = [
+    { peerId: "friend-device", nickname: "Mac", online: true },
+    { peerId: "nearby-one", nickname: "Design PC", online: true },
+    { peerId: "nearby-two", nickname: "Meeting Room", online: true },
+  ];
+
+  const entries = nearbyPeerEntries(
+    peers,
+    [{ peerId: "friend-device", nickname: "Mac Before Rename", online: true }],
+    [],
+    "local-device-id",
+  );
+
+  assert.deepEqual(entries.map(({ peer }) => peer.peerId), ["nearby-one", "nearby-two"]);
+});
+
+test("a stalled snapshot cannot occupy every future presence refresh", async () => {
+  const { startSnapshotReconciliation } = await import("../src/presence.ts");
+  let calls = 0;
+  const stop = startSnapshotReconciliation(() => {
+    calls += 1;
+    if (calls === 1) return new Promise<void>(() => undefined);
+  }, 5, 10);
+
+  try {
+    await delay(45);
+  } finally {
+    stop();
+  }
+
+  assert.ok(calls >= 2, `expected the refresh lock to recover after timeout, received ${calls} call(s)`);
+});

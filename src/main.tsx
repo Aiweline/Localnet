@@ -12,6 +12,7 @@ import {
   Monitor, Paperclip, RefreshCw, Search, Send, Settings2, ShieldCheck, UserPlus,
   UsersRound, Wifi, WifiOff, X,
 } from "lucide-react";
+import { submitDiscoveryRefresh } from "./discovery-refresh";
 import { mergePresenceSnapshot, mergeResolvedFriendSnapshot, nearbyPeerEntries, startSnapshotReconciliation } from "./presence";
 import { transferStatusPresentation, type TransferStatusInput } from "./transfer-status";
 import "./styles.css";
@@ -57,6 +58,7 @@ function App() {
   const [toast, setToast] = useState<ToastState | null>(null);
   const [editingProfile, setEditingProfile] = useState(false);
   const [discoverySlow, setDiscoverySlow] = useState(false);
+  const [discoveryRefreshing, setDiscoveryRefreshing] = useState(false);
   const [announcement, setAnnouncement] = useState("");
   const [notificationPermission, setNotificationPermission] = useState<NotificationPermission>("default");
   const refreshTimer = useRef<number | null>(null);
@@ -191,6 +193,20 @@ function App() {
     }
   };
 
+  const refreshNearby = async () => {
+    try {
+      await submitDiscoveryRefresh({
+        triggerNetworkDiscovery: () => invoke("refresh_discovery"),
+        refreshSnapshot: reconcilePresence,
+        setRefreshing: setDiscoveryRefreshing,
+      });
+      setDiscoverySlow(false);
+      setToast({ tone: "info", message: "正在重新扫描附近设备" });
+    } catch (error) {
+      setToast({ tone: "error", message: errorMessage(error) });
+    }
+  };
+
   if (loading) return <BootScreen />;
   if (fatalError && !snapshot.localProfile) return <FatalScreen message={fatalError} onRetry={() => void refresh(true)} />;
   if (!snapshot.localProfile) {
@@ -279,7 +295,23 @@ function App() {
               ))}
             </SidebarSection>
           )}
-          <SidebarSection title="附近用户" count={visibleNearby.length} icon={<Wifi size={14} />}>
+          <SidebarSection
+            title="附近用户"
+            count={visibleNearby.length}
+            icon={<Wifi size={14} />}
+            headerAction={(
+              <button
+                type="button"
+                className="section-action"
+                disabled={discoveryRefreshing}
+                onClick={() => void refreshNearby()}
+                title="重新扫描附近设备"
+                aria-label="重新扫描附近设备"
+              >
+                <RefreshCw size={13} className={discoveryRefreshing ? "spin" : ""} />
+              </button>
+            )}
+          >
             {visibleNearby.map(({ peer, relationship }) => (
               <div className="person-row" key={peer.peerId}>
                 <Avatar name={peer.nickname} online />
@@ -477,8 +509,8 @@ function MessageStatusIcon({ status }: { status: MessageStatus }) {
   return <CheckCheck size={13} />;
 }
 
-function SidebarSection({ title, count, icon, accent, children }: { title: string; count: number; icon?: React.ReactNode; accent?: boolean; children: React.ReactNode }) {
-  return <section className={`sidebar-section ${accent ? "accent" : ""}`}><header>{icon}<span>{title}</span><em>{count}</em></header>{children}</section>;
+function SidebarSection({ title, count, icon, accent, headerAction, children }: { title: string; count: number; icon?: React.ReactNode; accent?: boolean; headerAction?: React.ReactNode; children: React.ReactNode }) {
+  return <section className={`sidebar-section ${accent ? "accent" : ""}`}><header>{icon}<span>{title}</span><em>{count}</em>{headerAction}</header>{children}</section>;
 }
 function SidebarEmpty({ icon, text }: { icon: React.ReactNode; text: string }) { return <div className="sidebar-empty">{icon}<span>{text}</span></div>; }
 function Avatar({ name, online, large }: { name: string; online: boolean; large?: boolean }) {
