@@ -2,6 +2,7 @@ import { StrictMode, useCallback, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getVersion } from "@tauri-apps/api/app";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
@@ -12,8 +13,15 @@ import {
   Monitor, Paperclip, RefreshCw, Search, Send, Settings2, ShieldCheck, UserPlus,
   UsersRound, Wifi, WifiOff, X,
 } from "lucide-react";
+import { submitDiscoveryRefresh } from "./discovery-refresh";
+import {
+  initializeNotificationPermission,
+  requestNotificationPermission,
+  type NotificationPermissionState,
+} from "./notifications";
 import { mergePresenceSnapshot, mergeResolvedFriendSnapshot, nearbyPeerEntries, startSnapshotReconciliation } from "./presence";
 import { transferStatusPresentation, type TransferStatusInput } from "./transfer-status";
+import { checkForUpdate, createUpdateDownloadRequest, type UpdateInfo } from "./update";
 import "./styles.css";
 
 type Platform = "windows" | "macos" | "unknown";
@@ -33,6 +41,8 @@ interface TransferPreferences { autoReceiveFiles: boolean; receiveDirectory: str
 interface PresenceSnapshot { peers: PeerSummary[]; friends: Friend[] }
 interface BootstrapSnapshot { localProfile: LocalProfile | null; transferPreferences: TransferPreferences; peers: PeerSummary[]; friendRequests: FriendRequest[]; friends: Friend[]; messages: ChatMessage[]; transfers: TransferRecord[] }
 interface ToastState { tone: "success" | "error" | "info"; message: string }
+interface DownloadedUpdate { path: string; bytes: number }
+interface UpdateDownloadProgress { version: string; downloadedBytes: number; totalBytes: number }
 type NetworkEvent =
   | { type: "peerDiscovered"; peer: PeerSummary }
   | { type: "peerOffline"; peerId: string; lastSeen: string }
@@ -57,8 +67,17 @@ function App() {
   const [toast, setToast] = useState<ToastState | null>(null);
   const [editingProfile, setEditingProfile] = useState(false);
   const [discoverySlow, setDiscoverySlow] = useState(false);
+  const [discoveryRefreshing, setDiscoveryRefreshing] = useState(false);
   const [announcement, setAnnouncement] = useState("");
-  const [notificationPermission, setNotificationPermission] = useState<NotificationPermission>("default");
+  const [appVersion, setAppVersion] = useState("");
+  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
+  const [updateChecked, setUpdateChecked] = useState(false);
+  const [updateChecking, setUpdateChecking] = useState(false);
+  const [updateDownloading, setUpdateDownloading] = useState(false);
+  const [updateDownloaded, setUpdateDownloaded] = useState(false);
+  const [updateProgress, setUpdateProgress] = useState(0);
+  const [updateError, setUpdateError] = useState("");
+  const [notificationPermission, setNotificationPermission] = useState<NotificationPermissionState>("default");
   const refreshTimer = useRef<number | null>(null);
   const hasOnlinePeer = snapshot.peers.some((peer) => peer.online);
 
@@ -134,9 +153,66 @@ function App() {
 
   useEffect(() => {
     let active = true;
-    void isPermissionGranted()
-      .then((granted) => active && setNotificationPermission(granted ? "granted" : "default"))
-      .catch(() => active && setNotificationPermission("default"));
+    void getVersion()
+      .then((version) => { if (active) setAppVersion(version); })
+      .catch(() => { if (active) setAppVersion(""); });
+    return () => { active = false; };
+  }, []);
+
+  const profilePlatform = snapshot.localProfile?.platform;
+  const runUpdateCheck = useCallback(async (showFeedback = false) => {
+    if (!appVersion || !profilePlatform) return;
+    setUpdateChecking(true);
+    setUpdateError("");
+    try {
+      const update = await checkForUpdate(appVersion, profilePlatform);
+      setUpdateInfo(update);
+      setUpdateChecked(true);
+      setUpdateDownloaded(false);
+      setUpdateProgress(0);
+      if (showFeedback) {
+        setToast(update
+          ? { tone: "info", message: `发现新版本 v${update.version}` }
+          : { tone: "success", message: "当前已是最新版本" });
+      }
+    } catch {
+      setUpdateChecked(true);
+      setUpdateError("检查更新失败，可稍后重试");
+      if (showFeedback) setToast({ tone: "error", message: "检查更新失败，请检查网络后重试" });
+    } finally {
+      setUpdateChecking(false);
+    }
+  }, [appVersion, profilePlatform]);
+
+  useEffect(() => {
+    if (appVersion && profilePlatform) void runUpdateCheck();
+  }, [appVersion, profilePlatform, runUpdateCheck]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen<UpdateDownloadProgress>("localnet://update-progress", ({ payload }) => {
+      if (!disposed && updateInfo?.version === payload.version && payload.totalBytes > 0) {
+        setUpdateProgress(Math.min(100, Math.round((payload.downloadedBytes / payload.totalBytes) * 100)));
+      }
+    }).then((cleanup) => {
+      if (disposed) cleanup(); else unlisten = cleanup;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [updateInfo?.version]);
+
+  useEffect(() => {
+    let active = true;
+    void initializeNotificationPermission({
+      isPermissionGranted,
+      requestPermission,
+      store: window.localStorage,
+    }).then((permission) => {
+      if (active) setNotificationPermission(permission);
+    });
     return () => { active = false; };
   }, []);
 
@@ -178,8 +254,11 @@ function App() {
   const enableSystemNotifications = async () => {
     setBusyKey("notifications");
     try {
-      const granted = await isPermissionGranted();
-      const permission = granted ? "granted" : await requestPermission();
+      const permission = await requestNotificationPermission({
+        isPermissionGranted,
+        requestPermission,
+        store: window.localStorage,
+      });
       setNotificationPermission(permission);
       setToast(permission === "granted"
         ? { tone: "success", message: "系统通知已开启" }
@@ -188,6 +267,52 @@ function App() {
       setToast({ tone: "error", message: errorMessage(error) });
     } finally {
       setBusyKey("");
+    }
+  };
+
+  const refreshNearby = async () => {
+    try {
+      await submitDiscoveryRefresh({
+        triggerNetworkDiscovery: () => invoke("refresh_discovery"),
+        refreshSnapshot: reconcilePresence,
+        setRefreshing: setDiscoveryRefreshing,
+      });
+      setDiscoverySlow(false);
+      setToast({ tone: "info", message: "正在重新扫描附近设备" });
+    } catch (error) {
+      setToast({ tone: "error", message: errorMessage(error) });
+    }
+  };
+
+  const downloadAvailableUpdate = async () => {
+    if (!updateInfo || updateDownloading) return;
+    setUpdateDownloading(true);
+    setUpdateDownloaded(false);
+    setUpdateError("");
+    setUpdateProgress(0);
+    try {
+      const request = createUpdateDownloadRequest(updateInfo);
+      await invoke<DownloadedUpdate>("download_update", { request });
+      setUpdateProgress(100);
+      setUpdateDownloaded(true);
+      setToast({ tone: "success", message: "更新包下载并校验完成，可以打开安装" });
+    } catch (error) {
+      const message = errorMessage(error);
+      setUpdateError(message);
+      setToast({ tone: "error", message });
+    } finally {
+      setUpdateDownloading(false);
+    }
+  };
+
+  const openAvailableUpdate = async () => {
+    if (!updateInfo || !updateDownloaded) return;
+    try {
+      const request = createUpdateDownloadRequest(updateInfo);
+      await invoke("open_downloaded_update", { request });
+      setToast({ tone: "info", message: "安装包已打开，请按系统提示完成更新" });
+    } catch (error) {
+      setToast({ tone: "error", message: errorMessage(error) });
     }
   };
 
@@ -249,7 +374,7 @@ function App() {
       <aside className="sidebar">
         <header className="brand-row">
           <span className="brand-mark"><MessageCircleMore size={22} /></span>
-          <span><strong>Weline Localnet</strong><small>局域网私密传输</small></span>
+          <span><strong>Weline Localnet {appVersion && <span className="version-badge">v{appVersion}</span>}</strong><small>局域网私密传输</small></span>
           <button className="icon-button" title="设置" onClick={() => setEditingProfile(true)}><Settings2 size={18} /></button>
         </header>
         <button className="profile-card" onClick={() => setEditingProfile(true)}>
@@ -279,7 +404,23 @@ function App() {
               ))}
             </SidebarSection>
           )}
-          <SidebarSection title="附近用户" count={visibleNearby.length} icon={<Wifi size={14} />}>
+          <SidebarSection
+            title="附近用户"
+            count={visibleNearby.length}
+            icon={<Wifi size={14} />}
+            headerAction={(
+              <button
+                type="button"
+                className="section-action"
+                disabled={discoveryRefreshing}
+                onClick={() => void refreshNearby()}
+                title="重新扫描附近设备"
+                aria-label="重新扫描附近设备"
+              >
+                <RefreshCw size={13} className={discoveryRefreshing ? "spin" : ""} />
+              </button>
+            )}
+          >
             {visibleNearby.map(({ peer, relationship }) => (
               <div className="person-row" key={peer.peerId}>
                 <Avatar name={peer.nickname} online />
@@ -305,6 +446,17 @@ function App() {
       </aside>
 
       <section className="content-shell">
+        {updateInfo && (
+          <UpdateBanner
+            update={updateInfo}
+            downloading={updateDownloading}
+            downloaded={updateDownloaded}
+            progress={updateProgress}
+            error={updateError}
+            onDownload={() => void downloadAvailableUpdate()}
+            onOpen={() => void openAvailableUpdate()}
+          />
+        )}
         {primaryIncomingRequest && (
           <IncomingRequestBanner
             request={primaryIncomingRequest}
@@ -333,7 +485,7 @@ function App() {
       </section>
 
       {editingProfile && (
-        <ProfileDialog profile={profile} transferPreferences={snapshot.transferPreferences} busy={busyKey === "profile"} directoryBusy={busyKey === "open-receive-directory"} notificationBusy={busyKey === "notifications"} notificationPermission={notificationPermission} onEnableNotifications={enableSystemNotifications} onChooseDirectory={async (currentDirectory) => {
+        <ProfileDialog profile={profile} transferPreferences={snapshot.transferPreferences} busy={busyKey === "profile"} directoryBusy={busyKey === "open-receive-directory"} notificationBusy={busyKey === "notifications"} notificationPermission={notificationPermission} appVersion={appVersion} updateChecking={updateChecking} updateStatus={updateInfo ? `发现新版本 v${updateInfo.version}` : updateError || (updateChecked ? "已是最新版" : "尚未检查")} onCheckUpdates={() => runUpdateCheck(true)} onEnableNotifications={enableSystemNotifications} onChooseDirectory={async (currentDirectory) => {
           const selected = await open({ multiple: false, directory: true, defaultPath: currentDirectory || undefined });
           return typeof selected === "string" ? selected : null;
         }} onOpenDirectory={async (path) => {
@@ -377,6 +529,31 @@ function IncomingRequestBanner({ request, platform, count, busy, onResolve }: {
           {busy ? <LoaderCircle size={15} className="spin" /> : <Check size={15} />} 接受
         </button>
       </div>
+    </section>
+  );
+}
+
+function UpdateBanner({ update, downloading, downloaded, progress, error, onDownload, onOpen }: {
+  update: UpdateInfo;
+  downloading: boolean;
+  downloaded: boolean;
+  progress: number;
+  error: string;
+  onDownload: () => void;
+  onOpen: () => void;
+}) {
+  return (
+    <section className="update-banner" role="region" aria-label="应用更新">
+      <span className="update-banner-icon"><FileDown size={19} /></span>
+      <span className="update-banner-copy">
+        <strong>发现新版本 v{update.version}</strong>
+        <small>{error || (downloaded ? "更新包已通过 SHA-256 校验" : downloading ? `正在下载 ${progress}%` : "来自 Weline Localnet 官方 GitHub Release")}</small>
+        {downloading && <span role="progressbar" aria-label={`更新下载 ${progress}%`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress}><i style={{ width: `${progress}%` }} /></span>}
+      </span>
+      <button type="button" disabled={downloading} onClick={downloaded ? onOpen : onDownload}>
+        {downloading ? <LoaderCircle size={14} className="spin" /> : downloaded ? <FolderOpen size={14} /> : <FileDown size={14} />}
+        {downloading ? `下载中 ${progress}%` : downloaded ? "打开安装包" : error ? "重新下载" : "下载更新"}
+      </button>
     </section>
   );
 }
@@ -477,8 +654,8 @@ function MessageStatusIcon({ status }: { status: MessageStatus }) {
   return <CheckCheck size={13} />;
 }
 
-function SidebarSection({ title, count, icon, accent, children }: { title: string; count: number; icon?: React.ReactNode; accent?: boolean; children: React.ReactNode }) {
-  return <section className={`sidebar-section ${accent ? "accent" : ""}`}><header>{icon}<span>{title}</span><em>{count}</em></header>{children}</section>;
+function SidebarSection({ title, count, icon, accent, headerAction, children }: { title: string; count: number; icon?: React.ReactNode; accent?: boolean; headerAction?: React.ReactNode; children: React.ReactNode }) {
+  return <section className={`sidebar-section ${accent ? "accent" : ""}`}><header>{icon}<span>{title}</span><em>{count}</em>{headerAction}</header>{children}</section>;
 }
 function SidebarEmpty({ icon, text }: { icon: React.ReactNode; text: string }) { return <div className="sidebar-empty">{icon}<span>{text}</span></div>; }
 function Avatar({ name, online, large }: { name: string; online: boolean; large?: boolean }) {
@@ -495,13 +672,17 @@ function Onboarding({ busy, onSubmit }: { busy: boolean; onSubmit: (nickname: st
   return <main className="onboarding-screen"><section className="onboarding-card"><div className="onboarding-copy"><span className="brand-mark large"><MessageCircleMore size={30} /></span><p className="eyebrow">欢迎使用 WELINE LOCALNET</p><h1>无需服务器，直接和内网用户连接。</h1><p>设置一个昵称，其他 Weline Localnet 用户就能在附近列表中发现你。</p><ul><li><Wifi size={17} /> 自动发现同一局域网用户</li><li><ShieldCheck size={17} /> 设备身份保存在本机</li><li><Paperclip size={17} /> 文字、图片和文件直传</li></ul></div><form className="nickname-form" onSubmit={(event) => { event.preventDefault(); if (nickname.trim()) void onSubmit(nickname); }}><span className="form-icon"><CircleUserRound size={25} /></span><h2>你希望别人怎么称呼你？</h2><p>昵称只会显示给同一内网中的 Weline Localnet 用户。</p><label>昵称<input autoFocus maxLength={32} value={nickname} onChange={(event) => setNickname(event.target.value)} placeholder="例如：小林" /></label><button className="primary-button" disabled={busy || !nickname.trim()}>{busy ? <LoaderCircle size={18} className="spin" /> : <Wifi size={18} />}{busy ? "正在启动…" : "进入 Weline Localnet"}</button><small><ShieldCheck size={13} /> 不需要账号、手机号或互联网连接</small></form></section></main>;
 }
 
-function ProfileDialog({ profile, transferPreferences, busy, directoryBusy, notificationBusy, notificationPermission, onEnableNotifications, onChooseDirectory, onOpenDirectory, onClose, onSave }: {
+function ProfileDialog({ profile, transferPreferences, busy, directoryBusy, notificationBusy, notificationPermission, appVersion, updateChecking, updateStatus, onCheckUpdates, onEnableNotifications, onChooseDirectory, onOpenDirectory, onClose, onSave }: {
   profile: LocalProfile;
   transferPreferences: TransferPreferences;
   busy: boolean;
   directoryBusy: boolean;
   notificationBusy: boolean;
   notificationPermission: NotificationPermission;
+  appVersion: string;
+  updateChecking: boolean;
+  updateStatus: string;
+  onCheckUpdates: () => Promise<void>;
   onEnableNotifications: () => Promise<void>;
   onChooseDirectory: (currentDirectory: string) => Promise<string | null>;
   onOpenDirectory: (path: string) => Promise<void>;
@@ -544,6 +725,13 @@ function ProfileDialog({ profile, transferPreferences, busy, directoryBusy, noti
           <button type="button" disabled={notificationBusy || notificationEnabled} onClick={() => void onEnableNotifications()}>
             {notificationBusy ? <LoaderCircle size={13} className="spin" /> : notificationEnabled ? <Check size={13} /> : null}
             {notificationEnabled ? "已开启" : notificationPermission === "denied" ? "重新授权" : "开启"}
+          </button>
+        </div>
+        <div className="update-setting">
+          <RefreshCw size={17} />
+          <span><strong>Weline Localnet {appVersion ? `v${appVersion}` : ""}</strong><small>{updateStatus}</small></span>
+          <button type="button" disabled={updateChecking} onClick={() => void onCheckUpdates()}>
+            {updateChecking && <LoaderCircle size={13} className="spin" />}{updateChecking ? "检查中…" : "检查更新"}
           </button>
         </div>
         <div className="about-setting">

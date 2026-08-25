@@ -1,4 +1,5 @@
 const DEFAULT_RECONCILIATION_INTERVAL_MS = 3_000;
+const DEFAULT_RECONCILIATION_TIMEOUT_MS = 2_500;
 
 export type NearbyRelationship = "available" | "pending";
 
@@ -79,15 +80,26 @@ export function mergeResolvedFriendSnapshot<
 export function startSnapshotReconciliation(
   refresh: () => void | Promise<void>,
   intervalMs = DEFAULT_RECONCILIATION_INTERVAL_MS,
+  timeoutMs = DEFAULT_RECONCILIATION_TIMEOUT_MS,
 ): () => void {
   let running = false;
 
   const reconcile = async () => {
     if (running) return;
     running = true;
+    let timeout: ReturnType<typeof globalThis.setTimeout> | undefined;
     try {
-      await refresh();
+      await Promise.race([
+        Promise.resolve(refresh()),
+        new Promise<never>((_, reject) => {
+          timeout = globalThis.setTimeout(
+            () => reject(new Error("presence snapshot refresh timed out")),
+            timeoutMs,
+          );
+        }),
+      ]);
     } finally {
+      if (timeout !== undefined) globalThis.clearTimeout(timeout);
       running = false;
     }
   };

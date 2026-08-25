@@ -45,6 +45,11 @@ pub fn presence(state: State<'_, AppState>) -> Result<PresenceSnapshot, AppError
 }
 
 #[tauri::command]
+pub fn refresh_discovery(state: State<'_, AppState>) -> Result<(), AppError> {
+    state.network()?.try_send(NetworkCommand::RefreshDiscovery)
+}
+
+#[tauri::command]
 pub fn complete_onboarding(
     nickname: String,
     app_handle: AppHandle,

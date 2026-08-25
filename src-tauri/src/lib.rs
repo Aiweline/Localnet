@@ -9,6 +9,7 @@ mod state;
 mod storage;
 mod transfer_manifest;
 pub mod transfer_policy;
+mod update;
 pub mod volume_preflight;
 
 use std::{path::PathBuf, sync::OnceLock};
@@ -40,6 +41,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::bootstrap,
             commands::presence,
+            commands::refresh_discovery,
             commands::complete_onboarding,
             commands::update_nickname,
             commands::update_settings,
@@ -52,6 +54,8 @@ pub fn run() {
             commands::cancel_transfer,
             commands::image_preview,
             commands::update_transfer_preferences,
+            update::download_update,
+            update::open_downloaded_update,
         ])
         .setup(|app| {
             initialize_logging();

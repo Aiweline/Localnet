@@ -9,5 +9,5 @@
     "skipLibCheck": true,
     "types": ["node"]
   },
-  "include": ["tests/transfer-status.test.ts"]
+  "include": ["tests/*.test.ts"]
 }

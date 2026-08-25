@@ -894,6 +894,7 @@ fn public_resumable_receive_error_message(error: &AppError) -> &'static str {
         AppError::Storage(_) => "本地传输状态处理失败，请刷新后重试",
         AppError::Identity(_) => "本机身份校验失败，请重新启动应用后重试",
         AppError::Permission(_) | AppError::NotFriend => "文件传输未获授权，连接已拒绝",
+        AppError::Update(_) => "应用更新状态异常，不影响当前文件传输",
         AppError::IncompatibleProtocol => "双方软件版本不兼容，请升级后重试",
         AppError::DestinationPreflight(failure) => failure.public_message(),
     }

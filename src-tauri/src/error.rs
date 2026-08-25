@@ -83,6 +83,8 @@ pub enum AppError {
     Network(String),
     #[error("{0}")]
     Permission(String),
+    #[error("{0}")]
+    Update(String),
     #[error("好友当前不在线，请对方启动 Weline Localnet 后重试")]
     OfflinePeer,
     #[error("对方尚未成为好友，请先发送好友申请并等待接受")]
@@ -112,6 +114,7 @@ impl AppError {
             Self::Identity(_) => "identity_error",
             Self::Network(_) => "network_error",
             Self::Permission(_) => "permission_error",
+            Self::Update(_) => "update_error",
             Self::OfflinePeer => "peer_offline",
             Self::NotFriend => "not_friend",
             Self::IncompatibleProtocol => "incompatible_protocol",

@@ -55,24 +55,58 @@ enum DiscoveryPacket {
 
 pub(super) struct DiscoveryService;
 
+#[derive(Clone)]
+pub(super) struct DiscoveryRefresh {
+    generation: watch::Sender<u64>,
+}
+
+impl DiscoveryRefresh {
+    pub(super) fn new() -> Self {
+        let (generation, _) = watch::channel(0);
+        Self { generation }
+    }
+
+    fn subscribe(&self) -> watch::Receiver<u64> {
+        self.generation.subscribe()
+    }
+
+    pub(super) fn trigger(&self) -> u64 {
+        let mut triggered = 0;
+        self.generation.send_modify(|generation| {
+            *generation = generation.wrapping_add(1);
+            if *generation == 0 {
+                *generation = 1;
+            }
+            triggered = *generation;
+        });
+        triggered
+    }
+}
+
 impl DiscoveryService {
     pub(super) fn spawn(
         peer_id: PeerId,
         listen_port: watch::Receiver<Option<u16>>,
         remembered_targets: watch::Receiver<Vec<Ipv4Addr>>,
-    ) -> mpsc::Receiver<DiscoveryEvent> {
+    ) -> (mpsc::Receiver<DiscoveryEvent>, DiscoveryRefresh) {
         let (event_sender, event_receiver) = mpsc::channel(128);
+        let refresh = DiscoveryRefresh::new();
 
         tauri::async_runtime::spawn(receive_beacons(
             peer_id,
             listen_port.clone(),
             event_sender.clone(),
         ));
-        tauri::async_runtime::spawn(announce_beacons(peer_id, listen_port.clone()));
+        tauri::async_runtime::spawn(announce_beacons(
+            peer_id,
+            listen_port.clone(),
+            refresh.subscribe(),
+        ));
         tauri::async_runtime::spawn(probe_peers(
             peer_id,
             listen_port.clone(),
             event_sender.clone(),
+            refresh.subscribe(),
         ));
         tauri::async_runtime::spawn(probe_remembered_peers(
             peer_id,
@@ -84,7 +118,7 @@ impl DiscoveryService {
         #[cfg(target_os = "windows")]
         mdns_compat::spawn(peer_id, event_sender.clone());
 
-        event_receiver
+        (event_receiver, refresh)
     }
 }
 
@@ -169,13 +203,24 @@ async fn receive_beacons(
     }
 }
 
-async fn announce_beacons(peer_id: PeerId, listen_port: watch::Receiver<Option<u16>>) {
+async fn announce_beacons(
+    peer_id: PeerId,
+    listen_port: watch::Receiver<Option<u16>>,
+    mut refresh: watch::Receiver<u64>,
+) {
     time::sleep(startup_jitter(peer_id)).await;
     let mut interval = time::interval(ANNOUNCE_INTERVAL);
     interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
     loop {
-        interval.tick().await;
+        tokio::select! {
+            _ = interval.tick() => {}
+            changed = refresh.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+        }
         let Some(port) = *listen_port.borrow() else {
             continue;
         };
@@ -208,13 +253,21 @@ async fn probe_peers(
     peer_id: PeerId,
     listen_port: watch::Receiver<Option<u16>>,
     sender: mpsc::Sender<DiscoveryEvent>,
+    mut refresh: watch::Receiver<u64>,
 ) {
     time::sleep(startup_jitter(peer_id) + Duration::from_millis(250)).await;
     let mut interval = time::interval(PROBE_INTERVAL);
     interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
     loop {
-        interval.tick().await;
+        tokio::select! {
+            _ = interval.tick() => {}
+            changed = refresh.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+        }
         let Some(port) = *listen_port.borrow() else {
             continue;
         };
@@ -726,5 +779,34 @@ mod tests {
             vec![remembered_outside_local_24]
         );
         assert!(!unicast_probe_targets(&interface).contains(&remembered_outside_local_24));
+    }
+
+    #[test]
+    fn manual_refresh_wakes_every_discovery_path_and_can_be_reused() {
+        let refresh = DiscoveryRefresh::new();
+        let mut announce = refresh.subscribe();
+        let mut generic_probe = refresh.subscribe();
+
+        assert_eq!(refresh.trigger(), 1);
+        assert!(
+            announce
+                .has_changed()
+                .expect("announce subscriber remains open")
+        );
+        assert!(
+            generic_probe
+                .has_changed()
+                .expect("probe subscriber remains open")
+        );
+        assert_eq!(*announce.borrow_and_update(), 1);
+        assert_eq!(*generic_probe.borrow_and_update(), 1);
+
+        assert_eq!(refresh.trigger(), 2);
+        assert!(announce.has_changed().expect("announce can refresh again"));
+        assert!(
+            generic_probe
+                .has_changed()
+                .expect("probe can refresh again")
+        );
     }
 }
