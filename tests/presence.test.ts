@@ -3,7 +3,7 @@ import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 
 test("reconciles an online friend even when the presence event was missed", async () => {
-  const presenceModule = await import("../src/presence.ts").catch(() => ({}));
+  const presenceModule = await import("../src/presence.ts");
   assert.equal(
     typeof presenceModule.startSnapshotReconciliation,
     "function",

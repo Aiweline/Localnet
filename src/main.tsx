@@ -13,6 +13,11 @@ import {
   UsersRound, Wifi, WifiOff, X,
 } from "lucide-react";
 import { submitDiscoveryRefresh } from "./discovery-refresh";
+import {
+  initializeNotificationPermission,
+  requestNotificationPermission,
+  type NotificationPermissionState,
+} from "./notifications";
 import { mergePresenceSnapshot, mergeResolvedFriendSnapshot, nearbyPeerEntries, startSnapshotReconciliation } from "./presence";
 import { transferStatusPresentation, type TransferStatusInput } from "./transfer-status";
 import "./styles.css";
@@ -60,7 +65,7 @@ function App() {
   const [discoverySlow, setDiscoverySlow] = useState(false);
   const [discoveryRefreshing, setDiscoveryRefreshing] = useState(false);
   const [announcement, setAnnouncement] = useState("");
-  const [notificationPermission, setNotificationPermission] = useState<NotificationPermission>("default");
+  const [notificationPermission, setNotificationPermission] = useState<NotificationPermissionState>("default");
   const refreshTimer = useRef<number | null>(null);
   const hasOnlinePeer = snapshot.peers.some((peer) => peer.online);
 
@@ -136,9 +141,13 @@ function App() {
 
   useEffect(() => {
     let active = true;
-    void isPermissionGranted()
-      .then((granted) => active && setNotificationPermission(granted ? "granted" : "default"))
-      .catch(() => active && setNotificationPermission("default"));
+    void initializeNotificationPermission({
+      isPermissionGranted,
+      requestPermission,
+      store: window.localStorage,
+    }).then((permission) => {
+      if (active) setNotificationPermission(permission);
+    });
     return () => { active = false; };
   }, []);
 
@@ -180,8 +189,11 @@ function App() {
   const enableSystemNotifications = async () => {
     setBusyKey("notifications");
     try {
-      const granted = await isPermissionGranted();
-      const permission = granted ? "granted" : await requestPermission();
+      const permission = await requestNotificationPermission({
+        isPermissionGranted,
+        requestPermission,
+        store: window.localStorage,
+      });
       setNotificationPermission(permission);
       setToast(permission === "granted"
         ? { tone: "success", message: "系统通知已开启" }

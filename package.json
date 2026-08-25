@@ -17,6 +17,7 @@
     "tauri": "tauri",
     "check": "pnpm typecheck && pnpm build",
     "test:presence": "node --test --experimental-strip-types tests/presence.test.ts",
+    "test:client": "node --test --experimental-strip-types tests/discovery-refresh.test.ts tests/notifications.test.ts tests/update.test.ts",
     "test:transfer-status": "node --test --experimental-strip-types tests/transfer-status.test.ts",
     "release:check": "node scripts/release-version.mjs --check",
     "release:version": "node scripts/release-version.mjs"
