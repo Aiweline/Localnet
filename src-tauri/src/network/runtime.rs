@@ -49,6 +49,8 @@ const EVENT_NAME: &str = "localnet://event";
 const FRIEND_REQUEST_LIMIT: usize = 5;
 const FRIEND_REQUEST_WINDOW: Duration = Duration::from_secs(60);
 const INCOMING_START_TIMEOUT: Duration = Duration::from_secs(35);
+const TERMINAL_NOTIFICATIONS_PER_PEER: usize = 8;
+const TERMINAL_NOTIFICATIONS_GLOBAL: usize = 32;
 
 #[derive(Debug, Clone)]
 pub enum NetworkCommand {
@@ -285,6 +287,7 @@ struct NetworkRuntime {
     mdns_addresses: HashMap<PeerId, HashSet<Multiaddr>>,
     beacon_addresses: HashMap<PeerId, HashMap<Multiaddr, Instant>>,
     active_connections: HashMap<PeerId, usize>,
+    terminal_retry_cursor: usize,
     friend_request_times: HashMap<PeerId, VecDeque<Instant>>,
     mdns_enabled: bool,
     #[cfg(test)]
@@ -358,6 +361,7 @@ impl NetworkRuntime {
             mdns_addresses: HashMap::new(),
             beacon_addresses: HashMap::new(),
             active_connections: HashMap::new(),
+            terminal_retry_cursor: 0,
             friend_request_times: HashMap::new(),
             mdns_enabled,
             #[cfg(test)]
@@ -1231,13 +1235,6 @@ impl NetworkRuntime {
                 {
                     return Err(unauthorized());
                 }
-                let transfer = self
-                    .storage
-                    .get_transfer(&transfer_id)?
-                    .ok_or_else(unauthorized)?;
-                if transfer.peer_id != peer_id_text || transfer.transfer_protocol != 2 {
-                    return Err(unauthorized());
-                }
                 let terminal_status = match state {
                     TransferTerminalState::Cancelled => TransferStatus::Cancelled,
                     TransferTerminalState::Failed => TransferStatus::Failed,
@@ -1340,6 +1337,24 @@ impl NetworkRuntime {
                         &expected_peer,
                         &expected_generation,
                     )?;
+                    self.retry_terminal_notifications_for_connected_peers()?;
+                }
+            }
+            (
+                PendingAction::TransferTerminal {
+                    peer_id: expected_peer,
+                    transfer_id: expected_transfer,
+                    generation: expected_generation,
+                },
+                ControlResponse::Rejected { .. },
+            ) => {
+                if peer_id.to_string() == expected_peer {
+                    self.storage.acknowledge_terminal_notification(
+                        &expected_transfer,
+                        &expected_peer,
+                        &expected_generation,
+                    )?;
+                    self.retry_terminal_notifications_for_connected_peers()?;
                 }
             }
             (
@@ -1408,7 +1423,7 @@ impl NetworkRuntime {
                         transfer.error.as_deref(),
                     )?;
                     self.emit(NetworkEvent::TransferUpdated { transfer });
-                    self.flush_terminal_notifications_for_peer(peer_id)?;
+                    self.retry_terminal_notifications_for_connected_peers()?;
                 }
                 self.emit(NetworkEvent::NetworkError {
                     code: "transfer.resume_rejected".to_string(),
@@ -1545,36 +1560,87 @@ impl NetworkRuntime {
             .any(|capability| capability == FILE_RESUME_V2_CAPABILITY);
         self.emit(NetworkEvent::PeerDiscovered { peer });
         if supports_resume && self.storage.is_friend(&peer_id.to_string())? {
-            self.flush_terminal_notifications_for_peer(peer_id)?;
+            self.retry_terminal_notifications_for_connected_peers()?;
             self.resume_outgoing_for_peer(peer_id)?;
         }
         Ok(())
     }
 
     fn retry_terminal_notifications_for_connected_peers(&mut self) -> Result<(), AppError> {
-        let connected = self
+        let mut connected = self
             .active_connections
             .iter()
             .filter_map(|(peer_id, count)| (*count > 0).then_some(*peer_id))
             .collect::<Vec<_>>();
-        for peer_id in connected {
-            self.flush_terminal_notifications_for_peer(peer_id)?;
+        if connected.is_empty() {
+            self.terminal_retry_cursor = 0;
+            return Ok(());
+        }
+        connected.sort_by_key(ToString::to_string);
+        let start = self.terminal_retry_cursor % connected.len();
+        connected.rotate_left(start);
+        self.terminal_retry_cursor = (start + 1) % connected.len();
+
+        loop {
+            let mut admitted_this_round = 0_usize;
+            for peer_id in &connected {
+                admitted_this_round +=
+                    self.flush_terminal_notifications_for_peer_up_to(*peer_id, 1)?;
+            }
+            if admitted_this_round == 0 {
+                break;
+            }
         }
         Ok(())
     }
 
     fn flush_terminal_notifications_for_peer(&mut self, peer_id: PeerId) -> Result<(), AppError> {
+        self.flush_terminal_notifications_for_peer_up_to(peer_id, usize::MAX)
+            .map(|_| ())
+    }
+
+    fn flush_terminal_notifications_for_peer_up_to(
+        &mut self,
+        peer_id: PeerId,
+        admission_limit: usize,
+    ) -> Result<usize, AppError> {
         let peer_id_text = peer_id.to_string();
         if !self.storage.is_friend(&peer_id_text)?
             || !self.peer_supports_resumable_transfers(&peer_id_text)?
         {
-            return Ok(());
+            return Ok(0);
         }
 
-        for notification in self
+        let global_in_flight = self
+            .pending
+            .values()
+            .filter(|action| matches!(action, PendingAction::TransferTerminal { .. }))
+            .count();
+        let peer_in_flight = self
+            .pending
+            .values()
+            .filter(|action| {
+                matches!(
+                    action,
+                    PendingAction::TransferTerminal { peer_id, .. }
+                        if peer_id == &peer_id_text
+                )
+            })
+            .count();
+        let available = TERMINAL_NOTIFICATIONS_GLOBAL
+            .saturating_sub(global_in_flight)
+            .min(TERMINAL_NOTIFICATIONS_PER_PEER.saturating_sub(peer_in_flight))
+            .min(admission_limit);
+        if available == 0 {
+            return Ok(0);
+        }
+
+        let page_limit = peer_in_flight.saturating_add(available);
+        let notifications = self
             .storage
-            .list_pending_terminal_notifications(&peer_id_text)?
-        {
+            .list_pending_terminal_notifications_page(&peer_id_text, page_limit)?;
+        let mut admitted = 0_usize;
+        for notification in notifications {
             let already_pending = self.pending.values().any(|action| {
                 matches!(
                     action,
@@ -1589,6 +1655,9 @@ impl NetworkRuntime {
             });
             if already_pending {
                 continue;
+            }
+            if admitted == available {
+                break;
             }
             let state = match notification.state {
                 TransferStatus::Cancelled => TransferTerminalState::Cancelled,
@@ -1614,6 +1683,7 @@ impl NetworkRuntime {
                             generation: notification.generation,
                         },
                     );
+                    admitted += 1;
                 }
                 Err(error) => {
                     tracing::debug!(
@@ -1625,7 +1695,7 @@ impl NetworkRuntime {
                 }
             }
         }
-        Ok(())
+        Ok(admitted)
     }
 
     fn resume_outgoing_for_peer(&mut self, peer_id: PeerId) -> Result<(), AppError> {
@@ -2909,6 +2979,7 @@ mod tests {
             mdns_addresses: HashMap::new(),
             beacon_addresses: HashMap::new(),
             active_connections,
+            terminal_retry_cursor: 0,
             friend_request_times: HashMap::new(),
             mdns_enabled: false,
             test_control_transport: Some(TestControlTransport::default()),
@@ -3562,6 +3633,379 @@ mod tests {
         drop(runtime);
         drop(storage);
         fs::remove_dir_all(directory).expect("remove remote terminal control fixture");
+    }
+
+    #[test]
+    fn production_terminal_ack_is_not_blocked_by_durable_offline_media_cleanup() {
+        let (directory, storage, _) = automatic_fixture("terminal-offline-media-ack");
+        let media = directory.join("selected-media");
+        let detached_media = directory.join("detached-media");
+        fs::create_dir_all(&media).expect("create selected media fixture");
+        let remote_peer = deterministic_peer_id(93);
+        add_runtime_friend(&storage, &remote_peer.to_string());
+        persist_runtime_resume_capability(&storage, &remote_peer.to_string());
+        let mut offer = v2_offer();
+        offer.transfer_id = "terminal-offline-media-ack".to_string();
+        let accepted =
+            prepare_manual_runtime_acceptance(&media, &storage, &remote_peer.to_string(), &offer);
+        let partial = PathBuf::from(
+            accepted
+                .partial_path
+                .as_deref()
+                .expect("accepted transfer owns a resumable partial"),
+        );
+        fs::rename(&media, &detached_media).expect("simulate unavailable destination media");
+        let mut runtime = production_test_runtime(storage.clone(), &directory, remote_peer);
+        let request = || ControlRequest::TransferTerminal {
+            transfer_id: offer.transfer_id.clone(),
+            generation: "offline-media-generation".to_string(),
+            state: TransferTerminalState::Failed,
+        };
+
+        assert!(matches!(
+            runtime
+                .handle_inbound_request(remote_peer, request())
+                .expect("durably staged filesystem cleanup cannot suppress terminal ACK"),
+            ControlResponse::TransferTerminalAck { transfer_id, generation }
+                if transfer_id == offer.transfer_id
+                    && generation == "offline-media-generation"
+        ));
+        let failed = storage
+            .get_transfer(&offer.transfer_id)
+            .unwrap()
+            .expect("terminal transfer remains visible");
+        assert_eq!(failed.status, TransferStatus::Failed);
+        assert!(failed.partial_path.is_none());
+        assert!(failed.reservation_token.is_none());
+
+        fs::rename(&detached_media, &media).expect("restore destination media");
+        assert!(matches!(
+            runtime
+                .handle_inbound_request(remote_peer, request())
+                .expect("idempotent terminal retry drains the stable cleanup generation"),
+            ControlResponse::TransferTerminalAck { .. }
+        ));
+        assert!(!partial.exists());
+
+        drop(runtime);
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove terminal offline media fixture");
+    }
+
+    #[test]
+    fn production_terminal_response_is_indistinguishable_for_exact_unknown_and_wrong_owner_ids() {
+        let (directory, storage, _) = automatic_fixture("terminal-privacy");
+        let remote_peer = deterministic_peer_id(83);
+        let other_owner = deterministic_peer_id(84);
+        add_runtime_friend(&storage, &remote_peer.to_string());
+        persist_runtime_resume_capability(&storage, &remote_peer.to_string());
+        let exact_id = "terminal-privacy-exact";
+        let wrong_owner_id = "terminal-privacy-wrong-owner";
+        storage
+            .upsert_transfer(&resume_record(
+                exact_id,
+                &remote_peer.to_string(),
+                Direction::Incoming,
+                TransferProtocol::ResumableV2 as u8,
+                TransferStatus::Paused,
+                0,
+            ))
+            .expect("persist exact terminal row");
+        storage
+            .upsert_transfer(&resume_record(
+                wrong_owner_id,
+                &other_owner.to_string(),
+                Direction::Incoming,
+                TransferProtocol::ResumableV2 as u8,
+                TransferStatus::Paused,
+                0,
+            ))
+            .expect("persist wrong-owner terminal row");
+        let mut runtime = production_test_runtime(storage.clone(), &directory, remote_peer);
+
+        for transfer_id in [exact_id, "terminal-privacy-unknown", wrong_owner_id] {
+            assert!(matches!(
+                runtime
+                    .handle_inbound_request(
+                        remote_peer,
+                        ControlRequest::TransferTerminal {
+                            transfer_id: transfer_id.to_string(),
+                            generation: format!("generation-{transfer_id}"),
+                            state: TransferTerminalState::Cancelled,
+                        },
+                    )
+                    .expect("authorized terminal IDs have one privacy-preserving response"),
+                ControlResponse::TransferTerminalAck {
+                    transfer_id: acknowledged,
+                    generation,
+                } if acknowledged == transfer_id && generation == format!("generation-{transfer_id}")
+            ));
+        }
+        assert_eq!(
+            storage
+                .get_transfer(wrong_owner_id)
+                .expect("load wrong-owner row")
+                .expect("wrong-owner row exists")
+                .status,
+            TransferStatus::Paused,
+            "privacy-preserving ACK must not authorize a wrong-owner mutation"
+        );
+
+        drop(runtime);
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove terminal privacy fixture");
+    }
+
+    #[test]
+    fn production_terminal_rejection_from_exact_peer_retires_only_the_bound_generation() {
+        let (directory, storage, _) = automatic_fixture("terminal-negative-ack");
+        let remote_peer = deterministic_peer_id(85);
+        let wrong_peer = deterministic_peer_id(86);
+        add_runtime_friend(&storage, &remote_peer.to_string());
+        persist_runtime_resume_capability(&storage, &remote_peer.to_string());
+        let transfer_id = "terminal-negative-ack";
+        storage
+            .upsert_transfer(&resume_record(
+                transfer_id,
+                &remote_peer.to_string(),
+                Direction::Outgoing,
+                TransferProtocol::ResumableV2 as u8,
+                TransferStatus::Paused,
+                0,
+            ))
+            .expect("persist paused terminal row");
+        assert!(
+            storage
+                .try_cancel_unclaimed_outgoing_transfer(
+                    transfer_id,
+                    &remote_peer.to_string(),
+                    "cancelled while remote storage was unavailable",
+                )
+                .expect("persist terminal outbox")
+        );
+        let mut runtime = production_test_runtime(storage.clone(), &directory, remote_peer);
+
+        schedule_resume_query(&mut runtime, remote_peer);
+        runtime
+            .handle_outbound_response(
+                wrong_peer,
+                PendingRequestId::Test(1),
+                ControlResponse::Rejected {
+                    code: "transfer_unknown".to_string(),
+                    message: "remote row missing".to_string(),
+                },
+            )
+            .expect("wrong-peer rejection is ignored");
+        assert_eq!(
+            storage
+                .list_pending_terminal_notifications(&remote_peer.to_string())
+                .expect("wrong-peer rejection retains exact outbox")
+                .len(),
+            1
+        );
+
+        schedule_resume_query(&mut runtime, remote_peer);
+        runtime
+            .handle_outbound_response(
+                remote_peer,
+                PendingRequestId::Test(2),
+                ControlResponse::Rejected {
+                    code: "transfer_unknown".to_string(),
+                    message: "remote row missing".to_string(),
+                },
+            )
+            .expect("request-bound rejection converges terminal outbox");
+        assert!(
+            storage
+                .list_pending_terminal_notifications(&remote_peer.to_string())
+                .expect("exact peer rejection retires exact generation")
+                .is_empty()
+        );
+        schedule_resume_query(&mut runtime, remote_peer);
+        assert_eq!(
+            runtime
+                .test_control_transport
+                .as_ref()
+                .expect("test transport")
+                .requests
+                .len(),
+            2,
+            "a request-bound negative acknowledgement must stop periodic retries"
+        );
+
+        drop(runtime);
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove terminal negative ACK fixture");
+    }
+
+    #[test]
+    fn production_terminal_flush_caps_each_peer_and_fills_one_slot_after_exact_ack() {
+        let (directory, storage, _) = automatic_fixture("terminal-peer-window");
+        let remote_peer = deterministic_peer_id(87);
+        add_runtime_friend(&storage, &remote_peer.to_string());
+        persist_runtime_resume_capability(&storage, &remote_peer.to_string());
+        for index in 0..12 {
+            let transfer_id = format!("terminal-peer-window-{index:02}");
+            storage
+                .upsert_transfer(&resume_record(
+                    &transfer_id,
+                    &remote_peer.to_string(),
+                    Direction::Outgoing,
+                    TransferProtocol::ResumableV2 as u8,
+                    TransferStatus::Paused,
+                    0,
+                ))
+                .expect("persist bounded terminal row");
+            assert!(
+                storage
+                    .try_cancel_unclaimed_outgoing_transfer(
+                        &transfer_id,
+                        &remote_peer.to_string(),
+                        "bounded terminal fixture",
+                    )
+                    .expect("persist bounded terminal notification")
+            );
+        }
+        let mut runtime = production_test_runtime(storage.clone(), &directory, remote_peer);
+
+        schedule_resume_query(&mut runtime, remote_peer);
+        let transport = runtime
+            .test_control_transport
+            .as_ref()
+            .expect("test control transport");
+        assert_eq!(
+            transport.requests.len(),
+            8,
+            "one peer may have at most eight terminal requests in flight"
+        );
+        let (acknowledged, generation) = match &transport.requests[0].1 {
+            ControlRequest::TransferTerminal {
+                transfer_id,
+                generation,
+                ..
+            } => (transfer_id.clone(), generation.clone()),
+            request => panic!("expected terminal request, got {request:?}"),
+        };
+
+        runtime
+            .handle_outbound_response(
+                remote_peer,
+                PendingRequestId::Test(1),
+                ControlResponse::TransferTerminalAck {
+                    transfer_id: acknowledged,
+                    generation,
+                },
+            )
+            .expect("exact ACK fills the next bounded slot");
+        assert_eq!(
+            runtime
+                .test_control_transport
+                .as_ref()
+                .expect("test control transport")
+                .requests
+                .len(),
+            9,
+            "retiring one request admits exactly one later outbox row"
+        );
+        assert_eq!(
+            runtime
+                .pending
+                .values()
+                .filter(|action| matches!(action, PendingAction::TransferTerminal { .. }))
+                .count(),
+            8
+        );
+        assert_eq!(
+            storage
+                .list_pending_terminal_notifications(&remote_peer.to_string())
+                .expect("load bounded terminal outbox")
+                .len(),
+            11
+        );
+
+        drop(runtime);
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove terminal peer window fixture");
+    }
+
+    #[test]
+    fn production_terminal_retry_has_a_global_in_flight_ceiling() {
+        let (directory, storage, _) = automatic_fixture("terminal-global-window");
+        let peers = (88..93).map(deterministic_peer_id).collect::<Vec<_>>();
+        for peer in &peers {
+            add_runtime_friend(&storage, &peer.to_string());
+            persist_runtime_resume_capability(&storage, &peer.to_string());
+            for index in 0..10 {
+                let transfer_id = format!("terminal-global-{}-{index:02}", peer);
+                storage
+                    .upsert_transfer(&resume_record(
+                        &transfer_id,
+                        &peer.to_string(),
+                        Direction::Outgoing,
+                        TransferProtocol::ResumableV2 as u8,
+                        TransferStatus::Paused,
+                        0,
+                    ))
+                    .expect("persist global-window transfer");
+                assert!(
+                    storage
+                        .try_cancel_unclaimed_outgoing_transfer(
+                            &transfer_id,
+                            &peer.to_string(),
+                            "global terminal fixture",
+                        )
+                        .expect("persist global-window notification")
+                );
+            }
+        }
+        let mut runtime = production_test_runtime(storage.clone(), &directory, peers[0]);
+        for peer in peers.iter().skip(1) {
+            runtime.active_connections.insert(*peer, 1);
+        }
+
+        runtime
+            .retry_terminal_notifications_for_connected_peers()
+            .expect("retry connected peers with a bounded global window");
+        assert_eq!(
+            runtime
+                .test_control_transport
+                .as_ref()
+                .expect("test control transport")
+                .requests
+                .len(),
+            32,
+            "a retry tick may create at most 32 terminal requests globally"
+        );
+        for peer in &peers {
+            assert!(
+                runtime
+                    .test_control_transport
+                    .as_ref()
+                    .expect("test control transport")
+                    .requests
+                    .iter()
+                    .any(|(request_peer, _)| request_peer == peer),
+                "bounded admission must not starve connected peer {peer}"
+            );
+        }
+        assert_eq!(runtime.pending.len(), 32);
+        runtime
+            .retry_terminal_notifications_for_connected_peers()
+            .expect("full global window is throttled");
+        assert_eq!(
+            runtime
+                .test_control_transport
+                .as_ref()
+                .expect("test control transport")
+                .requests
+                .len(),
+            32,
+            "a second tick cannot duplicate in-flight requests"
+        );
+
+        drop(runtime);
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove terminal global window fixture");
     }
 
     #[test]

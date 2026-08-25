@@ -32,6 +32,8 @@ pub enum FinalizationPhase {
     DuringCopy,
     AfterCopySync,
     BeforeCopyMaterializedJournal,
+    #[cfg(target_os = "macos")]
+    AfterCopyQuarantineProof,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -617,7 +619,7 @@ fn owned_cleanup_quarantine_prefix(cleanup_token: &str, artifact_kind: &str) -> 
 }
 
 #[cfg(target_os = "macos")]
-fn owned_cleanup_quarantine_path(
+pub(crate) fn owned_cleanup_quarantine_path(
     path: &Path,
     cleanup_token: &str,
     artifact_kind: &str,
@@ -829,7 +831,13 @@ where
                     "接收目录或磁盘当前不可用",
                 ));
             }
-            Ok(false)
+            remove_owned_partial_marker_after_file_cleanup_with_cleanup_token(
+                partial,
+                destination,
+                transfer_id,
+                reservation_token,
+                cleanup_token,
+            )
         }
         ExactRemovalOutcome::NotOwned | ExactRemovalOutcome::ProofLost => Ok(false),
     }
@@ -860,23 +868,6 @@ where
             }
             Ok(())
         },
-    )
-}
-
-pub fn remove_owned_partial_marker_after_file_cleanup(
-    partial: &Path,
-    destination: &Path,
-    transfer_id: &str,
-    reservation_token: &str,
-) -> io::Result<bool> {
-    let cleanup_token = uuid::Uuid::new_v4().to_string();
-    remove_owned_partial_marker_after_file_cleanup_internal(
-        partial,
-        destination,
-        transfer_id,
-        reservation_token,
-        &cleanup_token,
-        |_, _| Ok(()),
     )
 }
 
@@ -1068,6 +1059,14 @@ where
         read_finalization_record(reserved_destination, transfer_id, reservation_token)?
     {
         if record.state == FinalizationState::CopyPrepared {
+            #[cfg(target_os = "macos")]
+            let (record, copy_cleanup_token) =
+                persist_copy_cleanup_token_before_namespace_mutation(
+                    reserved_destination,
+                    transfer_id,
+                    reservation_token,
+                    record,
+                )?;
             candidate = directory.join(record.candidate);
             previous = record
                 .previous
@@ -1086,40 +1085,73 @@ where
             } else {
                 None
             };
-            if reservation_is_owned(&candidate, transfer_id, reservation_token)? {
-                match open_regular_file_no_follow(&candidate, true) {
-                    Ok(candidate_file) if file_identity(&candidate_file)? == record.identity => {
-                        return materialize_copy_candidate(
-                            &partial_file,
-                            candidate_file,
-                            reserved_destination,
-                            candidate,
-                            previous,
-                            retained_legacy_stage,
-                            file_name,
-                            transfer_id,
-                            reservation_token,
-                            persist_switch,
-                            phase_hook,
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(error) if is_no_follow_rejection(&error) => {}
-                    Err(error) => return Err(error),
+
+            #[cfg(target_os = "macos")]
+            {
+                if !retire_copy_candidate_generation(
+                    &candidate,
+                    record.identity,
+                    &copy_cleanup_token,
+                    phase_hook,
+                )? {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "复制恢复时无法证明并清理未完成候选文件",
+                    ));
                 }
+                return prepare_copy_candidate(
+                    &partial_file,
+                    reserved_destination,
+                    candidate,
+                    previous,
+                    retained_legacy_stage,
+                    file_name,
+                    transfer_id,
+                    reservation_token,
+                    persist_switch,
+                    phase_hook,
+                );
             }
-            return prepare_copy_candidate(
-                &partial_file,
-                reserved_destination,
-                candidate,
-                previous,
-                retained_legacy_stage,
-                file_name,
-                transfer_id,
-                reservation_token,
-                persist_switch,
-                phase_hook,
-            );
+
+            #[cfg(not(target_os = "macos"))]
+            {
+                if reservation_is_owned(&candidate, transfer_id, reservation_token)? {
+                    match open_regular_file_no_follow(&candidate, true) {
+                        Ok(candidate_file)
+                            if file_identity(&candidate_file)? == record.identity =>
+                        {
+                            return materialize_copy_candidate(
+                                &partial_file,
+                                candidate_file,
+                                reserved_destination,
+                                candidate,
+                                previous,
+                                retained_legacy_stage,
+                                file_name,
+                                transfer_id,
+                                reservation_token,
+                                persist_switch,
+                                phase_hook,
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(error) if is_no_follow_rejection(&error) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                return prepare_copy_candidate(
+                    &partial_file,
+                    reserved_destination,
+                    candidate,
+                    previous,
+                    retained_legacy_stage,
+                    file_name,
+                    transfer_id,
+                    reservation_token,
+                    persist_switch,
+                    phase_hook,
+                );
+            }
         }
     }
 
@@ -1479,10 +1511,18 @@ where
     })();
     if let Err(error) = copy_result {
         if is_storage_full_error(&error) {
+            let candidate_name = candidate
+                .file_name()
+                .and_then(|value| value.to_str())
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "复制目标文件名无效"))?;
+            let copy_cleanup_token =
+                stable_copy_cleanup_token(transfer_id, reservation_token, candidate_name);
             return match retire_incomplete_copy_candidate(
                 candidate_file,
                 &candidate,
                 candidate_identity,
+                &copy_cleanup_token,
+                phase_hook,
             ) {
                 Ok(true) => Err(error),
                 Ok(false) => Err(io::Error::new(
@@ -1553,17 +1593,23 @@ pub(crate) fn is_storage_full_error(error: &io::Error) -> bool {
     false
 }
 
-fn retire_incomplete_copy_candidate(
+fn retire_incomplete_copy_candidate<H>(
     candidate_file: File,
     candidate: &Path,
     expected_identity: FileIdentity,
-) -> io::Result<bool> {
+    cleanup_token: &str,
+    phase_hook: &mut H,
+) -> io::Result<bool>
+where
+    H: FnMut(FinalizationPhase) -> io::Result<()>,
+{
     if file_identity(&candidate_file)? != expected_identity {
         return Ok(false);
     }
 
     #[cfg(windows)]
     {
+        let _ = (cleanup_token, phase_hook);
         if !path_has_file_identity(candidate, expected_identity)? {
             return Ok(false);
         }
@@ -1580,31 +1626,54 @@ fn retire_incomplete_copy_candidate(
 
     #[cfg(target_os = "macos")]
     {
-        let directory = candidate
-            .parent()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "复制目标保存位置无效"))?;
-        let quarantine = directory.join(format!(
-            ".weline-localnet-copy-quarantine-{}",
-            uuid::Uuid::new_v4()
-        ));
         drop(candidate_file);
-        macos_rename_no_replace(candidate, &quarantine)?;
-        let quarantine_file = open_regular_file_no_follow(&quarantine, false)?;
-        if file_identity(&quarantine_file)? != expected_identity {
-            drop(quarantine_file);
-            macos_restore_quarantine_without_overwrite(&quarantine, candidate, directory)?;
-            return Ok(false);
-        }
-        drop(quarantine_file);
-        fs::remove_file(&quarantine)?;
-        sync_directory(directory)?;
-        return Ok(true);
+        return retire_copy_candidate_generation(
+            candidate,
+            expected_identity,
+            cleanup_token,
+            phase_hook,
+        );
     }
 
     #[cfg(not(any(windows, target_os = "macos")))]
     {
-        let _ = (candidate_file, candidate, expected_identity);
+        let _ = (
+            candidate_file,
+            candidate,
+            expected_identity,
+            cleanup_token,
+            phase_hook,
+        );
         Ok(false)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn retire_copy_candidate_generation<H>(
+    candidate: &Path,
+    expected_identity: FileIdentity,
+    cleanup_token: &str,
+    phase_hook: &mut H,
+) -> io::Result<bool>
+where
+    H: FnMut(FinalizationPhase) -> io::Result<()>,
+{
+    let mut verify = |file: &mut File| Ok(file_identity(file)? == expected_identity);
+    let mut cleanup_hook = |phase: ExactCleanupPhase, _path: &Path| {
+        if phase == ExactCleanupPhase::AfterQuarantineProof {
+            phase_hook(FinalizationPhase::AfterCopyQuarantineProof)?;
+        }
+        Ok(())
+    };
+    match remove_exact_verified_file(
+        candidate,
+        cleanup_token,
+        "copy-candidate",
+        &mut verify,
+        &mut cleanup_hook,
+    )? {
+        ExactRemovalOutcome::Removed | ExactRemovalOutcome::Missing => Ok(true),
+        ExactRemovalOutcome::NotOwned | ExactRemovalOutcome::ProofLost => Ok(false),
     }
 }
 
@@ -2315,8 +2384,42 @@ struct FinalizationRecord {
     staged_identity: Option<FileIdentity>,
     #[serde(default)]
     stage_cleanup: Option<LegacyStageCleanupRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    copy_cleanup_token: Option<String>,
     identity: FileIdentity,
     state: FinalizationState,
+}
+
+fn stable_copy_cleanup_token(
+    transfer_id: &str,
+    reservation_token: &str,
+    candidate: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"weline-localnet-copy-cleanup-v1\0");
+    hasher.update(transfer_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(reservation_token.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(candidate.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+#[cfg(target_os = "macos")]
+fn persist_copy_cleanup_token_before_namespace_mutation(
+    reserved_destination: &Path,
+    transfer_id: &str,
+    reservation_token: &str,
+    mut record: FinalizationRecord,
+) -> io::Result<(FinalizationRecord, String)> {
+    let cleanup_token = record.copy_cleanup_token.clone().unwrap_or_else(|| {
+        stable_copy_cleanup_token(transfer_id, reservation_token, &record.candidate)
+    });
+    if record.copy_cleanup_token.is_none() {
+        record.copy_cleanup_token = Some(cleanup_token.clone());
+        append_finalization_record_value(reserved_destination, transfer_id, &record)?;
+    }
+    Ok((record, cleanup_token))
 }
 
 fn append_finalization_record(
@@ -2374,6 +2477,8 @@ fn append_finalization_record_with_stage(
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "暂存文件名无效"))
         })
         .transpose()?;
+    let copy_cleanup_token = (state == FinalizationState::CopyPrepared)
+        .then(|| stable_copy_cleanup_token(transfer_id, reservation_token, &candidate));
     let record = FinalizationRecord {
         prefix: FINALIZATION_PREFIX.to_string(),
         transfer_id: transfer_id.to_string(),
@@ -2383,6 +2488,7 @@ fn append_finalization_record_with_stage(
         staged,
         staged_identity,
         stage_cleanup: None,
+        copy_cleanup_token,
         identity,
         state,
     };
@@ -2402,7 +2508,12 @@ fn append_finalization_record_value(
         .open(finalization_marker_path(reserved_destination, transfer_id)?)?;
     writeln!(marker, "{checksum} {}", hex::encode(encoded))?;
     marker.flush()?;
-    marker.sync_all()
+    marker.sync_all()?;
+    #[cfg(target_os = "macos")]
+    if let Some(directory) = reserved_destination.parent() {
+        sync_directory(directory)?;
+    }
+    Ok(())
 }
 
 fn append_legacy_stage_cleanup_record(
@@ -2469,6 +2580,18 @@ fn read_finalization_record(
                 .as_deref()
                 .is_some_and(|name| !valid_finalization_stage_name(name, transfer_id))
             || (record.staged_identity.is_some() && record.staged.is_none())
+            || record
+                .copy_cleanup_token
+                .as_deref()
+                .is_some_and(|cleanup_token| {
+                    record.state != FinalizationState::CopyPrepared
+                        || cleanup_token
+                            != stable_copy_cleanup_token(
+                                transfer_id,
+                                reservation_token,
+                                &record.candidate,
+                            )
+                })
             || record.stage_cleanup.as_ref().is_some_and(|cleanup| {
                 record.staged.is_none()
                     || cleanup.identity != record.staged_identity.unwrap_or(record.identity)
@@ -3229,8 +3352,69 @@ mod tests {
             fs::read(&retired).expect("owned inode remains"),
             b"owned partial"
         );
+        assert!(
+            partial_owner_sidecar_path(&partial)
+                .expect("partial owner marker")
+                .exists(),
+            "ProofLost must retain the sidecar needed to prove later cleanup"
+        );
 
         fs::remove_dir_all(directory).expect("remove partial race fixture");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_partial_cleanup_restarts_the_same_durable_quarantine_generation() {
+        let directory = temporary_directory("macos-partial-quarantine-restart");
+        fs::create_dir_all(&directory).expect("create receive directory");
+        let destination = directory.join("report.bin");
+        let transfer_id = "partial-quarantine-restart";
+        let reservation_token = "partial-quarantine-token";
+        let cleanup_token = "database-persisted-cleanup-generation";
+        reserve_receive_path(&destination, transfer_id, reservation_token)
+            .expect("reserve destination");
+        let partial = reserve_resumable_partial(&destination, transfer_id, reservation_token)
+            .expect("reserve partial");
+        fs::write(&partial, b"owned partial survives until exact cleanup")
+            .expect("write owned partial");
+        let quarantine = super::owned_cleanup_quarantine_path(&partial, cleanup_token, "partial")
+            .expect("derive durable partial quarantine");
+
+        let crashed = remove_owned_partial_internal(
+            &partial,
+            &destination,
+            transfer_id,
+            reservation_token,
+            cleanup_token,
+            |phase, path| {
+                if phase == ExactCleanupPhase::AfterQuarantineProof && path == quarantine {
+                    return Err(io::Error::other(
+                        "simulated crash after partial quarantine proof",
+                    ));
+                }
+                Ok(())
+            },
+        );
+        assert!(crashed.is_err());
+        assert!(!partial.exists());
+        assert!(quarantine.exists());
+        assert!(partial_owner_sidecar_path(&partial).unwrap().exists());
+
+        assert!(
+            remove_owned_partial_internal(
+                &partial,
+                &destination,
+                transfer_id,
+                reservation_token,
+                cleanup_token,
+                |_, _| Ok(()),
+            )
+            .expect("restart exact partial cleanup")
+        );
+        assert!(!quarantine.exists());
+        assert!(!partial_owner_sidecar_path(&partial).unwrap().exists());
+
+        fs::remove_dir_all(directory).expect("remove partial quarantine restart fixture");
     }
 
     #[cfg(target_os = "macos")]
@@ -4046,6 +4230,143 @@ mod tests {
         fs::remove_dir_all(directory).expect("remove copy storage-full fixture");
     }
 
+    #[test]
+    fn copy_prepared_journal_persists_cleanup_generation_before_copy() {
+        let directory = temporary_directory("copy-cleanup-generation-journal");
+        fs::create_dir_all(&directory).expect("create receive directory");
+        let destination = directory.join("large.bin");
+        let transfer_id = "copy-cleanup-generation";
+        let reservation_token = "copy-cleanup-token";
+        reserve_receive_path(&destination, transfer_id, reservation_token)
+            .expect("reserve destination");
+        let partial = reserve_resumable_partial(&destination, transfer_id, reservation_token)
+            .expect("reserve partial");
+        fs::write(&partial, vec![0x4a; 128 * 1024]).expect("write complete partial");
+
+        let interrupted = finalize_reserved_receive_copy_fallback_with_hooks(
+            &partial,
+            &destination,
+            "large.bin",
+            transfer_id,
+            reservation_token,
+            |_, _| Ok(()),
+            |_, _| {
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "filesystem does not support hard links",
+                ))
+            },
+            |phase| {
+                if phase == FinalizationPhase::BeforeCopy {
+                    Err(io::Error::other("stop after CopyPrepared journal sync"))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .err()
+        .expect("copy is interrupted after its recovery authority is durable");
+        assert!(interrupted.to_string().contains("CopyPrepared"));
+
+        let record = read_finalization_record(&destination, transfer_id, reservation_token)
+            .expect("read finalization journal")
+            .expect("CopyPrepared record is durable");
+        assert_eq!(record.state, FinalizationState::CopyPrepared);
+        assert!(
+            record
+                .copy_cleanup_token
+                .as_deref()
+                .is_some_and(|value| !value.is_empty()),
+            "a crash-safe candidate quarantine generation must be journaled before copying"
+        );
+
+        fs::remove_dir_all(directory).expect("remove copy cleanup journal fixture");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_storage_full_quarantine_crash_restarts_from_the_complete_partial() {
+        let directory = temporary_directory("macos-copy-quarantine-restart");
+        fs::create_dir_all(&directory).expect("create receive directory");
+        let destination = directory.join("large.bin");
+        let transfer_id = "macos-copy-quarantine-restart";
+        let reservation_token = "macos-copy-quarantine-token";
+        reserve_receive_path(&destination, transfer_id, reservation_token)
+            .expect("reserve destination");
+        let partial = reserve_resumable_partial(&destination, transfer_id, reservation_token)
+            .expect("reserve partial");
+        let payload = vec![0x73; 256 * 1024];
+        fs::write(&partial, &payload).expect("write complete partial");
+        let injected_storage_full = std::cell::Cell::new(false);
+        let injected_crash = std::cell::Cell::new(false);
+
+        let crashed = finalize_reserved_receive_copy_fallback_with_hooks(
+            &partial,
+            &destination,
+            "large.bin",
+            transfer_id,
+            reservation_token,
+            |_, _| Ok(()),
+            |_, _| {
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "filesystem does not support hard links",
+                ))
+            },
+            |phase| {
+                if phase == FinalizationPhase::DuringCopy && !injected_storage_full.replace(true) {
+                    return Err(injected_storage_full_error());
+                }
+                if phase == FinalizationPhase::AfterCopyQuarantineProof
+                    && !injected_crash.replace(true)
+                {
+                    return Err(io::Error::other(
+                        "simulated crash after durable copy quarantine",
+                    ));
+                }
+                Ok(())
+            },
+        )
+        .err()
+        .expect("crash is injected between quarantine rename and unlink");
+        assert!(crashed.to_string().contains("无法安全清理"));
+        assert_eq!(fs::read(&partial).unwrap(), payload);
+        assert!(!destination.exists());
+
+        let record = read_finalization_record(&destination, transfer_id, reservation_token)
+            .expect("read CopyPrepared recovery record")
+            .expect("copy recovery record remains durable");
+        let cleanup_token = record
+            .copy_cleanup_token
+            .as_deref()
+            .expect("copy cleanup generation was journaled before copying");
+        let quarantine =
+            super::owned_cleanup_quarantine_path(&destination, cleanup_token, "copy-candidate")
+                .expect("derive journal-bound copy quarantine");
+        assert!(
+            quarantine.exists(),
+            "crash leaves a discoverable quarantine"
+        );
+
+        let finalized = finalize_reserved_receive_copy_fallback_with_hooks(
+            &partial,
+            &destination,
+            "large.bin",
+            transfer_id,
+            reservation_token,
+            |_, _| Ok(()),
+            |_, _| panic!("CopyPrepared restart must not reprobe hard-link support"),
+            |_| Ok(()),
+        )
+        .expect("restart retires the quarantine and rematerializes without retransmission");
+        assert_eq!(finalized.path, destination);
+        assert_eq!(fs::read(&destination).unwrap(), payload);
+        assert_eq!(fs::read(&partial).unwrap(), payload);
+        assert!(!quarantine.exists());
+
+        fs::remove_dir_all(directory).expect("remove macOS copy quarantine fixture");
+    }
+
     fn injected_storage_full_error() -> io::Error {
         #[cfg(windows)]
         {
@@ -4479,6 +4800,13 @@ mod tests {
             FinalizationState::CopyPrepared,
         )
         .expect("write old CopyPrepared journal shape");
+        let mut legacy_record =
+            read_finalization_record(&destination, "legacy-recovery", "legacy-token")
+                .expect("read generated CopyPrepared record")
+                .expect("CopyPrepared record exists");
+        legacy_record.copy_cleanup_token = None;
+        super::append_finalization_record_value(&destination, "legacy-recovery", &legacy_record)
+            .expect("append the pre-cleanup-token journal shape");
         drop(staged_file);
         let hard_link_calls = std::cell::Cell::new(0_u32);
 

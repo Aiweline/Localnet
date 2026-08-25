@@ -20,8 +20,6 @@ use crate::{
         open_owned_resumable_partial_file, owned_finalization_reservations,
         owned_finalized_receive_path, remove_owned_finalization_marker,
         remove_owned_finalization_stage, remove_owned_partial,
-        remove_owned_partial_marker_after_file_cleanup,
-        remove_owned_partial_marker_after_file_cleanup_with_cleanup_token,
         remove_owned_partial_with_cleanup_token, remove_owned_reservation,
         remove_owned_reservation_with_cleanup_token, remove_owned_reservations_in_directory,
         remove_owned_reservations_in_directory_with_cleanup_token, reserve_resumable_partial,
@@ -1554,18 +1552,25 @@ impl Storage {
         Ok(changed == 1)
     }
 
-    pub(crate) fn list_pending_terminal_notifications(
+    pub(crate) fn list_pending_terminal_notifications_page(
         &self,
         peer_id: &str,
+        limit: usize,
     ) -> Result<Vec<PendingTerminalNotification>, AppError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = i64::try_from(limit)
+            .map_err(|_| AppError::InvalidInput("终态通知分页大小无效".to_string()))?;
         let connection = self.connection()?;
         let mut statement = connection.prepare(
             "SELECT transfer_id, peer_id, generation, terminal_status
              FROM transfer_terminal_notifications
-             WHERE peer_id = ?1 ORDER BY created_at, transfer_id",
+             WHERE peer_id = ?1 ORDER BY created_at, transfer_id
+             LIMIT ?2",
         )?;
         statement
-            .query_map([peer_id], |row| {
+            .query_map(params![peer_id, limit], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -1587,6 +1592,14 @@ impl Storage {
                 })
             })
             .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn list_pending_terminal_notifications(
+        &self,
+        peer_id: &str,
+    ) -> Result<Vec<PendingTerminalNotification>, AppError> {
+        self.list_pending_terminal_notifications_page(peer_id, 10_000)
     }
 
     pub(crate) fn acknowledge_terminal_notification(
@@ -1679,7 +1692,18 @@ impl Storage {
                     TransferStatus::Cancelled | TransferStatus::Failed
                 ))
         {
-            self.cleanup_owned_transfer_artifacts(transfer_id)?;
+            if let Err(cleanup_error) = self.cleanup_owned_transfer_artifacts(transfer_id) {
+                if self.pending_terminal_cleanup(transfer_id)?.is_some() {
+                    tracing::warn!(
+                        %cleanup_error,
+                        %transfer_id,
+                        %peer_id,
+                        "remote terminal state is durable; deferring owned artifact cleanup"
+                    );
+                } else {
+                    return Err(cleanup_error);
+                }
+            }
         }
         Ok(changed == 1)
     }
@@ -3272,11 +3296,11 @@ impl Storage {
     fn cleanup_owned_artifact_record(&self, record: &OwnedArtifactRecord) -> Result<(), AppError> {
         let completed = record.status == "completed";
         let terminal = matches!(record.status.as_str(), "cancelled" | "failed");
-        if terminal {
-            self.stage_terminal_cleanup(record)?;
+        if terminal || completed {
+            self.stage_owned_cleanup(record)?;
             let staged = self
                 .pending_terminal_cleanup(&record.transfer_id)?
-                .ok_or_else(|| AppError::Storage("终态清理记录在提交后消失".to_string()))?;
+                .ok_or_else(|| AppError::Storage("所有权清理记录在提交后消失".to_string()))?;
             self.cleanup_pending_terminal_artifact(&staged)?;
             return Ok(());
         }
@@ -3306,43 +3330,6 @@ impl Storage {
         let artifact_destination = finalized_destination
             .as_deref()
             .or(record.destination.as_deref());
-        let mut partial_cleaned = record.partial.is_none();
-
-        if completed {
-            if let (Some(destination), Some(token)) =
-                (artifact_destination, record.reservation_token.as_deref())
-            {
-                let expected_partial = record
-                    .partial
-                    .clone()
-                    .unwrap_or(resumable_partial_path(destination, &record.transfer_id)?);
-                match remove_owned_partial(
-                    &expected_partial,
-                    destination,
-                    &record.transfer_id,
-                    token,
-                ) {
-                    Ok(true) => partial_cleaned = true,
-                    Ok(false) => {
-                        partial_cleaned = remove_owned_partial_marker_after_file_cleanup(
-                            &expected_partial,
-                            destination,
-                            &record.transfer_id,
-                            token,
-                        )?;
-                    }
-                    Err(error) => {
-                        finalization_marker_cleaned = false;
-                        tracing::warn!(
-                            transfer_id = %record.transfer_id,
-                            %error,
-                            "failed to clean completed receive partial marker"
-                        );
-                    }
-                }
-            }
-        }
-
         let mut reservation_cleaned = !record.destination_reserved;
         if record.destination_reserved {
             if let Some(token) = record.reservation_token.as_deref() {
@@ -3384,56 +3371,6 @@ impl Storage {
             }
         }
 
-        if completed && !journal_reservations.is_empty() {
-            if let (Some(destination), Some(token)) = (
-                record.destination.as_deref(),
-                record.reservation_token.as_deref(),
-            ) {
-                match remove_owned_finalization_stage(destination, &record.transfer_id, token) {
-                    Ok(true) => {
-                        if let Err(error) = remove_owned_finalization_marker(
-                            destination,
-                            &record.transfer_id,
-                            token,
-                        ) {
-                            finalization_marker_cleaned = false;
-                            tracing::warn!(
-                                transfer_id = %record.transfer_id,
-                                %error,
-                                "failed to clean receive finalization marker"
-                            );
-                        }
-                    }
-                    Ok(false) => finalization_marker_cleaned = false,
-                    Err(error) => {
-                        finalization_marker_cleaned = false;
-                        tracing::warn!(
-                            transfer_id = %record.transfer_id,
-                            %error,
-                            "failed to clean receive finalization stage"
-                        );
-                    }
-                }
-            }
-        }
-
-        if terminal {
-            if let (Some(partial), Some(destination), Some(token)) = (
-                record.partial.as_deref(),
-                artifact_destination,
-                record.reservation_token.as_deref(),
-            ) {
-                match remove_owned_partial(partial, destination, &record.transfer_id, token) {
-                    Ok(_) => partial_cleaned = true,
-                    Err(error) => tracing::warn!(
-                        transfer_id = %record.transfer_id,
-                        %error,
-                        "failed to clean stale resumable partial"
-                    ),
-                }
-            }
-        }
-
         let connection = self.connection()?;
         if reservation_cleaned && finalization_marker_cleaned {
             connection.execute(
@@ -3443,28 +3380,10 @@ impl Storage {
                 [&record.transfer_id],
             )?;
         }
-        if terminal && partial_cleaned {
-            connection.execute(
-                "UPDATE transfers SET partial_path = NULL WHERE transfer_id = ?1
-                 AND status IN ('cancelled', 'failed')",
-                [&record.transfer_id],
-            )?;
-            connection.execute(
-                "DELETE FROM transfer_chunks WHERE transfer_id = ?1",
-                [&record.transfer_id],
-            )?;
-        }
-        if completed && partial_cleaned {
-            connection.execute(
-                "UPDATE transfers SET partial_path = NULL WHERE transfer_id = ?1
-                 AND status = 'completed'",
-                [&record.transfer_id],
-            )?;
-        }
         Ok(())
     }
 
-    fn stage_terminal_cleanup(&self, record: &OwnedArtifactRecord) -> Result<(), AppError> {
+    fn stage_owned_cleanup(&self, record: &OwnedArtifactRecord) -> Result<(), AppError> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
         transaction.execute(
@@ -3492,7 +3411,7 @@ impl Storage {
         let changed = transaction.execute(
             "UPDATE transfers
              SET destination_reserved = 0, reservation_token = NULL, partial_path = NULL
-             WHERE transfer_id = ?1 AND status IN ('cancelled', 'failed')
+             WHERE transfer_id = ?1 AND status = ?6
                AND local_path IS ?2 AND partial_path IS ?3 AND reservation_token IS ?4
                AND destination_reserved = ?5",
             params![
@@ -3507,17 +3426,18 @@ impl Storage {
                     .map(|path| path.to_string_lossy().into_owned()),
                 record.reservation_token,
                 record.destination_reserved,
+                record.status,
             ],
         )?;
         if changed != 1 {
-            return Err(AppError::Storage(
-                "终态传输所有权清理状态已变化".to_string(),
-            ));
+            return Err(AppError::Storage("传输所有权清理状态已变化".to_string()));
         }
-        transaction.execute(
-            "DELETE FROM transfer_chunks WHERE transfer_id = ?1",
-            [&record.transfer_id],
-        )?;
+        if matches!(record.status.as_str(), "cancelled" | "failed") {
+            transaction.execute(
+                "DELETE FROM transfer_chunks WHERE transfer_id = ?1",
+                [&record.transfer_id],
+            )?;
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -3664,14 +3584,7 @@ impl Storage {
                 &record.transfer_id,
                 token,
                 cleanup_token,
-            )?
-                || remove_owned_partial_marker_after_file_cleanup_with_cleanup_token(
-                    partial,
-                    destination,
-                    &record.transfer_id,
-                    token,
-                    cleanup_token,
-                )?;
+            )?;
         }
         if !partial_cleaned || !reservation_cleaned {
             return Ok(());
@@ -7121,6 +7034,107 @@ mod tests {
     }
 
     #[test]
+    fn completed_cleanup_stages_stable_authority_before_unavailable_media_retry() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-completed-cleanup-offline-media-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let media = fixture.join("selected-media");
+        let detached_media = fixture.join("detached-media");
+        fs::create_dir_all(&media).expect("create selected media fixture");
+        let database = fixture.join("localnet.sqlite3");
+        let storage = Storage::open(&database).expect("open storage");
+        let destination = media.join("report.bin");
+        let transfer_id = "completed-cleanup-offline-media";
+        let token = "token-completed-cleanup-offline-media";
+        let payload = b"completed payload remains linked while cleanup is deferred";
+        reserve_receive_path(&destination, transfer_id, token).expect("reserve destination");
+        let partial = reserve_resumable_partial(&destination, transfer_id, token)
+            .expect("reserve owned partial");
+        fs::write(&partial, payload).expect("write complete partial");
+        let finalized = finalize_reserved_receive_durable(
+            &partial,
+            &destination,
+            "report.bin",
+            transfer_id,
+            token,
+        )
+        .expect("durably finalize receive");
+        {
+            let connection = storage.connection().expect("insert completed transfer");
+            connection
+                .execute(
+                    "INSERT INTO transfers
+                       (transfer_id, peer_id, direction, kind, file_name, file_size, mime_type,
+                        sha256, local_path, destination_reserved, reservation_token,
+                        transfer_protocol, chunk_size, chunk_count, manifest_sha256,
+                        partial_path, transferred_bytes, status, created_at, updated_at)
+                     VALUES (?1, 'peer-one', 'incoming', 'file', 'report.bin', ?2,
+                             'application/octet-stream', ?3, ?4, 1, ?5,
+                             2, ?6, 1, ?7, ?8, ?2, 'completed', ?9, ?9)",
+                    rusqlite::params![
+                        transfer_id,
+                        payload.len(),
+                        hex::encode(Sha256::digest(payload)),
+                        finalized.path.to_string_lossy(),
+                        token,
+                        TRANSFER_CHUNK_BYTES,
+                        "0".repeat(64),
+                        partial.to_string_lossy(),
+                        "2026-08-25T00:00:00.000Z",
+                    ],
+                )
+                .expect("insert completed transfer");
+        }
+        fs::rename(&media, &detached_media).expect("simulate unavailable destination media");
+
+        let _ = storage.cleanup_completed_incoming_artifacts(transfer_id);
+        let pending = storage
+            .pending_terminal_cleanup(transfer_id)
+            .expect("inspect durable cleanup authority")
+            .expect("completed cleanup authority must be staged before touching the media");
+        assert_eq!(pending.status, "completed");
+        assert!(
+            pending
+                .cleanup_token
+                .as_deref()
+                .is_some_and(|value| !value.is_empty()),
+            "restart must reuse one database-persisted cleanup generation"
+        );
+        let completed = storage
+            .get_transfer(transfer_id)
+            .unwrap()
+            .expect("completed transfer remains visible");
+        assert!(!completed.destination_reserved);
+        assert!(completed.reservation_token.is_none());
+        assert!(completed.partial_path.is_none());
+
+        drop(storage);
+        let storage = Storage::open(&database)
+            .expect("restart preserves deferred completed cleanup while media is unavailable");
+        assert!(
+            storage
+                .pending_terminal_cleanup(transfer_id)
+                .unwrap()
+                .is_some()
+        );
+        drop(storage);
+        fs::rename(&detached_media, &media).expect("restore destination media");
+        let storage = Storage::open(&database).expect("restart cleanup after media returns");
+        assert!(
+            storage
+                .pending_terminal_cleanup(transfer_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!partial.exists());
+        assert_eq!(fs::read(finalized.path).unwrap(), payload);
+
+        drop(storage);
+        fs::remove_dir_all(fixture).expect("remove fixture");
+    }
+
+    #[test]
     fn lost_recovery_claim_leaves_the_partial_filesystem_untouched() {
         let fixture = std::env::temp_dir().join(format!(
             "weline-localnet-recovery-cas-lost-{}",
@@ -7926,7 +7940,7 @@ mod tests {
             cleanup_token: None,
         };
         storage
-            .stage_terminal_cleanup(&record)
+            .stage_owned_cleanup(&record)
             .expect("atomically stage terminal filesystem cleanup");
         assert!(
             partial.exists(),
@@ -8001,7 +8015,7 @@ mod tests {
                 .expect("insert terminal transfer");
         }
         storage
-            .stage_terminal_cleanup(&OwnedArtifactRecord {
+            .stage_owned_cleanup(&OwnedArtifactRecord {
                 transfer_id: transfer_id.to_string(),
                 destination: Some(destination.clone()),
                 partial: None,
@@ -8095,7 +8109,7 @@ mod tests {
             cleanup_token: None,
         };
         storage
-            .stage_terminal_cleanup(&old_record)
+            .stage_owned_cleanup(&old_record)
             .expect("stage old cleanup generation");
         let old_record = storage
             .pending_terminal_cleanup(transfer_id)
@@ -8295,7 +8309,7 @@ mod tests {
             cleanup_token: None,
         };
         storage
-            .stage_terminal_cleanup(&record)
+            .stage_owned_cleanup(&record)
             .expect("durably stage terminal cleanup");
         drop(storage);
 
@@ -8367,7 +8381,7 @@ mod tests {
             cleanup_token: None,
         };
         storage
-            .stage_terminal_cleanup(&record)
+            .stage_owned_cleanup(&record)
             .expect("durably stage terminal cleanup");
         drop(storage);
         fs::rename(&media, &detached_media).expect("simulate unavailable media");
@@ -8437,7 +8451,7 @@ mod tests {
             cleanup_token: None,
         };
         storage
-            .stage_terminal_cleanup(&record)
+            .stage_owned_cleanup(&record)
             .expect("stage terminal cleanup");
         drop(storage);
         fs::rename(&media, &detached_media).expect("simulate removed destination media");
@@ -8512,7 +8526,7 @@ mod tests {
             status: "failed".to_string(),
             cleanup_token: None,
         };
-        storage.stage_terminal_cleanup(&record).unwrap();
+        storage.stage_owned_cleanup(&record).unwrap();
         fs::remove_file(&partial).expect("remove originally owned inode");
         fs::write(&partial, b"replacement user data").expect("replace partial path");
         drop(storage);
@@ -8528,6 +8542,96 @@ mod tests {
 
         drop(storage);
         fs::remove_dir_all(fixture).expect("remove fixture");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_completed_and_terminal_proof_loss_retain_cleanup_authority() {
+        for status in ["completed", "failed"] {
+            let fixture = std::env::temp_dir().join(format!(
+                "weline-localnet-{status}-partial-proof-lost-{}",
+                uuid::Uuid::now_v7()
+            ));
+            fs::create_dir_all(&fixture).expect("create storage fixture");
+            let database = fixture.join("localnet.sqlite3");
+            let storage = Storage::open(&database).expect("open storage");
+            let transfer_id = format!("{status}-partial-proof-lost");
+            let reservation_token = format!("{status}-reservation-token");
+            let destination = fixture.join("report.bin");
+            let partial = reserve_resumable_partial(&destination, &transfer_id, &reservation_token)
+                .expect("reserve owned partial");
+            fs::write(&partial, b"original owned payload").expect("write owned partial");
+            {
+                let connection = storage.connection().expect("insert owned transfer");
+                connection
+                    .execute(
+                        "INSERT INTO transfers
+                           (transfer_id, peer_id, direction, kind, file_name, file_size, mime_type,
+                            sha256, local_path, destination_reserved, reservation_token,
+                            transfer_protocol, partial_path, transferred_bytes, status,
+                            created_at, updated_at)
+                         VALUES (?1, 'peer-one', 'incoming', 'file', 'report.bin', 22,
+                                 'application/octet-stream', ?2, ?3, 0, ?4, 2, ?5,
+                                 22, ?6, ?7, ?7)",
+                        rusqlite::params![
+                            transfer_id,
+                            "0".repeat(64),
+                            destination.to_string_lossy(),
+                            reservation_token,
+                            partial.to_string_lossy(),
+                            status,
+                            "2026-08-25T00:00:00.000Z",
+                        ],
+                    )
+                    .expect("insert owned transfer");
+            }
+            storage
+                .stage_owned_cleanup(&OwnedArtifactRecord {
+                    transfer_id: transfer_id.clone(),
+                    destination: Some(destination.clone()),
+                    partial: Some(partial.clone()),
+                    reservation_token: Some(reservation_token.clone()),
+                    destination_reserved: false,
+                    transfer_protocol: 2,
+                    status: status.to_string(),
+                    cleanup_token: None,
+                })
+                .expect("stage durable cleanup authority");
+            let staged = storage
+                .pending_terminal_cleanup(&transfer_id)
+                .unwrap()
+                .expect("load durable cleanup authority");
+            let cleanup_token = staged
+                .cleanup_token
+                .as_deref()
+                .expect("stable cleanup generation");
+            let quarantine = crate::receive_paths::owned_cleanup_quarantine_path(
+                &partial,
+                cleanup_token,
+                "partial",
+            )
+            .expect("derive stable partial quarantine");
+            let retired = fixture.join("retired-owned-partial");
+            fs::rename(&partial, &quarantine).expect("simulate crash quarantine");
+            fs::rename(&quarantine, &retired).expect("replace quarantined namespace");
+            fs::write(&quarantine, b"concurrent replacement").expect("write replacement");
+
+            storage
+                .cleanup_pending_terminal_artifact(&staged)
+                .expect("ProofLost is deferred without deleting replacement");
+            assert_eq!(fs::read(&quarantine).unwrap(), b"concurrent replacement");
+            assert_eq!(fs::read(&retired).unwrap(), b"original owned payload");
+            assert!(
+                storage
+                    .pending_terminal_cleanup(&transfer_id)
+                    .unwrap()
+                    .is_some(),
+                "{status} ProofLost must retain its tombstone and stable cleanup generation"
+            );
+
+            drop(storage);
+            fs::remove_dir_all(fixture).expect("remove fixture");
+        }
     }
 
     #[test]
