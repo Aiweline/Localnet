@@ -347,12 +347,16 @@ jobs:
           set -euo pipefail
           version="${{ needs.prepare.outputs.version }}"
           tag="v${version}"
+          source scripts/release-decision.sh
           if git rev-parse --verify --quiet "$tag^{commit}" >/dev/null; then
             tag_commit="$(git rev-list -n 1 "$tag")"
             if [[ "$tag_commit" != "$GITHUB_SHA" ]]; then
               echo "::error::Refusing to repair $tag from $GITHUB_SHA because the tag points to $tag_commit."
               exit 1
             fi
+            verify_remote_release_tag origin "$tag" "$GITHUB_SHA"
+          else
+            create_remote_release_tag origin "$tag" "$GITHUB_SHA"
           fi
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             while IFS= read -r asset; do
@@ -362,10 +366,15 @@ jobs:
                 "Weline_Localnet_${version}_universal.dmg.sha256"|\
                 "Weline_Localnet_${version}_x64-portable.exe"|\
                 "Weline_Localnet_${version}_x64-setup.exe") ;;
-                *) gh release delete-asset "$tag" "$asset" --repo "$GITHUB_REPOSITORY" --yes ;;
+                *)
+                  verify_remote_release_tag origin "$tag" "$GITHUB_SHA"
+                  gh release delete-asset "$tag" "$asset" --repo "$GITHUB_REPOSITORY" --yes
+                  ;;
               esac
             done < <(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+            verify_remote_release_tag origin "$tag" "$GITHUB_SHA"
             gh release upload "$tag" release-assets/* --repo "$GITHUB_REPOSITORY" --clobber
+            verify_remote_release_tag origin "$tag" "$GITHUB_SHA"
             gh release edit "$tag" \
               --repo "$GITHUB_REPOSITORY" \
               --title "Weline Localnet v${version}" \
@@ -374,6 +383,7 @@ jobs:
               --prerelease=false \
               --latest
           else
+            verify_remote_release_tag origin "$tag" "$GITHUB_SHA"
             gh release create "$tag" release-assets/* \
               --repo "$GITHUB_REPOSITORY" \
               --target "$GITHUB_SHA" \

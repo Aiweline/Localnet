@@ -8,6 +8,79 @@ validate_release_ref() {
   fi
 }
 
+validate_remote_release_tag_arguments() {
+  local remote_name="${1:?remote name is required}"
+  local tag="${2:?tag is required}"
+  local expected_sha="${3:?expected SHA is required}"
+
+  if [[ ! "$remote_name" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]]; then
+    echo "::error::Invalid Git remote name for release provenance verification."
+    return 1
+  fi
+  if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
+    ! git check-ref-format "refs/tags/$tag" >/dev/null 2>&1; then
+    echo "::error::Invalid stable release tag: $tag."
+    return 1
+  fi
+  if [[ ! "$expected_sha" =~ ^[0-9A-Fa-f]{40}$ && ! "$expected_sha" =~ ^[0-9A-Fa-f]{64}$ ]]; then
+    echo "::error::Invalid expected commit SHA for $tag."
+    return 1
+  fi
+}
+
+verify_remote_release_tag() {
+  local remote_name="${1:?remote name is required}"
+  local tag="${2:?tag is required}"
+  local expected_sha="${3:?expected SHA is required}"
+  validate_remote_release_tag_arguments "$remote_name" "$tag" "$expected_sha"
+
+  local remote_refs
+  if ! remote_refs="$(
+    git ls-remote --exit-code -- "$remote_name" \
+      "refs/tags/$tag" "refs/tags/$tag^{}"
+  )"; then
+    echo "::error::Remote tag $tag is missing or could not be read from $remote_name."
+    return 1
+  fi
+
+  local direct_object=""
+  local peeled_object=""
+  local object_id ref_name
+  while IFS=$'\t' read -r object_id ref_name; do
+    case "$ref_name" in
+      "refs/tags/$tag") direct_object="$object_id" ;;
+      "refs/tags/$tag^{}") peeled_object="$object_id" ;;
+    esac
+  done <<< "$remote_refs"
+
+  local remote_commit="${peeled_object:-$direct_object}"
+  if [[ -z "$remote_commit" ]]; then
+    echo "::error::Remote tag $tag is missing from $remote_name."
+    return 1
+  fi
+  if [[ "${remote_commit,,}" != "${expected_sha,,}" ]]; then
+    echo "::error::Remote tag $tag does not point to expected commit $expected_sha; current peeled object is $remote_commit."
+    return 1
+  fi
+}
+
+create_remote_release_tag() {
+  local remote_name="${1:?remote name is required}"
+  local tag="${2:?tag is required}"
+  local expected_sha="${3:?expected SHA is required}"
+  validate_remote_release_tag_arguments "$remote_name" "$tag" "$expected_sha"
+
+  if ! git cat-file -e "$expected_sha^{commit}" 2>/dev/null; then
+    echo "::error::Expected release commit $expected_sha is not available locally."
+    return 1
+  fi
+  if ! git push --porcelain "$remote_name" "$expected_sha:refs/tags/$tag"; then
+    echo "::error::Could not create remote tag $tag atomically at $expected_sha; the ref may have appeared concurrently."
+    return 1
+  fi
+  verify_remote_release_tag "$remote_name" "$tag" "$expected_sha"
+}
+
 emit_release_output() {
   local should_release="${1:?release decision is required}"
   if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
