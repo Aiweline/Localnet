@@ -49,3 +49,31 @@ test("reconciles an online friend even when the presence event was missed", asyn
   assert.strictEqual(visibleSnapshot.messages, messages);
   assert.strictEqual(visibleSnapshot.transfers, transfers);
 });
+
+test("nearby relationships allow future protocol peers and never re-offer known friends", async () => {
+  const { nearbyPeerEntries } = await import("../src/presence.ts");
+  const peers = [
+    { peerId: "future-peer", nickname: "Future", online: true, protocolVersion: 2 },
+    { peerId: "friend-peer", nickname: "Friend", online: true, protocolVersion: 1 },
+    { peerId: "accepted-peer", nickname: "Accepted", online: true, protocolVersion: 1 },
+    { peerId: "pending-peer", nickname: "Pending", online: true, protocolVersion: 1 },
+    { peerId: "self-peer", nickname: "Self", online: true, protocolVersion: 1 },
+  ];
+  const entries = nearbyPeerEntries(
+    peers,
+    [{ peerId: "friend-peer" }],
+    [
+      { peerId: "accepted-peer", direction: "outgoing", status: "accepted" },
+      { peerId: "pending-peer", direction: "incoming", status: "pending" },
+    ],
+    "self-peer",
+  );
+
+  assert.deepEqual(
+    entries.map(({ peer, relationship }) => [peer.peerId, relationship]),
+    [
+      ["future-peer", "available"],
+      ["pending-peer", "pending"],
+    ],
+  );
+});

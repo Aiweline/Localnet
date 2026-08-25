@@ -1,6 +1,7 @@
 use std::{
     fs,
     io::Read,
+    net::Ipv4Addr,
     path::{Path, PathBuf},
     str::FromStr,
     sync::{Arc, Mutex, MutexGuard},
@@ -58,6 +59,13 @@ pub(crate) struct PendingTerminalNotification {
     pub peer_id: String,
     pub generation: String,
     pub state: TransferStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingFriendDecision {
+    pub request_id: String,
+    pub peer_id: String,
+    pub accepted: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -237,6 +245,48 @@ impl Storage {
         Ok(())
     }
 
+    pub fn remember_authenticated_lan_ip(
+        &self,
+        peer_id: &str,
+        ip: Ipv4Addr,
+    ) -> Result<bool, AppError> {
+        if !ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() {
+            return Ok(false);
+        }
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE peers SET last_lan_ip = ?2 WHERE peer_id = ?1",
+            params![peer_id, ip.to_string()],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn list_friend_lan_targets(&self) -> Result<Vec<(String, Ipv4Addr)>, AppError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT f.peer_id, p.last_lan_ip
+             FROM friends f JOIN peers p ON p.peer_id = f.peer_id
+             WHERE p.last_lan_ip IS NOT NULL
+             ORDER BY f.peer_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.map(|row| {
+            let (peer_id, ip) = row?;
+            let ip = ip.parse::<Ipv4Addr>().map_err(|error| {
+                AppError::Storage(format!("已认证好友的局域网地址无效：{error}"))
+            })?;
+            if !ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() {
+                return Err(AppError::Storage(
+                    "已认证好友的局域网地址不属于可用内网".to_string(),
+                ));
+            }
+            Ok((peer_id, ip))
+        })
+        .collect()
+    }
+
     pub fn get_peer(&self, peer_id: &str) -> Result<Option<PeerSummary>, AppError> {
         Ok(self
             .list_peers()?
@@ -317,6 +367,13 @@ impl Storage {
     ) -> Result<(), AppError> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
+        let request_owner: Option<(String, String)> = transaction
+            .query_row(
+                "SELECT peer_id, direction FROM friend_requests WHERE request_id = ?1",
+                [request_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
         let changed = transaction.execute(
             "UPDATE friend_requests SET status = ?2, updated_at = ?3
              WHERE request_id = ?1 AND status = 'pending'",
@@ -353,6 +410,125 @@ impl Storage {
                 ],
             )?;
         }
+        if let Some((peer_id, direction)) = request_owner
+            && direction == Direction::Incoming.as_str()
+        {
+            transaction.execute(
+                "INSERT INTO pending_friend_decisions
+                   (request_id, peer_id, accepted, created_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(request_id) DO UPDATE SET
+                   peer_id = excluded.peer_id,
+                   accepted = excluded.accepted",
+                params![
+                    request_id,
+                    peer_id,
+                    i64::from(status == FriendRequestStatus::Accepted),
+                    updated_at,
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn list_pending_friend_decisions(
+        &self,
+        peer_id: &str,
+    ) -> Result<Vec<PendingFriendDecision>, AppError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT request_id, peer_id, accepted
+             FROM pending_friend_decisions
+             WHERE peer_id = ?1
+             ORDER BY created_at ASC, request_id ASC
+             LIMIT 16",
+        )?;
+        let rows = statement.query_map([peer_id], |row| {
+            Ok(PendingFriendDecision {
+                request_id: row.get(0)?,
+                peer_id: row.get(1)?,
+                accepted: row.get::<_, i64>(2)? != 0,
+            })
+        })?;
+        rows.map(|row| row.map_err(Into::into)).collect()
+    }
+
+    pub(crate) fn acknowledge_friend_decision(
+        &self,
+        request_id: &str,
+        peer_id: &str,
+    ) -> Result<bool, AppError> {
+        let connection = self.connection()?;
+        Ok(connection.execute(
+            "DELETE FROM pending_friend_decisions
+             WHERE request_id = ?1 AND peer_id = ?2",
+            params![request_id, peer_id],
+        )? == 1)
+    }
+
+    pub(crate) fn reconcile_request_from_existing_friend(
+        &self,
+        request: &FriendRequest,
+    ) -> Result<(), AppError> {
+        if request.direction != Direction::Incoming
+            || request.status != FriendRequestStatus::Accepted
+        {
+            return Err(AppError::InvalidInput("好友状态对账请求无效".to_string()));
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let is_friend: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM friends WHERE peer_id = ?1)",
+            [&request.peer_id],
+            |row| row.get(0),
+        )?;
+        if !is_friend {
+            return Err(AppError::InvalidInput(
+                "只有现有好友可以自动对账".to_string(),
+            ));
+        }
+        let existing_peer: Option<String> = transaction
+            .query_row(
+                "SELECT peer_id FROM friend_requests WHERE request_id = ?1",
+                [&request.request_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if existing_peer
+            .as_deref()
+            .is_some_and(|peer_id| peer_id != request.peer_id)
+        {
+            return Err(AppError::InvalidInput(
+                "好友申请编号冲突，已拒绝处理".to_string(),
+            ));
+        }
+        transaction.execute(
+            "INSERT INTO friend_requests
+               (request_id, peer_id, nickname, direction, status, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'incoming', 'accepted', ?4, ?5)
+             ON CONFLICT(request_id) DO UPDATE SET
+               nickname = excluded.nickname,
+               direction = 'incoming',
+               status = 'accepted',
+               updated_at = excluded.updated_at",
+            params![
+                request.request_id,
+                request.peer_id,
+                request.nickname,
+                request.created_at,
+                request.updated_at,
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO pending_friend_decisions
+               (request_id, peer_id, accepted, created_at)
+             VALUES (?1, ?2, 1, ?3)
+             ON CONFLICT(request_id) DO UPDATE SET
+               peer_id = excluded.peer_id,
+               accepted = 1",
+            params![request.request_id, request.peer_id, request.updated_at],
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -2456,6 +2632,7 @@ impl Storage {
                online INTEGER NOT NULL DEFAULT 0,
                protocol_version INTEGER NOT NULL,
                capabilities_json TEXT NOT NULL DEFAULT '[]',
+               last_lan_ip TEXT,
                last_seen TEXT NOT NULL
              );
              CREATE TABLE IF NOT EXISTS friend_requests (
@@ -2468,6 +2645,15 @@ impl Storage {
                updated_at TEXT NOT NULL
              );
              CREATE INDEX IF NOT EXISTS idx_friend_requests_peer ON friend_requests(peer_id);
+             CREATE TABLE IF NOT EXISTS pending_friend_decisions (
+               request_id TEXT PRIMARY KEY NOT NULL,
+               peer_id TEXT NOT NULL,
+               accepted INTEGER NOT NULL CHECK(accepted IN (0, 1)),
+               created_at TEXT NOT NULL,
+               FOREIGN KEY (request_id) REFERENCES friend_requests(request_id) ON DELETE CASCADE
+             );
+             CREATE INDEX IF NOT EXISTS idx_pending_friend_decisions_peer
+               ON pending_friend_decisions(peer_id, created_at);
              CREATE TABLE IF NOT EXISTS friends (
                peer_id TEXT PRIMARY KEY NOT NULL,
                nickname TEXT NOT NULL,
@@ -2751,6 +2937,39 @@ impl Storage {
             transaction.execute(
                 "ALTER TABLE peers
                  ADD COLUMN capabilities_json TEXT NOT NULL DEFAULT '[]'",
+                [],
+            )?;
+        }
+        let has_last_lan_ip: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('peers')
+             WHERE name = 'last_lan_ip'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_last_lan_ip == 0 {
+            transaction.execute("ALTER TABLE peers ADD COLUMN last_lan_ip TEXT", [])?;
+        }
+        let seeded_friend_decisions: bool = transaction.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM settings WHERE key = 'friend_decision_outbox_seeded_v1'
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        if !seeded_friend_decisions {
+            transaction.execute(
+                "INSERT OR IGNORE INTO pending_friend_decisions
+                   (request_id, peer_id, accepted, created_at)
+                 SELECT request_id, peer_id,
+                        CASE status WHEN 'accepted' THEN 1 ELSE 0 END,
+                        updated_at
+                 FROM friend_requests
+                 WHERE direction = 'incoming' AND status IN ('accepted', 'rejected')",
+                [],
+            )?;
+            transaction.execute(
+                "INSERT INTO settings (key, value)
+                 VALUES ('friend_decision_outbox_seeded_v1', '1')",
                 [],
             )?;
         }
@@ -4041,6 +4260,7 @@ fn validate_loaded_optional_sha256(value: Option<String>) -> Result<Option<Strin
 mod tests {
     use std::{
         fs, io,
+        net::Ipv4Addr,
         path::{Path, PathBuf},
         sync::{Arc, Barrier},
         thread,
@@ -4052,8 +4272,9 @@ mod tests {
     use super::{OwnedArtifactRecord, PartialRecoveryRecord, Storage};
     use crate::{
         domain::{
-            ChatMessage, Direction, MessageKind, MessageStatus, PeerSummary, Platform,
-            TransferKind, TransferPreferences, TransferRecord, TransferStatus,
+            ChatMessage, Direction, Friend, FriendRequest, FriendRequestStatus, MessageKind,
+            MessageStatus, PeerSummary, Platform, TransferKind, TransferPreferences,
+            TransferRecord, TransferStatus,
         },
         error::AppError,
         receive_paths::{
@@ -9033,5 +9254,143 @@ mod tests {
 
         drop(storage);
         fs::remove_dir_all(fixture).expect("remove rejected resume fixture");
+    }
+
+    #[test]
+    fn remembered_friend_lan_target_is_authenticated_private_and_survives_restart() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-remembered-friend-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&fixture).expect("create remembered friend fixture");
+        let database = fixture.join("localnet.sqlite3");
+        let storage = Storage::open(&database).expect("open remembered friend storage");
+        for peer_id in ["friend-peer", "nearby-peer"] {
+            storage
+                .upsert_peer(&PeerSummary {
+                    peer_id: peer_id.to_string(),
+                    nickname: peer_id.to_string(),
+                    platform: Platform::Windows,
+                    online: true,
+                    protocol_version: 1,
+                    capabilities: Vec::new(),
+                    last_seen: "2026-08-25T00:00:00.000Z".to_string(),
+                })
+                .expect("persist remembered peer");
+        }
+        storage
+            .connection()
+            .expect("persist friend fixture")
+            .execute(
+                "INSERT INTO friends (peer_id, nickname, platform, added_at, last_seen)
+                 VALUES ('friend-peer', 'Friend', 'windows', ?1, ?1)",
+                ["2026-08-25T00:00:00.000Z"],
+            )
+            .expect("insert accepted friend");
+
+        assert!(
+            !storage
+                .remember_authenticated_lan_ip("friend-peer", Ipv4Addr::new(8, 8, 8, 8))
+                .expect("public authenticated endpoint is ignored")
+        );
+        assert!(
+            storage
+                .remember_authenticated_lan_ip("friend-peer", Ipv4Addr::new(192, 168, 31, 22),)
+                .expect("remember private friend endpoint")
+        );
+        assert!(
+            storage
+                .remember_authenticated_lan_ip("nearby-peer", Ipv4Addr::new(192, 168, 31, 23),)
+                .expect("remember private nonfriend endpoint")
+        );
+        drop(storage);
+
+        let storage = Storage::open(&database).expect("reopen remembered friend storage");
+        assert_eq!(
+            storage
+                .list_friend_lan_targets()
+                .expect("load remembered friend targets"),
+            vec![("friend-peer".to_string(), Ipv4Addr::new(192, 168, 31, 22))]
+        );
+
+        drop(storage);
+        fs::remove_dir_all(fixture).expect("remove remembered friend fixture");
+    }
+
+    #[test]
+    fn accepted_incoming_friend_decision_is_durable_and_exactly_acknowledged() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-friend-decision-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&fixture).expect("create friend decision fixture");
+        let database = fixture.join("localnet.sqlite3");
+        let request_id = uuid::Uuid::now_v7().to_string();
+        let peer_id = "friend-decision-peer";
+        let now = "2026-08-25T00:00:00.000Z";
+        let storage = Storage::open(&database).expect("open friend decision storage");
+        storage
+            .put_friend_request(&FriendRequest {
+                request_id: request_id.clone(),
+                peer_id: peer_id.to_string(),
+                nickname: "Durable Friend".to_string(),
+                direction: Direction::Incoming,
+                status: FriendRequestStatus::Pending,
+                created_at: now.to_string(),
+                updated_at: now.to_string(),
+            })
+            .expect("persist incoming request");
+        storage
+            .resolve_friend_request(
+                &request_id,
+                FriendRequestStatus::Accepted,
+                Some(&Friend {
+                    peer_id: peer_id.to_string(),
+                    nickname: "Durable Friend".to_string(),
+                    platform: Platform::Windows,
+                    online: true,
+                    added_at: now.to_string(),
+                    last_seen: now.to_string(),
+                }),
+                now,
+            )
+            .expect("accept incoming request");
+        drop(storage);
+
+        let storage = Storage::open(&database).expect("reopen friend decision storage");
+        let pending = storage
+            .list_pending_friend_decisions(peer_id)
+            .expect("load durable friend decision");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].request_id, request_id);
+        assert_eq!(pending[0].peer_id, peer_id);
+        assert!(pending[0].accepted);
+        assert!(
+            !storage
+                .acknowledge_friend_decision(&request_id, "wrong-peer")
+                .expect("wrong peer cannot acknowledge friend decision")
+        );
+        assert!(
+            storage
+                .acknowledge_friend_decision(&request_id, peer_id)
+                .expect("exact peer acknowledges friend decision")
+        );
+        assert!(
+            storage
+                .list_pending_friend_decisions(peer_id)
+                .expect("acknowledged friend decision is retired")
+                .is_empty()
+        );
+        drop(storage);
+        let storage = Storage::open(&database).expect("reopen acknowledged friend decision");
+        assert!(
+            storage
+                .list_pending_friend_decisions(peer_id)
+                .expect("one-time migration does not recreate acknowledged decisions")
+                .is_empty()
+        );
+
+        drop(storage);
+        fs::remove_dir_all(fixture).expect("remove friend decision fixture");
     }
 }
