@@ -25,7 +25,10 @@ import {
   requestNotificationPermission,
   type NotificationPermissionState,
 } from "./notifications";
-import { mergePresenceSnapshot, mergeResolvedFriendSnapshot, nearbyPeerEntries, startSnapshotReconciliation } from "./presence";
+import {
+  mergePeerDiscoverySnapshot, mergePeerOfflineSnapshot, mergePresenceSnapshot,
+  mergeResolvedFriendSnapshot, nearbyPeerEntries, startSnapshotReconciliation,
+} from "./presence";
 import { transferStatusPresentation, type TransferStatusInput, type TransferStatusLabels } from "./transfer-status";
 import { checkForUpdate, createUpdateDownloadRequest, type UpdateInfo } from "./update";
 import "./styles.css";
@@ -125,6 +128,14 @@ function App() {
 
   const handleNetworkEvent = useCallback((event: NetworkEvent) => {
     const currentT = translatorRef.current;
+    if (event.type === "peerDiscovered") {
+      setSnapshot((current) => mergePeerDiscoverySnapshot(current, event.peer));
+      return;
+    }
+    if (event.type === "peerOffline") {
+      setSnapshot((current) => mergePeerOfflineSnapshot(current, event.peerId, event.lastSeen));
+      return;
+    }
     scheduleRefresh();
     switch (event.type) {
       case "friendRequestReceived":

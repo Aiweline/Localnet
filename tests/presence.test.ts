@@ -133,6 +133,29 @@ test("friend identity stays bound to PeerId when either device changes its nickn
   );
 });
 
+test("a peer discovery event updates the matching friend's nickname and online state by PeerId", async () => {
+  const { mergePeerDiscoverySnapshot } = await import("../src/presence.ts");
+  const current: {
+    peers: Array<{ peerId: string; nickname: string; online: boolean }>;
+    friends: Array<{ peerId: string; nickname: string; online: boolean }>;
+    messages: Array<{ messageId: string }>;
+  } = {
+    peers: [{ peerId: "mac-peer", nickname: "Old Mac", online: false }],
+    friends: [{ peerId: "mac-peer", nickname: "Old Mac", online: false }],
+    messages: [{ messageId: "keep-me" }],
+  };
+
+  const next = mergePeerDiscoverySnapshot(current, {
+    peerId: "mac-peer",
+    nickname: "New Mac",
+    online: true,
+  });
+
+  assert.deepEqual(next.peers, [{ peerId: "mac-peer", nickname: "New Mac", online: true }]);
+  assert.deepEqual(next.friends, [{ peerId: "mac-peer", nickname: "New Mac", online: true }]);
+  assert.strictEqual(next.messages, current.messages);
+});
+
 test("discovering one friend never hides other addable devices", async () => {
   const { nearbyPeerEntries } = await import("../src/presence.ts");
   const peers = [
