@@ -370,7 +370,7 @@ jobs:
               --notes-file release-notes.md \
               --verify-tag \
               --draft
-            release_json="$(find_release_by_tag "$repository" "$tag")"
+            release_json="$(wait_for_release_by_tag "$repository" "$tag")"
             if ! validate_resumable_draft_release "$release_json" "$version" release-notes.md; then
               echo "::error::The newly created release draft could not be read back exactly."
               exit 1

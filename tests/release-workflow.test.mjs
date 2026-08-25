@@ -264,6 +264,7 @@ function runReleaseMutationStep(
     publishImmutable = true,
     raceMissingProtection = false,
     secondPolicyMissing = false,
+    draftListDelayReads = 0,
   } = {},
 ) {
   const fixtureFiles = {
@@ -275,6 +276,7 @@ function runReleaseMutationStep(
     published: join(fixture.checkout, "fake-release-published.json"),
     mutationLog: join(fixture.checkout, "release-mutations.log"),
     protectionCount: join(fixture.checkout, "fake-protection-count"),
+    releaseVisibilityCount: join(fixture.checkout, "fake-release-visibility-count"),
     eventLog: join(fixture.checkout, "fake-release-events.log"),
   };
   const summaries = rulesetList ?? (ruleset ? [[], [{
@@ -293,6 +295,7 @@ function runReleaseMutationStep(
     fixtureFiles.releaseState,
     fixtureFiles.mutationLog,
     fixtureFiles.protectionCount,
+    fixtureFiles.releaseVisibilityCount,
     fixtureFiles.eventLog,
   ]) {
     rmSync(stale, { force: true });
@@ -378,7 +381,17 @@ gh() {
           return 1
         fi
         if [[ -f "$RELEASE_STATE" ]]; then
-          printf '[[],[%s]]' "$(cat "$RELEASE_STATE")"
+          local visibility_count=0
+          if [[ -f "$RELEASE_VISIBILITY_COUNT" ]]; then
+            visibility_count="$(cat "$RELEASE_VISIBILITY_COUNT")"
+          fi
+          if (( visibility_count < DRAFT_LIST_DELAY_READS )); then
+            visibility_count=$((visibility_count + 1))
+            printf '%s' "$visibility_count" > "$RELEASE_VISIBILITY_COUNT"
+            printf '[[],[]]'
+          else
+            printf '[[],[%s]]' "$(cat "$RELEASE_STATE")"
+          fi
         else
           printf '[[],[]]'
         fi
@@ -429,7 +442,9 @@ gh() {
       PROTECTION_COUNT: fixtureFiles.protectionCount,
       PUBLISHED_RELEASE: fixtureFiles.published,
       RACE_MISSING_PROTECTION: String(raceMissingProtection),
+      DRAFT_LIST_DELAY_READS: String(draftListDelayReads),
       RELEASE_STATE: fixtureFiles.releaseState,
+      RELEASE_VISIBILITY_COUNT: fixtureFiles.releaseVisibilityCount,
       RULESET_DETAIL: fixtureFiles.rulesetDetail,
       RULESET_LIST: fixtureFiles.rulesetList,
       SECOND_POLICY_MISSING: String(secondPolicyMissing),
@@ -759,6 +774,23 @@ test("the publish step atomically creates a missing new tag before creating its 
       readFileSync(join(fixture.checkout, "release-mutations.log"), "utf8"),
       /^release create v0\.2\.0 /m,
     );
+  } finally {
+    fixture.dispose();
+  }
+});
+
+test("a newly created draft waits for release-list propagation before upload", () => {
+  const fixture = remoteTagFixture("missing");
+  try {
+    const result = runReleaseMutationStep(fixture, { draftListDelayReads: 1 });
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    const mutations = readFileSync(
+      join(fixture.checkout, "release-mutations.log"),
+      "utf8",
+    );
+    assert.match(mutations, /^release create v0\.2\.0 /m);
+    assert.match(mutations, /^release upload v0\.2\.0 /m);
+    assert.match(mutations, /^release edit v0\.2\.0 .*--draft=false/m);
   } finally {
     fixture.dispose();
   }

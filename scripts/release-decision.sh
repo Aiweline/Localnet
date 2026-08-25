@@ -69,6 +69,26 @@ find_release_by_tag() {
   node scripts/release-policy.mjs find-release "$tag" <<< "$pages"
 }
 
+wait_for_release_by_tag() {
+  local repository="${1:?GitHub repository is required}"
+  local tag="${2:?release tag is required}"
+  local release_json="" attempt
+  for ((attempt = 1; attempt <= 10; attempt++)); do
+    if ! release_json="$(find_release_by_tag "$repository" "$tag")"; then
+      return 1
+    fi
+    if [[ -n "$release_json" ]]; then
+      printf '%s' "$release_json"
+      return 0
+    fi
+    if ((attempt < 10)); then
+      sleep 2
+    fi
+  done
+  echo "::error::The newly created release draft did not become readable after bounded retries." >&2
+  return 1
+}
+
 read_release_by_id() {
   local repository="${1:?GitHub repository is required}"
   local release_id="${2:?release id is required}"
