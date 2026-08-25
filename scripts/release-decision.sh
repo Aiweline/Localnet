@@ -8,6 +8,155 @@ validate_release_ref() {
   fi
 }
 
+readonly RELEASE_POLICY_API_VERSION="2026-03-10"
+
+validate_github_repository_name() {
+  local repository="${1:?GitHub repository is required}"
+  if [[ ! "$repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    echo "::error::Invalid GitHub repository name for release policy verification."
+    return 1
+  fi
+}
+
+github_api_json() {
+  gh api \
+    -H "Accept: application/vnd.github+json" \
+    -H "X-GitHub-Api-Version: $RELEASE_POLICY_API_VERSION" \
+    -H "Time-Zone: UTC" \
+    "$@"
+}
+
+verify_audited_release_tag_policy() {
+  local repository="${1:?GitHub repository is required}"
+  validate_github_repository_name "$repository"
+  local ruleset_id
+  ruleset_id="$(node scripts/release-policy.mjs audited-ruleset-id)"
+
+  local pages
+  if ! pages="$(
+    github_api_json --paginate --slurp \
+      "repos/$repository/rulesets?per_page=100&includes_parents=false&targets=tag"
+  )"; then
+    echo "::error::Could not read the complete repository tag-ruleset list."
+    return 1
+  fi
+  if ! node scripts/release-policy.mjs validate-ruleset-list <<< "$pages"; then
+    return 1
+  fi
+
+  local detail
+  if ! detail="$(
+    github_api_json \
+      "repos/$repository/rulesets/$ruleset_id?includes_parents=false"
+  )"; then
+    echo "::error::Could not read the audited immutable release-tag ruleset detail."
+    return 1
+  fi
+  node scripts/release-policy.mjs validate-ruleset-detail "$repository" <<< "$detail"
+}
+
+find_release_by_tag() {
+  local repository="${1:?GitHub repository is required}"
+  local tag="${2:?release tag is required}"
+  validate_github_repository_name "$repository"
+  local pages
+  if ! pages="$(
+    github_api_json --paginate --slurp "repos/$repository/releases?per_page=100"
+  )"; then
+    echo "::error::Could not read the complete GitHub release list." >&2
+    return 1
+  fi
+  node scripts/release-policy.mjs find-release "$tag" <<< "$pages"
+}
+
+read_release_by_id() {
+  local repository="${1:?GitHub repository is required}"
+  local release_id="${2:?release id is required}"
+  validate_github_repository_name "$repository"
+  if [[ ! "$release_id" =~ ^[0-9]+$ ]]; then
+    echo "::error::Invalid GitHub release id." >&2
+    return 1
+  fi
+  github_api_json "repos/$repository/releases/$release_id"
+}
+
+validate_release_common() {
+  local release_json="${1:?release JSON is required}"
+  local version="${2:?release version is required}"
+  local notes_file="${3:?release notes file is required}"
+  node scripts/release-policy.mjs validate-release draft-complete "$version" "$notes_file" \
+    <<< "$release_json"
+}
+
+validate_published_immutable_release() {
+  local release_json="${1:?release JSON is required}"
+  local version="${2:?release version is required}"
+  local notes_file="${3:?release notes file is required}"
+  node scripts/release-policy.mjs validate-release published "$version" "$notes_file" \
+    <<< "$release_json"
+}
+
+validate_resumable_draft_release() {
+  local release_json="${1:?release JSON is required}"
+  local version="${2:?release version is required}"
+  local notes_file="${3:?release notes file is required}"
+  node scripts/release-policy.mjs validate-release draft-resumable "$version" "$notes_file" \
+    <<< "$release_json"
+}
+
+guard_release_mutation() {
+  local repository="${1:?GitHub repository is required}"
+  local remote_name="${2:?remote name is required}"
+  local tag="${3:?release tag is required}"
+  local expected_sha="${4:?expected SHA is required}"
+  verify_audited_release_tag_policy "$repository" &&
+    verify_remote_release_tag "$remote_name" "$tag" "$expected_sha"
+}
+
+write_release_notes() {
+  local version="${1:?release version is required}"
+  local commit_ref="${2:?release commit is required}"
+  local output="${3:?release notes output is required}"
+  if ! git cat-file -e "$commit_ref^{commit}" 2>/dev/null; then
+    echo "::error::Release notes commit is not available: $commit_ref."
+    return 1
+  fi
+  if git ls-files --error-unmatch "docs/releases/v${version}.md" >/dev/null 2>&1; then
+    cp "docs/releases/v${version}.md" "$output"
+    return
+  fi
+
+  local previous_tag changes
+  previous_tag="$(git tag --sort=-v:refname | grep -Fxv "v${version}" | head -n 1 || true)"
+  if [[ -n "$previous_tag" ]]; then
+    changes="$(git log --format='- %s' "${previous_tag}..${commit_ref}")"
+  else
+    changes="$(git log --format='- %s' -n 20 "$commit_ref")"
+  fi
+  cat > "$output" <<EOF
+## Weline Localnet ${version}
+
+Windows 与 macOS 局域网私密聊天及文件直传工具。本版本由通过发布门禁的 main 提交自动构建。
+
+### 变更
+
+${changes}
+
+### 下载
+
+- Windows x64 安装版与便携版
+- macOS Universal DMG（Apple Silicon + Intel）
+- SHA-256 完整性校验文件
+
+---
+
+Weline Localnet is a private peer-to-peer LAN messenger and file-transfer app for Windows and macOS. This release was built automatically from a gated main-branch commit.
+
+Company: 成都阿玛云科技有限公司
+Contact: contact@amayum.com
+EOF
+}
+
 validate_remote_release_tag_arguments() {
   local remote_name="${1:?remote name is required}"
   local tag="${2:?tag is required}"
@@ -150,23 +299,38 @@ release_decision_main() {
   if git rev-parse --verify --quiet "$tag^{commit}" >/dev/null; then
     tag_exists=true
     tag_commit="$(git rev-list -n 1 "$tag")"
-    local release_json
-    release_json="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease,assets 2>/dev/null || true)"
-    if [[ -n "$release_json" ]]; then
-      local expected_assets actual_assets is_draft is_prerelease
-      expected_assets="$(printf '%s\n' \
-        "Weline_Localnet_${version}_SHA256SUMS.txt" \
-        "Weline_Localnet_${version}_universal.dmg" \
-        "Weline_Localnet_${version}_universal.dmg.sha256" \
-        "Weline_Localnet_${version}_x64-portable.exe" \
-        "Weline_Localnet_${version}_x64-setup.exe" | sort)"
-      actual_assets="$(jq -r '.assets[].name' <<< "$release_json" | sort)"
-      is_draft="$(jq -r '.isDraft' <<< "$release_json")"
-      is_prerelease="$(jq -r '.isPrerelease' <<< "$release_json")"
-      if [[ "$is_draft" == "false" && "$is_prerelease" == "false" && "$actual_assets" == "$expected_assets" ]]; then
-        release_complete=true
-      fi
+  fi
+
+  local release_json
+  if ! release_json="$(find_release_by_tag "$GITHUB_REPOSITORY" "$tag")"; then
+    return 1
+  fi
+  if [[ "$tag_exists" == "false" && -n "$release_json" ]]; then
+    echo "::error::A GitHub release already exists for $tag, but the checked-out tag is missing."
+    return 1
+  fi
+  if [[ -n "$release_json" ]]; then
+    local notes_file generated_notes="" release_state
+    notes_file="docs/releases/v${version}.md"
+    if ! git ls-files --error-unmatch "$notes_file" >/dev/null 2>&1; then
+      generated_notes="$(mktemp)"
+      notes_file="$generated_notes"
+      write_release_notes "$version" "${tag_commit:-$GITHUB_SHA}" "$notes_file"
     fi
+    release_state="$(node scripts/release-policy.mjs release-state <<< "$release_json")"
+    if [[ "$release_state" == "published" ]]; then
+      if ! validate_published_immutable_release "$release_json" "$version" "$notes_file"; then
+        [[ -n "$generated_notes" ]] && rm -f "$generated_notes"
+        echo "::error::Published release $tag is mutable or differs from the exact immutable release contract; it cannot be repaired."
+        return 1
+      fi
+      release_complete=true
+    elif ! validate_resumable_draft_release "$release_json" "$version" "$notes_file"; then
+      [[ -n "$generated_notes" ]] && rm -f "$generated_notes"
+      echo "::error::Existing release draft $tag does not match the owned draft contract."
+      return 1
+    fi
+    [[ -n "$generated_notes" ]] && rm -f "$generated_notes"
   fi
 
   decide_release "$tag" "$tag_exists" "$tag_commit" "$release_complete" "$app_changed" "$GITHUB_SHA"

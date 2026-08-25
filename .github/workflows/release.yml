@@ -261,6 +261,11 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Set up Node.js for immutable release policy checks
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
       - name: Download Windows packages
         uses: actions/download-artifact@v4
         with:
@@ -306,38 +311,8 @@ jobs:
         run: |
           set -euo pipefail
           version="${{ needs.prepare.outputs.version }}"
-          if git ls-files --error-unmatch "docs/releases/v${version}.md" >/dev/null 2>&1; then
-            cp "docs/releases/v${version}.md" release-notes.md
-          else
-            previous_tag="$(git tag --sort=-v:refname | grep -Fxv "v${version}" | head -n 1 || true)"
-            if [[ -n "$previous_tag" ]]; then
-              changes="$(git log --format='- %s' "${previous_tag}..${GITHUB_SHA}")"
-            else
-              changes="$(git log --format='- %s' -n 20 "$GITHUB_SHA")"
-            fi
-            cat > release-notes.md <<EOF
-          ## Weline Localnet ${version}
-
-          Windows 与 macOS 局域网私密聊天及文件直传工具。本版本由通过发布门禁的 main 提交自动构建。
-
-          ### 变更
-
-          ${changes}
-
-          ### 下载
-
-          - Windows x64 安装版与便携版
-          - macOS Universal DMG（Apple Silicon + Intel）
-          - SHA-256 完整性校验文件
-
-          ---
-
-          Weline Localnet is a private peer-to-peer LAN messenger and file-transfer app for Windows and macOS. This release was built automatically from a gated main-branch commit.
-
-          Company: 成都阿玛云科技有限公司
-          Contact: contact@amayum.com
-          EOF
-          fi
+          source scripts/release-decision.sh
+          write_release_notes "$version" "$GITHUB_SHA" release-notes.md
 
       - name: Create or repair GitHub Release
         shell: bash
@@ -347,47 +322,84 @@ jobs:
           set -euo pipefail
           version="${{ needs.prepare.outputs.version }}"
           tag="v${version}"
+          repository="$GITHUB_REPOSITORY"
           source scripts/release-decision.sh
+
+          # This metadata-scoped check is tamper-evident, not self-healing. The
+          # audited no-bypass snapshot is maintained by a repository administrator.
+          verify_audited_release_tag_policy "$repository"
           if git rev-parse --verify --quiet "$tag^{commit}" >/dev/null; then
             tag_commit="$(git rev-list -n 1 "$tag")"
             if [[ "$tag_commit" != "$GITHUB_SHA" ]]; then
-              echo "::error::Refusing to repair $tag from $GITHUB_SHA because the tag points to $tag_commit."
+              echo "::error::Refusing to publish $tag from $GITHUB_SHA because the tag points to $tag_commit."
               exit 1
             fi
             verify_remote_release_tag origin "$tag" "$GITHUB_SHA"
           else
+            verify_audited_release_tag_policy "$repository"
             create_remote_release_tag origin "$tag" "$GITHUB_SHA"
           fi
-          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            while IFS= read -r asset; do
-              case "$asset" in
-                "Weline_Localnet_${version}_SHA256SUMS.txt"|\
-                "Weline_Localnet_${version}_universal.dmg"|\
-                "Weline_Localnet_${version}_universal.dmg.sha256"|\
-                "Weline_Localnet_${version}_x64-portable.exe"|\
-                "Weline_Localnet_${version}_x64-setup.exe") ;;
-                *)
-                  verify_remote_release_tag origin "$tag" "$GITHUB_SHA"
-                  gh release delete-asset "$tag" "$asset" --repo "$GITHUB_REPOSITORY" --yes
-                  ;;
-              esac
-            done < <(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
-            verify_remote_release_tag origin "$tag" "$GITHUB_SHA"
-            gh release upload "$tag" release-assets/* --repo "$GITHUB_REPOSITORY" --clobber
-            verify_remote_release_tag origin "$tag" "$GITHUB_SHA"
-            gh release edit "$tag" \
-              --repo "$GITHUB_REPOSITORY" \
-              --title "Weline Localnet v${version}" \
-              --notes-file release-notes.md \
-              --draft=false \
-              --prerelease=false \
-              --latest
+
+          release_json="$(find_release_by_tag "$repository" "$tag")"
+          if [[ -n "$release_json" ]]; then
+            release_id="$(node scripts/release-policy.mjs release-id <<< "$release_json")"
+            release_state="$(node scripts/release-policy.mjs release-state <<< "$release_json")"
+            if [[ "$release_state" == "published" ]]; then
+              if validate_published_immutable_release "$release_json" "$version" release-notes.md; then
+                echo "Published immutable release $tag already matches the exact notes and five assets; no mutation is permitted."
+                exit 0
+              fi
+              echo "::error::Published release $tag is mutable or differs from the exact immutable release contract; published releases are never repaired."
+              exit 1
+            fi
+            if ! validate_resumable_draft_release "$release_json" "$version" release-notes.md; then
+              echo "::error::Existing draft $tag is not an owned, exact release draft and will not be mutated."
+              exit 1
+            fi
           else
-            verify_remote_release_tag origin "$tag" "$GITHUB_SHA"
-            gh release create "$tag" release-assets/* \
-              --repo "$GITHUB_REPOSITORY" \
+            guard_release_mutation "$repository" origin "$tag" "$GITHUB_SHA"
+            gh release create "$tag" \
+              --repo "$repository" \
               --target "$GITHUB_SHA" \
               --title "Weline Localnet v${version}" \
               --notes-file release-notes.md \
-              --latest
+              --verify-tag \
+              --draft
+            release_json="$(find_release_by_tag "$repository" "$tag")"
+            if ! validate_resumable_draft_release "$release_json" "$version" release-notes.md; then
+              echo "::error::The newly created release draft could not be read back exactly."
+              exit 1
+            fi
+            release_id="$(node scripts/release-policy.mjs release-id <<< "$release_json")"
+          fi
+
+          assets=(
+            "release-assets/Weline_Localnet_${version}_SHA256SUMS.txt"
+            "release-assets/Weline_Localnet_${version}_universal.dmg"
+            "release-assets/Weline_Localnet_${version}_universal.dmg.sha256"
+            "release-assets/Weline_Localnet_${version}_x64-portable.exe"
+            "release-assets/Weline_Localnet_${version}_x64-setup.exe"
+          )
+          guard_release_mutation "$repository" origin "$tag" "$GITHUB_SHA"
+          gh release upload "$tag" "${assets[@]}" --repo "$repository" --clobber
+
+          release_json="$(read_release_by_id "$repository" "$release_id")"
+          if ! validate_release_common "$release_json" "$version" release-notes.md; then
+            echo "::error::Draft $tag does not contain exactly five uploaded assets; refusing to publish."
+            exit 1
+          fi
+
+          guard_release_mutation "$repository" origin "$tag" "$GITHUB_SHA"
+          gh release edit "$tag" \
+            --repo "$repository" \
+            --title "Weline Localnet v${version}" \
+            --notes-file release-notes.md \
+            --draft=false \
+            --prerelease=false \
+            --latest
+
+          release_json="$(read_release_by_id "$repository" "$release_id")"
+          if ! validate_published_immutable_release "$release_json" "$version" release-notes.md; then
+            echo "::error::Published release $tag did not become immutable with the exact five assets. Administrator action is required; the workflow will not repair it."
+            exit 1
           fi
