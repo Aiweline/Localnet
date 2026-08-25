@@ -135,12 +135,28 @@ pub fn send_friend_request(
     state: State<'_, AppState>,
 ) -> Result<Option<FriendRequest>, AppError> {
     validate_peer_id(&peer_id, state.identity.peer_id_string().as_str())?;
-    let peer = require_online_peer(&peer_id, &state)?;
-    send_friend_request_with_dispatch(&state.storage, peer_id, peer, |request| {
-        state
-            .network()?
-            .try_send(NetworkCommand::SendFriendRequest(request))
-    })
+    send_friend_request_if_needed(
+        &state.storage,
+        peer_id.clone(),
+        || require_online_peer(&peer_id, &state),
+        |request| {
+            state
+                .network()?
+                .try_send(NetworkCommand::SendFriendRequest(request))
+        },
+    )
+}
+
+fn send_friend_request_if_needed(
+    storage: &Storage,
+    peer_id: String,
+    resolve_online_peer: impl FnOnce() -> Result<PeerSummary, AppError>,
+    dispatch: impl FnMut(FriendRequest) -> Result<(), AppError>,
+) -> Result<Option<FriendRequest>, AppError> {
+    if storage.is_friend(&peer_id)? {
+        return Ok(None);
+    }
+    send_friend_request_with_dispatch(storage, peer_id, resolve_online_peer()?, dispatch)
 }
 
 fn send_friend_request_with_dispatch(
@@ -959,7 +975,7 @@ mod tests {
     use super::{
         accept_incoming_transfer_with_preflight, cancel_transfer_locally,
         prepare_receive_directory, prepare_source, prepare_transfer_preferences,
-        reserve_manual_receive_destination, send_friend_request_with_dispatch,
+        reserve_manual_receive_destination, send_friend_request_if_needed,
     };
     use crate::{
         domain::{
@@ -1067,14 +1083,24 @@ mod tests {
             )
             .expect("persist existing friendship");
 
+        let resolved_online_peer = std::cell::Cell::new(false);
         let dispatched = std::cell::Cell::new(false);
-        let result = send_friend_request_with_dispatch(&storage, peer_id.to_string(), peer, |_| {
-            dispatched.set(true);
-            Ok(())
-        })
-        .expect("an existing friendship is an idempotent success");
+        let result = send_friend_request_if_needed(
+            &storage,
+            peer_id.to_string(),
+            || {
+                resolved_online_peer.set(true);
+                Err(AppError::InvalidInput("peer is offline".to_string()))
+            },
+            |_| {
+                dispatched.set(true);
+                Ok(())
+            },
+        )
+        .expect("an existing friendship is an idempotent success even while offline");
 
         assert!(result.is_none());
+        assert!(!resolved_online_peer.get());
         assert!(!dispatched.get());
         assert!(storage.is_friend(peer_id).expect("friendship remains"));
 
