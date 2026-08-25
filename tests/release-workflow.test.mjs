@@ -1063,9 +1063,18 @@ test("release workflow is valid YAML and wires provenance checks before decision
   );
   const parsedWorkflow = JSON.parse(successfulValidation.stdout);
   const prepareSteps = parsedWorkflow.jobs.prepare.steps;
+  const transferStatusIndex = prepareSteps.findIndex((step) => step.name === "Run transfer status regression test");
+  const clientRegressionIndex = prepareSteps.findIndex((step) => step.name === "Run client experience regression tests");
   const rubySetupIndex = prepareSteps.findIndex((step) => step.name === "Set up Ruby for release workflow validation");
   const releaseRegressionIndex = prepareSteps.findIndex((step) => step.name === "Run release workflow regression test");
   assert.ok(rubySetupIndex >= 0, "prepare must install the YAML validator's pinned Ruby runtime");
+  assert.ok(
+    clientRegressionIndex > transferStatusIndex && clientRegressionIndex < rubySetupIndex,
+    "client experience regressions must run before release workflow validation and release decisions",
+  );
+  assert.match(prepareSteps[clientRegressionIndex].run, /tests\/discovery-refresh\.test\.ts/);
+  assert.match(prepareSteps[clientRegressionIndex].run, /tests\/notifications\.test\.ts/);
+  assert.match(prepareSteps[clientRegressionIndex].run, /tests\/update\.test\.ts/);
   assert.ok(
     releaseRegressionIndex > rubySetupIndex,
     "Ruby setup must complete before the release workflow regression test",
