@@ -43,6 +43,7 @@ use crate::{
     storage::Storage,
     transfer_manifest::validate_transfer_metadata,
     transfer_policy::{FILE_RESUME_V2_CAPABILITY, TransferProtocol},
+    volume_preflight::sanitize_destination_preflight_error,
 };
 
 const EVENT_NAME: &str = "localnet://event";
@@ -2418,7 +2419,9 @@ where
             "文件接收目录必须是绝对路径".to_string(),
         ));
     }
-    preflight(configured, file_size, 0)?;
+    if let Err(error) = preflight(configured, file_size, 0) {
+        return Err(sanitize_destination_preflight_error(configured, error));
+    }
     let directory = configured.to_path_buf();
     let reservation_token = uuid::Uuid::new_v4().to_string();
     let path =
@@ -6075,6 +6078,59 @@ mod tests {
     }
 
     #[test]
+    fn automatic_acceptance_never_persists_private_preflight_diagnostics() {
+        let (directory, storage, preferences) = automatic_fixture("private-diagnostics");
+        let offer = large_v2_offer();
+        let private_diagnostic = r"permission denied for E:\Private\客户\Archive (os error 5)";
+
+        let outcome = persist_incoming_offer_with_preflight(
+            &storage,
+            "automatic-preflight-peer",
+            &offer,
+            &preferences,
+            &|_, _, _| {
+                Err(AppError::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    private_diagnostic,
+                )))
+            },
+        )
+        .expect("automatic preflight failure must persist a safe manual fallback");
+
+        let message = outcome
+            .automatic_receive_error
+            .as_deref()
+            .expect("automatic preflight failure is reported");
+        assert!(message.contains("权限"));
+        assert!(!message.contains("E:\\Private"));
+        assert!(!message.contains("os error"));
+        let stored = storage
+            .get_transfer(&offer.transfer_id)
+            .expect("reload safe automatic fallback")
+            .expect("safe automatic fallback exists");
+        assert_eq!(stored.status, TransferStatus::AwaitingAcceptance);
+        assert_eq!(stored.error.as_deref(), Some(message));
+        assert!(
+            !stored
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("E:\\Private")
+        );
+        assert!(
+            !stored
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("os error")
+        );
+        assert!(outcome.transfer_decision.is_none());
+
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove private automatic fixture");
+    }
+
+    #[test]
     fn automatic_acceptance_insufficient_space_falls_back_without_transfer_decision_or_reservation()
     {
         let (directory, storage, preferences) = automatic_fixture("insufficient");
@@ -6122,7 +6178,7 @@ mod tests {
         .expect("FAT32 failure must persist a manual fallback");
 
         assert!(outcome.transfer_decision.is_none());
-        assert_automatic_fallback(&storage, &offer.transfer_id, "MSDOS");
+        assert_automatic_fallback(&storage, &offer.transfer_id, "磁盘格式");
         drop(storage);
         fs::remove_dir_all(directory).expect("remove FAT32 automatic fixture");
     }
@@ -6192,7 +6248,7 @@ mod tests {
         .expect("missing media must persist a manual fallback");
 
         assert!(outcome.transfer_decision.is_none());
-        assert_automatic_fallback(&storage, &offer.transfer_id, "请选择可访问且可写入的目录");
+        assert_automatic_fallback(&storage, &offer.transfer_id, "不可用");
         assert!(!missing.exists());
         drop(storage);
         fs::remove_dir_all(fixture).expect("remove missing automatic fixture");
@@ -6218,7 +6274,7 @@ mod tests {
         .expect("unwritable media must persist a manual fallback");
 
         assert!(outcome.transfer_decision.is_none());
-        assert_automatic_fallback(&storage, &offer.transfer_id, "无法写入接收目录");
+        assert_automatic_fallback(&storage, &offer.transfer_id, "不可用");
         drop(storage);
         fs::remove_dir_all(directory).expect("remove unwritable automatic fixture");
     }
@@ -6258,7 +6314,7 @@ mod tests {
 
             assert!(outcome.transfer_decision.is_none());
             let expected = if unavailable == "missing" {
-                "请选择可访问且可写入的目录"
+                "不可用"
             } else {
                 "可用空间不足"
             };
@@ -6671,8 +6727,8 @@ mod tests {
         )
         .expect_err("missing selected media must reject automatic v2 acceptance");
 
-        assert_eq!(error.code(), "storage_error");
-        assert!(error.to_string().contains("请选择可访问且可写入的目录"));
+        assert_eq!(error.code(), "destination_preflight_error");
+        assert!(error.to_string().contains("不可用"));
         assert!(!fixture.exists());
         let _ = fs::remove_dir_all(fixture);
     }

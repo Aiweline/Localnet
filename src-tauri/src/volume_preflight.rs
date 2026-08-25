@@ -5,7 +5,7 @@ use std::{
 };
 
 use crate::{
-    error::AppError,
+    error::{AppError, DestinationPreflightFailure},
     transfer_policy::{DEFAULT_MAX_FILE_BYTES, TRANSFER_CHUNK_BYTES},
 };
 
@@ -14,6 +14,46 @@ const FAT32_MAX_FILE_BYTES: u64 = (4 * 1024 * 1024 * 1024) - 1;
 const WRITE_PROBE_ATTEMPTS: u8 = 3;
 pub(crate) const DESTINATION_PREFLIGHT_PAUSE_MARKER: &str =
     "[weline-localnet:destination-preflight:v1]";
+
+pub(crate) fn destination_preflight_pause_error(failure: DestinationPreflightFailure) -> String {
+    format!(
+        "{DESTINATION_PREFLIGHT_PAUSE_MARKER}{}",
+        failure.marker_token()
+    )
+}
+
+pub(crate) fn destination_preflight_failure_from_pause_error(
+    error: &str,
+) -> Option<DestinationPreflightFailure> {
+    let token = error.strip_prefix(DESTINATION_PREFLIGHT_PAUSE_MARKER)?;
+    DestinationPreflightFailure::from_marker_token(token)
+}
+
+pub(crate) fn sanitize_destination_preflight_error(directory: &Path, error: AppError) -> AppError {
+    if matches!(error, AppError::DestinationPreflight(_)) {
+        return error;
+    }
+    let failure = DestinationPreflightFailure::from_app_error(&error);
+    tracing::warn!(
+        directory = %directory.display(),
+        raw_error = %error,
+        category = failure.marker_token(),
+        "destination preflight failed"
+    );
+    AppError::DestinationPreflight(failure)
+}
+
+fn destination_io_error(directory: &Path, operation: &str, error: std::io::Error) -> AppError {
+    let failure = DestinationPreflightFailure::from_io_error(&error);
+    tracing::warn!(
+        directory = %directory.display(),
+        %operation,
+        raw_error = %error,
+        category = failure.marker_token(),
+        "destination filesystem operation failed"
+    );
+    AppError::DestinationPreflight(failure)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VolumeSnapshot {
@@ -42,24 +82,24 @@ pub fn validate_volume(
     committed_bytes: u64,
 ) -> Result<(), AppError> {
     if file_size > DEFAULT_MAX_FILE_BYTES {
-        return Err(AppError::InvalidInput(
-            "单个文件不能超过 100 GiB".to_string(),
+        return Err(AppError::DestinationPreflight(
+            DestinationPreflightFailure::FileTooLarge,
         ));
     }
 
     let filesystem = normalize_filesystem_name(&snapshot.filesystem);
     if filesystem.is_empty() {
-        return Err(AppError::Storage(
-            "无法识别接收目录所在文件系统，请选择本地磁盘目录后重试".to_string(),
+        return Err(AppError::DestinationPreflight(
+            DestinationPreflightFailure::UnsupportedFilesystem,
         ));
     }
 
     if let Some(max_file_bytes) = snapshot.max_file_bytes
         && file_size > max_file_bytes
     {
-        return Err(AppError::InvalidInput(format!(
-            "接收目录位于 {filesystem} 文件系统，单个文件最大支持 {max_file_bytes} 字节；请选择支持更大文件的目录后重试"
-        )));
+        return Err(AppError::DestinationPreflight(
+            DestinationPreflightFailure::FilesystemLimit,
+        ));
     }
 
     let remaining_bytes = file_size
@@ -83,14 +123,9 @@ pub fn validate_volume(
         })?;
 
     if snapshot.available_bytes < required_bytes {
-        let final_copy_requirement = if final_copy_bytes == 0 {
-            String::new()
-        } else {
-            format!("，最终文件副本需要 {final_copy_bytes} 字节")
-        };
-        return Err(AppError::InvalidInput(format!(
-            "接收目录位于 {filesystem} 文件系统，可用空间不足：继续接收需要 {remaining_bytes} 字节{final_copy_requirement}，并需保留 {reserve_bytes} 字节；请选择可用空间更多的目录后重试"
-        )));
+        return Err(AppError::DestinationPreflight(
+            DestinationPreflightFailure::InsufficientSpace,
+        ));
     }
 
     Ok(())
@@ -113,17 +148,16 @@ pub fn preflight_destination(
 }
 
 fn probe_writable_directory(directory: &Path) -> Result<(), AppError> {
-    let metadata = fs::metadata(directory).map_err(|error| {
-        AppError::Storage(format!(
-            "无法访问接收目录 {}：{error}；请选择可访问且可写入的目录后重试",
-            directory.display()
-        ))
-    })?;
+    let metadata = fs::metadata(directory)
+        .map_err(|error| destination_io_error(directory, "read directory metadata", error))?;
     if !metadata.is_dir() {
-        return Err(AppError::Storage(format!(
-            "接收位置 {} 不是目录；请选择可写入的目录后重试",
-            directory.display()
-        )));
+        tracing::warn!(
+            directory = %directory.display(),
+            "destination path is not a directory"
+        );
+        return Err(AppError::DestinationPreflight(
+            DestinationPreflightFailure::DirectoryUnavailable,
+        ));
     }
 
     for _ in 0..WRITE_PROBE_ATTEMPTS {
@@ -138,42 +172,42 @@ fn probe_writable_directory(directory: &Path) -> Result<(), AppError> {
             .open(&probe_path)
         {
             Ok(mut file) => {
-                let write_result = file.write_all(&[0]).map_err(|error| {
-                    AppError::Storage(format!(
-                        "无法写入接收目录 {}：{error}；请选择可写入的目录后重试",
-                        directory.display()
-                    ))
-                });
+                let write_result = file
+                    .write_all(&[0])
+                    .map_err(|error| destination_io_error(directory, "write probe", error));
                 drop(file);
-                let cleanup_result = fs::remove_file(&probe_path).map_err(|error| {
-                    AppError::Storage(format!(
-                        "无法清理接收目录 {} 的写入检查文件：{error}；请选择可写入的目录后重试",
-                        directory.display()
-                    ))
-                });
+                let cleanup_result = fs::remove_file(&probe_path)
+                    .map_err(|error| destination_io_error(directory, "remove write probe", error));
 
                 return match (write_result, cleanup_result) {
                     (Ok(()), Ok(())) => Ok(()),
                     (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-                    (Err(write_error), Err(cleanup_error)) => Err(AppError::Storage(format!(
-                        "{write_error}；另一个检查文件无法清理：{cleanup_error}"
-                    ))),
+                    (Err(write_error), Err(cleanup_error)) => {
+                        tracing::warn!(
+                            directory = %directory.display(),
+                            %write_error,
+                            %cleanup_error,
+                            "destination write and cleanup probes both failed"
+                        );
+                        Err(write_error)
+                    }
                 };
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => {
-                return Err(AppError::Storage(format!(
-                    "无法在接收目录 {} 创建写入检查文件：{error}；请选择可写入的目录后重试",
-                    directory.display()
-                )));
+                return Err(destination_io_error(directory, "create write probe", error));
             }
         }
     }
 
-    Err(AppError::Storage(format!(
-        "无法在接收目录 {} 创建唯一的写入检查文件；请重新选择目录后重试",
-        directory.display()
-    )))
+    tracing::warn!(
+        directory = %directory.display(),
+        attempts = WRITE_PROBE_ATTEMPTS,
+        "destination write probe names repeatedly collided"
+    );
+    Err(AppError::DestinationPreflight(
+        DestinationPreflightFailure::DirectoryUnavailable,
+    ))
 }
 
 fn normalize_filesystem_name(filesystem: &str) -> String {
@@ -205,7 +239,10 @@ mod platform {
         GetDiskFreeSpaceExW, GetVolumeInformationW, GetVolumePathNameW,
     };
 
-    use super::{AppError, VolumeSnapshot, maximum_file_bytes, normalize_filesystem_name};
+    use super::{
+        AppError, DestinationPreflightFailure, VolumeSnapshot, destination_io_error,
+        maximum_file_bytes, normalize_filesystem_name,
+    };
 
     const VOLUME_PATH_CAPACITY: usize = 32_768;
     const FILESYSTEM_NAME_CAPACITY: usize = 256;
@@ -213,8 +250,8 @@ mod platform {
     pub(super) fn inspect_volume(directory: &Path) -> Result<VolumeSnapshot, AppError> {
         let mut directory_wide: Vec<u16> = directory.as_os_str().encode_wide().collect();
         if directory_wide.contains(&0) {
-            return Err(AppError::Storage(
-                "接收目录包含无效的空字符，请重新选择目录后重试".to_string(),
+            return Err(AppError::DestinationPreflight(
+                DestinationPreflightFailure::DirectoryUnavailable,
             ));
         }
         directory_wide.push(0);
@@ -248,7 +285,7 @@ mod platform {
             return Err(probe_error(directory, "读取文件系统类型"));
         }
         let filesystem = utf16_buffer_to_string(&filesystem_name).ok_or_else(|| {
-            AppError::Storage("无法识别接收目录所在文件系统，请选择本地磁盘目录后重试".to_string())
+            AppError::DestinationPreflight(DestinationPreflightFailure::UnsupportedFilesystem)
         })?;
 
         let mut available_bytes = 0_u64;
@@ -282,11 +319,7 @@ mod platform {
     }
 
     fn probe_error(directory: &Path, operation: &str) -> AppError {
-        AppError::Storage(format!(
-            "无法{operation}以检查接收目录 {}：{}；请选择可访问的本地目录后重试",
-            directory.display(),
-            std::io::Error::last_os_error()
-        ))
+        destination_io_error(directory, operation, std::io::Error::last_os_error())
     }
 }
 
@@ -299,11 +332,14 @@ mod platform {
         path::Path,
     };
 
-    use super::{AppError, VolumeSnapshot, maximum_file_bytes, normalize_filesystem_name};
+    use super::{
+        AppError, DestinationPreflightFailure, VolumeSnapshot, destination_io_error,
+        maximum_file_bytes, normalize_filesystem_name,
+    };
 
     pub(super) fn inspect_volume(directory: &Path) -> Result<VolumeSnapshot, AppError> {
         let directory = CString::new(directory.as_os_str().as_bytes()).map_err(|_| {
-            AppError::Storage("接收目录包含无效的空字符，请重新选择目录后重试".to_string())
+            AppError::DestinationPreflight(DestinationPreflightFailure::DirectoryUnavailable)
         })?;
         let mut stat = MaybeUninit::<libc::statfs>::zeroed();
         if unsafe { libc::statfs(directory.as_ptr(), stat.as_mut_ptr()) } != 0 {
@@ -319,20 +355,16 @@ mod platform {
             .map(normalize_filesystem_name)
             .filter(|name| !name.is_empty())
             .ok_or_else(|| {
-                AppError::Storage(
-                    "无法识别接收目录所在文件系统，请选择本地磁盘目录后重试".to_string(),
-                )
+                AppError::DestinationPreflight(DestinationPreflightFailure::UnsupportedFilesystem)
             })?;
         let available_blocks = u64::try_from(stat.f_bavail).map_err(|_| {
-            AppError::Storage("接收目录报告了无效的可用空间，请重新选择目录后重试".to_string())
+            AppError::DestinationPreflight(DestinationPreflightFailure::UnsupportedFilesystem)
         })?;
         let block_size = u64::try_from(stat.f_bsize).map_err(|_| {
-            AppError::Storage("接收目录报告了无效的块大小，请重新选择目录后重试".to_string())
+            AppError::DestinationPreflight(DestinationPreflightFailure::UnsupportedFilesystem)
         })?;
         let available_bytes = available_blocks.checked_mul(block_size).ok_or_else(|| {
-            AppError::Storage(
-                "接收目录可用空间过大，无法安全计算；请选择其他目录后重试".to_string(),
-            )
+            AppError::DestinationPreflight(DestinationPreflightFailure::UnsupportedFilesystem)
         })?;
 
         Ok(VolumeSnapshot {
@@ -343,10 +375,11 @@ mod platform {
     }
 
     fn probe_error(directory: &str, operation: &str) -> AppError {
-        AppError::Storage(format!(
-            "无法{operation}以检查接收目录 {directory}：{}；请选择可访问的本地目录后重试",
-            std::io::Error::last_os_error()
-        ))
+        destination_io_error(
+            Path::new(directory),
+            operation,
+            std::io::Error::last_os_error(),
+        )
     }
 }
 
@@ -354,13 +387,12 @@ mod platform {
 mod platform {
     use std::path::Path;
 
-    use super::{AppError, VolumeSnapshot};
+    use super::{AppError, DestinationPreflightFailure, VolumeSnapshot};
 
-    pub(super) fn inspect_volume(directory: &Path) -> Result<VolumeSnapshot, AppError> {
-        Err(AppError::Storage(format!(
-            "当前系统不支持检查接收目录 {} 的文件系统和可用空间，请选择受支持的 Windows 或 macOS 设备后重试",
-            directory.display()
-        )))
+    pub(super) fn inspect_volume(_directory: &Path) -> Result<VolumeSnapshot, AppError> {
+        Err(AppError::DestinationPreflight(
+            DestinationPreflightFailure::UnsupportedFilesystem,
+        ))
     }
 }
 
@@ -369,13 +401,51 @@ mod tests {
     use std::{fs, path::PathBuf};
 
     use super::{
-        FAT32_MAX_FILE_BYTES, VolumeSnapshot, maximum_file_bytes, preflight_destination,
-        validate_volume,
+        DESTINATION_PREFLIGHT_PAUSE_MARKER, FAT32_MAX_FILE_BYTES, VolumeSnapshot,
+        destination_preflight_failure_from_pause_error, destination_preflight_pause_error,
+        maximum_file_bytes, preflight_destination, validate_volume,
     };
-    use crate::transfer_policy::TRANSFER_CHUNK_BYTES;
+    use crate::{
+        error::{AppError, DestinationPreflightFailure},
+        transfer_policy::TRANSFER_CHUNK_BYTES,
+    };
 
     const GIB: u64 = 1024 * 1024 * 1024;
     const RESERVE_BYTES: u64 = 16 * TRANSFER_CHUNK_BYTES as u64;
+
+    #[test]
+    fn destination_pause_markers_round_trip_only_exact_allowlisted_categories() {
+        for failure in [
+            DestinationPreflightFailure::DirectoryUnavailable,
+            DestinationPreflightFailure::PermissionDenied,
+            DestinationPreflightFailure::InsufficientSpace,
+            DestinationPreflightFailure::FilesystemLimit,
+            DestinationPreflightFailure::UnsupportedFilesystem,
+            DestinationPreflightFailure::FileTooLarge,
+        ] {
+            let marker = destination_preflight_pause_error(failure);
+            assert_eq!(
+                destination_preflight_failure_from_pause_error(&marker),
+                Some(failure)
+            );
+        }
+        for invalid in [
+            DESTINATION_PREFLIGHT_PAUSE_MARKER.to_string(),
+            format!("{DESTINATION_PREFLIGHT_PAUSE_MARKER}directory-unavailable "),
+            format!("{DESTINATION_PREFLIGHT_PAUSE_MARKER} DIRECTORY-UNAVAILABLE"),
+            format!(
+                "{DESTINATION_PREFLIGHT_PAUSE_MARKER}unable to inspect E:\\Private (os error 3)"
+            ),
+            format!(
+                "{DESTINATION_PREFLIGHT_PAUSE_MARKER}{DESTINATION_PREFLIGHT_PAUSE_MARKER}directory-unavailable"
+            ),
+        ] {
+            assert_eq!(
+                destination_preflight_failure_from_pause_error(&invalid),
+                None
+            );
+        }
+    }
 
     #[test]
     fn accepts_exact_remaining_plus_64_mib() {
@@ -411,12 +481,12 @@ mod tests {
             let snapshot =
                 VolumeSnapshot::known(filesystem, 10 * GIB, maximum_file_bytes(filesystem));
             assert_eq!(snapshot.max_file_bytes, Some(FAT32_MAX_FILE_BYTES));
-            assert!(
-                validate_volume(&snapshot, 5 * GIB, 0)
-                    .unwrap_err()
-                    .to_string()
-                    .contains(&snapshot.filesystem)
-            );
+            assert!(matches!(
+                validate_volume(&snapshot, 5 * GIB, 0),
+                Err(AppError::DestinationPreflight(
+                    DestinationPreflightFailure::FilesystemLimit
+                ))
+            ));
         }
     }
 
@@ -440,12 +510,12 @@ mod tests {
                 .expect("copy-fallback filesystems accept the exact full workspace margin");
             let one_byte_short =
                 VolumeSnapshot::known(filesystem, exact - 1, maximum_file_bytes(filesystem));
-            assert!(
-                validate_volume(&one_byte_short, file_size, committed_bytes)
-                    .expect_err("one byte below copy workspace must fail")
-                    .to_string()
-                    .contains("最终文件副本")
-            );
+            assert!(matches!(
+                validate_volume(&one_byte_short, file_size, committed_bytes),
+                Err(AppError::DestinationPreflight(
+                    DestinationPreflightFailure::InsufficientSpace
+                ))
+            ));
         }
     }
 

@@ -14,6 +14,12 @@ export interface TransferStatusLabels {
   awaitingAcceptanceOutgoing: string;
   transferring: (percent: number) => string;
   paused: string;
+  destinationDirectoryUnavailable: string;
+  destinationPermissionDenied: string;
+  destinationInsufficientSpace: string;
+  destinationFilesystemLimit: string;
+  destinationUnsupportedFilesystem: string;
+  destinationFileTooLarge: string;
   completed: string;
   cancelled: string;
   failed: string;
@@ -32,6 +38,12 @@ export const DEFAULT_TRANSFER_STATUS_LABELS: TransferStatusLabels = {
   awaitingAcceptanceOutgoing: "等待对方接收",
   transferring: (percent) => `传输中 ${percent}%`,
   paused: "网络中断，等待自动恢复",
+  destinationDirectoryUnavailable: "接收目录当前不可用，请恢复磁盘或重新选择目录后重试",
+  destinationPermissionDenied: "没有权限写入接收目录，请重新选择可写入的目录",
+  destinationInsufficientSpace: "接收目录可用空间不足，请释放空间后等待自动恢复",
+  destinationFilesystemLimit: "接收目录的磁盘格式不支持这么大的文件，请选择支持大文件的目录",
+  destinationUnsupportedFilesystem: "无法安全检查接收目录所在磁盘，请选择本地磁盘目录后重试",
+  destinationFileTooLarge: "单个文件不能超过 100 GiB",
   completed: "已完成",
   cancelled: "已取消",
   failed: "传输失败",
@@ -57,7 +69,7 @@ export function transferStatusPresentation(
     case "transferring":
       return { label: labels.transferring(percent), tone: "active", percent, showProgress: true, showCancel: false };
     case "paused": {
-      const destinationError = destinationPreflightPauseMessage(transfer);
+      const destinationError = destinationPreflightPauseMessage(transfer, labels);
       return {
         label: destinationError || labels.paused,
         tone: "paused",
@@ -75,16 +87,26 @@ export function transferStatusPresentation(
   }
 }
 
-function destinationPreflightPauseMessage(transfer: TransferStatusInput): string {
+function destinationPreflightPauseMessage(transfer: TransferStatusInput, labels: TransferStatusLabels): string {
   if (transfer.direction !== "incoming" || !transfer.error?.startsWith(DESTINATION_PREFLIGHT_PAUSE_MARKER)) {
     return "";
   }
-  const message = normalizePausedError(transfer.error.slice(DESTINATION_PREFLIGHT_PAUSE_MARKER.length));
-  return message && !message.includes(DESTINATION_PREFLIGHT_PAUSE_MARKER) ? message : "";
-}
-
-function normalizePausedError(error: string | undefined): string {
-  return error?.replace(/\s+/g, " ").trim() ?? "";
+  switch (transfer.error.slice(DESTINATION_PREFLIGHT_PAUSE_MARKER.length)) {
+    case "directory-unavailable":
+      return labels.destinationDirectoryUnavailable;
+    case "permission-denied":
+      return labels.destinationPermissionDenied;
+    case "insufficient-space":
+      return labels.destinationInsufficientSpace;
+    case "filesystem-limit":
+      return labels.destinationFilesystemLimit;
+    case "unsupported-filesystem":
+      return labels.destinationUnsupportedFilesystem;
+    case "file-too-large":
+      return labels.destinationFileTooLarge;
+    default:
+      return "";
+  }
 }
 
 function transferPercent(transfer: TransferStatusInput): number {

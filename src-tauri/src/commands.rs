@@ -28,6 +28,7 @@ use crate::{
     storage::Storage,
     transfer_manifest::{TransferChunk, build_manifest_from_snapshot, capture_source_snapshot},
     transfer_policy::{TRANSFER_CHUNK_BYTES, TransferProtocol, select_transfer_protocol},
+    volume_preflight::sanitize_destination_preflight_error,
 };
 
 #[tauri::command]
@@ -705,7 +706,9 @@ where
     let parent = path
         .parent()
         .ok_or_else(|| AppError::InvalidInput("接收文件保存位置无效".to_string()))?;
-    preflight(parent, transfer.file_size, 0)?;
+    if let Err(error) = preflight(parent, transfer.file_size, 0) {
+        return Err(sanitize_destination_preflight_error(parent, error));
+    }
 
     let reservation_token = uuid::Uuid::now_v7().to_string();
     reserve_manual_receive_destination(path, &transfer.transfer_id, &reservation_token)
@@ -1187,6 +1190,36 @@ mod tests {
     }
 
     #[test]
+    fn manual_acceptance_never_returns_private_preflight_diagnostics() {
+        let (directory, storage, transfer) = acceptance_fixture("private-diagnostics", GIB);
+        let destination = directory.join("archive.bin");
+        let private_diagnostic =
+            r"unable to inspect E:\Private\客户\Archive: path unavailable (os error 3)";
+        let mut decisions = 0_u8;
+
+        let error = accept_incoming_transfer_with_preflight(
+            &storage,
+            &transfer,
+            &destination,
+            &|_, _, _| Err(AppError::Storage(private_diagnostic.to_string())),
+            &mut |_| {
+                decisions += 1;
+                Ok(())
+            },
+        )
+        .expect_err("private preflight diagnostics must block acceptance safely");
+
+        assert_eq!(error.code(), "destination_preflight_error");
+        assert!(error.to_string().contains("不可用"));
+        assert!(!error.to_string().contains("E:\\Private"));
+        assert!(!error.to_string().contains("os error"));
+        assert_eq!(decisions, 0);
+        assert_manual_acceptance_unchanged(&storage, &transfer.transfer_id, &destination);
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove private diagnostics fixture");
+    }
+
+    #[test]
     fn manual_acceptance_insufficient_space_has_no_reservation_or_transfer_decision() {
         let file_size = 5 * GIB;
         let (directory, storage, transfer) = acceptance_fixture("insufficient", file_size);
@@ -1236,7 +1269,7 @@ mod tests {
         )
         .expect_err("FAT32 must reject a five GiB destination");
 
-        assert!(error.to_string().contains("FAT32"));
+        assert!(error.to_string().contains("磁盘格式"));
         assert!(!decision_sent.load(Ordering::SeqCst));
         assert_manual_acceptance_unchanged(&storage, &transfer.transfer_id, &destination);
         drop(storage);
@@ -1320,12 +1353,7 @@ mod tests {
             )
             .expect_err("an unavailable destination must block acceptance");
 
-            let expected = if unavailable == "missing" {
-                "请选择可访问且可写入的目录"
-            } else {
-                "请选择可写入的目录后重试"
-            };
-            assert!(error.to_string().contains(expected));
+            assert!(error.to_string().contains("不可用"));
             assert_eq!(decisions, 0);
             assert_manual_acceptance_unchanged(&storage, &transfer.transfer_id, &destination);
             drop(storage);
@@ -1365,7 +1393,7 @@ mod tests {
             .expect_err("legacy acceptance must fail preflight before reservation");
 
             let expected = if unavailable == "missing" {
-                "请选择可访问且可写入的目录"
+                "不可用"
             } else {
                 "可用空间不足"
             };

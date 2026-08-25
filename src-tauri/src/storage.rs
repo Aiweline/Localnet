@@ -15,7 +15,7 @@ use crate::{
         LocalProfile, MessageKind, MessageStatus, PeerSummary, Platform, PresenceSnapshot,
         TransferKind, TransferPreferences, TransferRecord, TransferStatus,
     },
-    error::AppError,
+    error::{AppError, DestinationPreflightFailure},
     receive_paths::{
         open_owned_resumable_partial_file, owned_finalization_reservations,
         owned_finalized_receive_path, remove_owned_finalization_marker,
@@ -29,7 +29,10 @@ use crate::{
         TransferChunk, decode_sha256, expected_chunk_count, expected_chunk_length, manifest_root,
         validate_transfer_metadata,
     },
-    volume_preflight::DESTINATION_PREFLIGHT_PAUSE_MARKER,
+    volume_preflight::{
+        DESTINATION_PREFLIGHT_PAUSE_MARKER, destination_preflight_failure_from_pause_error,
+        destination_preflight_pause_error,
+    },
 };
 
 #[derive(Clone)]
@@ -2775,6 +2778,37 @@ impl Storage {
              WHERE transfer_protocol = 2 AND status IN ('transferring', 'paused')",
             [],
         )?;
+        let invalid_destination_markers = {
+            let mut statement = transaction.prepare(
+                "SELECT transfer_id, error
+                 FROM transfers
+                 WHERE direction = 'incoming' AND transfer_protocol = 2 AND status = 'paused'
+                   AND error LIKE ?1",
+            )?;
+            let prefix = format!("{DESTINATION_PREFLIGHT_PAUSE_MARKER}%");
+            statement
+                .query_map([prefix], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .filter_map(|(transfer_id, error)| {
+                    destination_preflight_failure_from_pause_error(&error)
+                        .is_none()
+                        .then_some(transfer_id)
+                })
+                .collect::<Vec<_>>()
+        };
+        for transfer_id in invalid_destination_markers {
+            transaction.execute(
+                "UPDATE transfers
+                 SET error = '应用重新启动，等待自动恢复',
+                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 WHERE transfer_id = ?1 AND direction = 'incoming'
+                   AND transfer_protocol = 2 AND status = 'paused'",
+                [transfer_id],
+            )?;
+        }
         transaction.execute(
             "UPDATE transfers SET status = 'failed', error = '应用重新启动，请重试传输',
                                   receive_claimed = 0, send_claimed = 0,
@@ -2835,7 +2869,7 @@ impl Storage {
             if matches!(error, AppError::IntegrityFailure) {
                 self.fail_claimed_incoming_recovery(record, &error.to_string())?;
             } else {
-                self.pause_claimed_incoming_recovery(record, &error.to_string())?;
+                self.pause_claimed_incoming_recovery(record, &error)?;
             }
         }
         Ok(())
@@ -3082,7 +3116,7 @@ impl Storage {
     fn pause_claimed_incoming_recovery(
         &self,
         record: &PartialRecoveryRecord,
-        error: &str,
+        error: &AppError,
     ) -> Result<(), AppError> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -3096,10 +3130,12 @@ impl Storage {
             )
             .optional()?
             .flatten();
+        let fallback_error =
+            destination_preflight_pause_error(DestinationPreflightFailure::from_app_error(error));
         let persisted_error = current_error
             .as_deref()
             .filter(|value| is_valid_destination_preflight_pause_error(value))
-            .unwrap_or(error);
+            .unwrap_or(&fallback_error);
         let changed = transaction.execute(
             "UPDATE transfers
              SET error = ?3, receive_claimed = 0,
@@ -3629,11 +3665,7 @@ impl Storage {
 }
 
 fn is_valid_destination_preflight_pause_error(error: &str) -> bool {
-    let Some(message) = error.strip_prefix(DESTINATION_PREFLIGHT_PAUSE_MARKER) else {
-        return false;
-    };
-    let message = message.trim();
-    !message.is_empty() && !message.contains(DESTINATION_PREFLIGHT_PAUSE_MARKER)
+    destination_preflight_failure_from_pause_error(error).is_some()
 }
 
 #[derive(Debug)]
@@ -7601,7 +7633,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_unavailable_media_replaces_a_malformed_destination_pause_marker() {
+    fn startup_unavailable_media_replaces_a_raw_destination_marker_with_a_safe_category() {
         let fixture = std::env::temp_dir().join(format!(
             "weline-localnet-startup-malformed-destination-marker-{}",
             uuid::Uuid::now_v7()
@@ -7614,7 +7646,10 @@ mod tests {
         let destination = media.join("report.bin");
         let transfer_id = "startup-malformed-destination-marker";
         seed_resumable_incoming(&database, &destination, transfer_id, 0, Some(0));
-        let malformed = "[weline-localnet:destination-preflight:v1]   \n\t";
+        let malformed = concat!(
+            "[weline-localnet:destination-preflight:v1]",
+            r"unable to inspect E:\Private\客户\Archive: (os error 3)"
+        );
         {
             let connection = Connection::open(&database).expect("open fixture database");
             connection
@@ -7636,15 +7671,123 @@ mod tests {
             .expect("unavailable-media pause exists");
         assert_eq!(paused.status, TransferStatus::Paused);
         assert_ne!(paused.error.as_deref(), Some(malformed));
+        assert_eq!(
+            paused.error.as_deref(),
+            Some("[weline-localnet:destination-preflight:v1]directory-unavailable")
+        );
         assert!(
             !paused
                 .error
                 .as_deref()
-                .is_some_and(|value| value.contains("weline-localnet:destination-preflight"))
+                .unwrap_or_default()
+                .contains("E:\\Private")
+        );
+        assert!(
+            !paused
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("os error")
         );
 
         drop(storage);
         fs::rename(&detached_media, &media).expect("restore destination media");
+        fs::remove_dir_all(fixture).expect("remove storage fixture");
+    }
+
+    #[test]
+    fn startup_unavailable_media_preserves_an_exact_destination_category_marker() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-startup-preserved-destination-marker-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&fixture).expect("create storage fixture");
+        let database = fixture.join("localnet.sqlite3");
+        initialize_database(&database);
+        let media = fixture.join("destination-media");
+        fs::create_dir_all(&media).expect("create destination media");
+        let destination = media.join("report.bin");
+        let transfer_id = "startup-preserved-destination-marker";
+        seed_resumable_incoming(&database, &destination, transfer_id, 0, Some(0));
+        let marker = "[weline-localnet:destination-preflight:v1]permission-denied";
+        {
+            let connection = Connection::open(&database).expect("open fixture database");
+            connection
+                .execute(
+                    "UPDATE transfers
+                     SET status = 'paused', receive_claimed = 0, error = ?2
+                     WHERE transfer_id = ?1",
+                    rusqlite::params![transfer_id, marker],
+                )
+                .expect("persist exact destination marker");
+        }
+        let detached_media = fixture.join("detached-destination-media");
+        fs::rename(&media, &detached_media).expect("detach destination media");
+
+        let storage = Storage::open(&database).expect("reconcile unavailable destination media");
+        let paused = storage
+            .get_transfer(transfer_id)
+            .expect("load preserved destination pause")
+            .expect("preserved destination pause exists");
+        assert_eq!(paused.status, TransferStatus::Paused);
+        assert_eq!(paused.error.as_deref(), Some(marker));
+
+        drop(storage);
+        fs::rename(&detached_media, &media).expect("restore destination media");
+        fs::remove_dir_all(fixture).expect("remove storage fixture");
+    }
+
+    #[test]
+    fn startup_available_media_scrubs_a_legacy_raw_destination_marker() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-startup-scrub-raw-destination-marker-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&fixture).expect("create storage fixture");
+        let database = fixture.join("localnet.sqlite3");
+        initialize_database(&database);
+        let destination = fixture.join("report.bin");
+        let transfer_id = "startup-scrub-raw-destination-marker";
+        seed_resumable_incoming(&database, &destination, transfer_id, 0, Some(0));
+        let legacy_raw = concat!(
+            "[weline-localnet:destination-preflight:v1]",
+            r"unable to inspect E:\Private\客户\Archive: (os error 3)"
+        );
+        {
+            let connection = Connection::open(&database).expect("open fixture database");
+            connection
+                .execute(
+                    "UPDATE transfers
+                     SET status = 'paused', receive_claimed = 0, error = ?2
+                     WHERE transfer_id = ?1",
+                    rusqlite::params![transfer_id, legacy_raw],
+                )
+                .expect("persist legacy raw destination marker");
+        }
+
+        let storage = Storage::open(&database).expect("reconcile available destination media");
+        let paused = storage
+            .get_transfer(transfer_id)
+            .expect("load scrubbed destination pause")
+            .expect("scrubbed destination pause exists");
+        assert_eq!(paused.status, TransferStatus::Paused);
+        assert_ne!(paused.error.as_deref(), Some(legacy_raw));
+        assert!(
+            !paused
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("E:\\Private")
+        );
+        assert!(
+            !paused
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("os error")
+        );
+
+        drop(storage);
         fs::remove_dir_all(fixture).expect("remove storage fixture");
     }
 

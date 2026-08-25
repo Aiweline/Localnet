@@ -14,7 +14,7 @@ use crate::{
         expected_chunk_length, manifest_root,
     },
     transfer_policy::{TRANSFER_CHUNK_BYTES, TransferProtocol},
-    volume_preflight::DESTINATION_PREFLIGHT_PAUSE_MARKER,
+    volume_preflight::{destination_preflight_pause_error, sanitize_destination_preflight_error},
 };
 
 const CHUNK_FRAME_HEADER_BYTES: usize = 40;
@@ -62,7 +62,7 @@ where
         return Ok(None);
     }
 
-    let mut destination_preflight_failed = false;
+    let mut destination_preflight_failure = None;
     let preflight_result = match storage.get_transfer(&candidate.transfer_id) {
         Ok(Some(claimed)) => (|| {
             if claimed.direction != Direction::Incoming
@@ -112,8 +112,12 @@ where
                 ));
             }
             if let Err(error) = preflight(directory, claimed.file_size, claimed.transferred_bytes) {
-                destination_preflight_failed = true;
-                return Err(error);
+                let error = sanitize_destination_preflight_error(directory, error);
+                let AppError::DestinationPreflight(failure) = error else {
+                    unreachable!("destination preflight sanitizer must return a category")
+                };
+                destination_preflight_failure = Some(failure);
+                return Err(AppError::DestinationPreflight(failure));
             }
             Ok(claimed)
         })(),
@@ -126,8 +130,8 @@ where
     match preflight_result {
         Ok(claimed) => Ok(Some(claimed)),
         Err(error) => {
-            let persisted_error = if destination_preflight_failed {
-                format!("{DESTINATION_PREFLIGHT_PAUSE_MARKER}{error}")
+            let persisted_error = if let Some(failure) = destination_preflight_failure {
+                destination_preflight_pause_error(failure)
             } else {
                 error.to_string()
             };
@@ -731,7 +735,8 @@ fn is_recoverable_stream_error(error: &AppError) -> bool {
         | AppError::Permission(_)
         | AppError::NotFriend
         | AppError::IncompatibleProtocol
-        | AppError::IntegrityFailure => false,
+        | AppError::IntegrityFailure
+        | AppError::DestinationPreflight(_) => false,
     }
 }
 
@@ -1214,11 +1219,9 @@ mod tests {
             .expect("reload blocked resume")
             .expect("blocked resume remains");
         assert_eq!(blocked.status, TransferStatus::Paused);
-        assert!(
-            blocked
-                .error
-                .as_deref()
-                .is_some_and(|value| value.contains("可用空间不足"))
+        assert_eq!(
+            blocked.error.as_deref(),
+            Some("[weline-localnet:destination-preflight:v1]insufficient-space")
         );
 
         assert!(
@@ -1267,9 +1270,9 @@ mod tests {
         )
         .expect_err("real destination preflight must block resumed receive");
         let plain_message = error.to_string();
-        assert!(plain_message.contains("不是目录"));
+        assert!(plain_message.contains("不可用"));
         assert!(!plain_message.contains("weline-localnet:destination-preflight"));
-        let marked_message = format!("[weline-localnet:destination-preflight:v1]{plain_message}");
+        let marked_message = "[weline-localnet:destination-preflight:v1]directory-unavailable";
         assert_eq!(
             storage
                 .get_transfer(&paused.transfer_id)
@@ -1277,7 +1280,7 @@ mod tests {
                 .expect("marked resume remains before restart")
                 .error
                 .as_deref(),
-            Some(marked_message.as_str())
+            Some(marked_message)
         );
 
         drop(storage);
@@ -1288,7 +1291,7 @@ mod tests {
             .expect("reload blocked resume after restart")
             .expect("blocked resume remains after restart");
         assert_eq!(blocked.status, TransferStatus::Paused);
-        assert_eq!(blocked.error.as_deref(), Some(marked_message.as_str()));
+        assert_eq!(blocked.error.as_deref(), Some(marked_message));
 
         std::fs::remove_file(&media).expect("remove invalid destination media replacement");
         std::fs::rename(&detached_media, &media).expect("restore actual destination media");

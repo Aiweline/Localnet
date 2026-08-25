@@ -26,7 +26,7 @@ use crate::{
         ChatMessage, Direction, MessageKind, MessageStatus, TransferRecord, TransferStatus,
         now_rfc3339,
     },
-    error::AppError,
+    error::{AppError, DestinationPreflightFailure},
     protocol::{FILE_PROTOCOL, FILE_PROTOCOL_V2, TransferStreamHeader},
     receive_paths::{
         commit_without_overwrite, finalize_reserved_receive,
@@ -35,7 +35,9 @@ use crate::{
     },
     storage::Storage,
     transfer_policy::{TRANSFER_CHUNK_BYTES, TransferProtocol},
-    volume_preflight::DESTINATION_PREFLIGHT_PAUSE_MARKER,
+    volume_preflight::{
+        destination_preflight_failure_from_pause_error, destination_preflight_pause_error,
+    },
 };
 
 const BUFFER_SIZE: usize = 64 * 1024;
@@ -855,7 +857,9 @@ fn resumable_receive_network_error_event(
     if matches!(error, AppError::Io(error) if is_storage_full_error(error)) {
         return NetworkEvent::NetworkError {
             code: TRUSTED_DESTINATION_PAUSE_CODE.to_string(),
-            message: "接收目录可用空间不足，请释放空间后等待自动恢复".to_string(),
+            message: DestinationPreflightFailure::InsufficientSpace
+                .public_message()
+                .to_string(),
         };
     }
     if let Some(message) = trusted_destination_pause_message(updated) {
@@ -875,15 +879,8 @@ fn trusted_destination_pause_message(updated: Option<&TransferRecord>) -> Option
     if transfer.direction != Direction::Incoming || transfer.status != TransferStatus::Paused {
         return None;
     }
-    let message = transfer
-        .error
-        .as_deref()?
-        .strip_prefix(DESTINATION_PREFLIGHT_PAUSE_MARKER)?
-        .trim();
-    if message.is_empty() || message.contains(DESTINATION_PREFLIGHT_PAUSE_MARKER) {
-        return None;
-    }
-    Some(message.to_string())
+    let failure = destination_preflight_failure_from_pause_error(transfer.error.as_deref()?)?;
+    Some(failure.public_message().to_string())
 }
 
 fn public_resumable_receive_error_message(error: &AppError) -> &'static str {
@@ -898,6 +895,7 @@ fn public_resumable_receive_error_message(error: &AppError) -> &'static str {
         AppError::Identity(_) => "本机身份校验失败，请重新启动应用后重试",
         AppError::Permission(_) | AppError::NotFriend => "文件传输未获授权，连接已拒绝",
         AppError::IncompatibleProtocol => "双方软件版本不兼容，请升级后重试",
+        AppError::DestinationPreflight(failure) => failure.public_message(),
     }
 }
 
@@ -933,7 +931,9 @@ where
         if is_recoverable_receive_error(error) {
             let persisted_error = match error {
                 AppError::Io(error) if is_storage_full_error(error) => {
-                    format!("{DESTINATION_PREFLIGHT_PAUSE_MARKER}{error}")
+                    destination_preflight_pause_error(
+                        DestinationPreflightFailure::InsufficientSpace,
+                    )
                 }
                 _ => error.to_string(),
             };
@@ -1337,11 +1337,11 @@ mod tests {
     use tokio::io::{AsyncRead as TokioAsyncRead, ReadBuf};
 
     use super::{
-        DESTINATION_PREFLIGHT_PAUSE_MARKER, NetworkEvent, ResumableProgressGate,
-        ResumableStreamOpener, authorize_resumable_incoming, claim_legacy_incoming,
-        claim_resumable_outgoing, commit_and_publish_resumable_ack, is_storage_full_error,
-        persist_claimed_outgoing_error, resumable_receive_network_error_event,
-        run_resumable_receive_body_with, send_resumable_transfer,
+        NetworkEvent, ResumableProgressGate, ResumableStreamOpener, authorize_resumable_incoming,
+        claim_legacy_incoming, claim_resumable_outgoing, commit_and_publish_resumable_ack,
+        is_storage_full_error, persist_claimed_outgoing_error,
+        resumable_receive_network_error_event, run_resumable_receive_body_with,
+        send_resumable_transfer,
     };
     use crate::network::resumable_transfer::read_chunk_frame_with_idle_timeout;
     use crate::{
@@ -1349,13 +1349,13 @@ mod tests {
             Direction, Friend, FriendRequest, FriendRequestStatus, Platform, TransferKind,
             TransferRecord, TransferStatus,
         },
-        error::AppError,
+        error::{AppError, DestinationPreflightFailure},
         protocol::TransferStreamHeader,
         receive_paths::{reservation_is_owned, reserve_receive_path, resumable_partial_is_owned},
         storage::Storage,
         transfer_manifest::{TransferChunk, build_manifest, manifest_root},
         transfer_policy::{TRANSFER_CHUNK_BYTES, TransferProtocol},
-        volume_preflight::{VolumeSnapshot, validate_volume},
+        volume_preflight::{DESTINATION_PREFLIGHT_PAUSE_MARKER, VolumeSnapshot, validate_volume},
     };
 
     const MIB: u64 = 1024 * 1024;
@@ -2036,6 +2036,114 @@ mod tests {
         );
         drop(storage);
         fs::remove_dir_all(directory).expect("remove stale receive fixture");
+    }
+
+    #[tokio::test]
+    async fn production_resume_preflight_classifies_private_os_diagnostics_before_persistence_and_events()
+     {
+        let cases = [
+            (
+                "missing-media",
+                AppError::Storage(
+                    r"unable to inspect E:\Private\客户\Archive: (os error 3)".to_string(),
+                ),
+                "directory-unavailable",
+            ),
+            (
+                "permission-denied",
+                AppError::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    r"access denied for E:\Private\客户\Archive (os error 5)",
+                )),
+                "permission-denied",
+            ),
+        ];
+
+        for (name, injected, expected_category) in cases {
+            let (directory, storage, paused) =
+                paused_receive_with_real_partial(&format!("classified-{name}"));
+            let raw_diagnostic = injected.to_string();
+            let body_started = Arc::new(AtomicBool::new(false));
+            let body_flag = body_started.clone();
+            let error = run_resumable_receive_body_with(
+                &storage,
+                &paused,
+                paused.transferred_bytes,
+                &move |_, _, _| {
+                    Err(match &injected {
+                        AppError::Storage(message) => AppError::Storage(message.clone()),
+                        AppError::Io(error) => {
+                            AppError::Io(std::io::Error::new(error.kind(), error.to_string()))
+                        }
+                        _ => unreachable!("fixture contains only storage and IO failures"),
+                    })
+                },
+                move |_, _| {
+                    let started = body_flag.clone();
+                    Box::pin(async move {
+                        started.store(true, Ordering::SeqCst);
+                        Ok(())
+                    })
+                },
+            )
+            .await
+            .expect_err("destination preflight failure must block the receive body");
+
+            assert!(!body_started.load(Ordering::SeqCst));
+            assert!(!error.to_string().contains("E:\\Private"));
+            assert!(!error.to_string().contains("os error"));
+            let blocked = storage
+                .get_transfer(&paused.transfer_id)
+                .expect("reload classified preflight pause")
+                .expect("classified preflight pause exists");
+            assert_eq!(
+                blocked.error.as_deref(),
+                Some(format!("{DESTINATION_PREFLIGHT_PAUSE_MARKER}{expected_category}").as_str())
+            );
+            assert!(
+                !blocked
+                    .error
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("E:\\Private")
+            );
+            assert!(
+                !blocked
+                    .error
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("os error")
+            );
+
+            let (code, message) = network_error_parts(resumable_receive_network_error_event(
+                &error,
+                Some(&blocked),
+            ));
+            assert_eq!(code, "transfer.resume_destination_unavailable");
+            assert!(!message.contains("E:\\Private"));
+            assert!(!message.contains("os error"));
+            assert!(!message.contains(&raw_diagnostic));
+            assert!(
+                message.contains(if expected_category == "permission-denied" {
+                    "权限"
+                } else {
+                    "不可用"
+                })
+            );
+
+            assert!(
+                storage
+                    .try_cancel_unclaimed_incoming_transfer(
+                        &paused.transfer_id,
+                        &paused.peer_id,
+                        paused.transfer_protocol,
+                        "test cleanup",
+                    )
+                    .expect("clean classified preflight fixture")
+            );
+            drop(storage);
+            fs::remove_dir_all(directory).expect("remove classified preflight fixture");
+        }
     }
 
     #[tokio::test]
@@ -2775,9 +2883,9 @@ mod tests {
         assert!(storage_full_message.contains("空间不足"));
         assert!(!storage_full_message.contains("os error"));
 
-        let trusted_message = "接收目录可用空间不足，请释放空间后重试";
+        let trusted_message = DestinationPreflightFailure::InsufficientSpace.public_message();
         paused.error = Some(format!(
-            "{DESTINATION_PREFLIGHT_PAUSE_MARKER}{trusted_message}"
+            "{DESTINATION_PREFLIGHT_PAUSE_MARKER}insufficient-space"
         ));
         let marked_preflight = resumable_receive_network_error_event(
             &AppError::InvalidInput("raw preflight implementation detail".to_string()),

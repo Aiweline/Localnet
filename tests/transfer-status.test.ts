@@ -72,17 +72,16 @@ test("shows the resumable network-waiting label with retained progress and Cance
   });
 });
 
-test("shows only a backend-marked incoming destination error while retaining progress and Cancel", () => {
-  const message = "目标磁盘可用空间不足，请释放空间后 保持应用打开";
+test("shows only an allowlisted incoming destination category while retaining progress and Cancel", () => {
   const presentation = present({
     direction: "incoming",
     fileSize: 1_000,
     transferredBytes: 420,
     status: "paused",
-    error: `${DESTINATION_PREFLIGHT_MARKER}  目标磁盘可用空间不足，请释放空间后\n保持应用打开  `,
+    error: `${DESTINATION_PREFLIGHT_MARKER}insufficient-space`,
   });
 
-  assert.equal(presentation.label, message);
+  assert.equal(presentation.label, "接收目录可用空间不足，请释放空间后等待自动恢复");
   assert.equal(presentation.tone, "paused");
   assert.equal(presentation.percent, 42);
   assert.equal(presentation.showProgress, true);
@@ -186,17 +185,46 @@ test("keeps every untagged legacy destination-looking paused error on the safe d
   }
 });
 
-test("shows legitimate backend-marked destination preflight messages without the marker", () => {
-  for (const message of actionableDestinationErrors) {
+test("maps exact backend destination categories to fixed safe labels", () => {
+  const categories = new Map([
+    ["directory-unavailable", "接收目录当前不可用，请恢复磁盘或重新选择目录后重试"],
+    ["permission-denied", "没有权限写入接收目录，请重新选择可写入的目录"],
+    ["insufficient-space", "接收目录可用空间不足，请释放空间后等待自动恢复"],
+    ["filesystem-limit", "接收目录的磁盘格式不支持这么大的文件，请选择支持大文件的目录"],
+    ["unsupported-filesystem", "无法安全检查接收目录所在磁盘，请选择本地磁盘目录后重试"],
+    ["file-too-large", "单个文件不能超过 100 GiB"],
+  ]);
+  for (const [category, message] of categories) {
     const presentation = present({
       direction: "incoming",
       fileSize: 1_000,
       transferredBytes: 420,
       status: "paused",
-      error: `${DESTINATION_PREFLIGHT_MARKER}${message}`,
+      error: `${DESTINATION_PREFLIGHT_MARKER}${category}`,
     });
 
     assert.equal(presentation.label, message, message);
+  }
+});
+
+test("never presents raw local paths or OS diagnostics carried by a forged marker", () => {
+  for (const payload of [
+    "unable to inspect E:\\Private\\客户\\Archive: (os error 3)",
+    "permission denied for E:\\Private\\客户\\Archive (os error 5)",
+    "directory-unavailable ",
+    " DIRECTORY-UNAVAILABLE",
+  ]) {
+    const presentation = present({
+      direction: "incoming",
+      fileSize: 1_000,
+      transferredBytes: 420,
+      status: "paused",
+      error: `${DESTINATION_PREFLIGHT_MARKER}${payload}`,
+    });
+
+    assert.equal(presentation.label, DEFAULT_PAUSED_LABEL, payload);
+    assert.ok(!presentation.label.includes("E:\\Private"));
+    assert.ok(!presentation.label.includes("os error"));
   }
 });
 
