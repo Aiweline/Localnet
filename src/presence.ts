@@ -53,6 +53,29 @@ export function mergePresenceSnapshot<
   };
 }
 
+export function mergeResolvedFriendSnapshot<
+  TFriend extends { peerId: string },
+  TRequest extends { requestId: string },
+  TSnapshot extends { friends: TFriend[]; friendRequests: TRequest[] },
+>(
+  current: TSnapshot,
+  request: TRequest,
+  friend: TFriend,
+): TSnapshot {
+  const friends = current.friends.some((item) => item.peerId === friend.peerId)
+    ? current.friends.map((item) => item.peerId === friend.peerId ? friend : item)
+    : [friend, ...current.friends];
+  const friendRequests = current.friendRequests.some((item) => item.requestId === request.requestId)
+    ? current.friendRequests.map((item) => item.requestId === request.requestId ? request : item)
+    : [request, ...current.friendRequests];
+
+  return {
+    ...current,
+    friends,
+    friendRequests,
+  };
+}
+
 export function startSnapshotReconciliation(
   refresh: () => void | Promise<void>,
   intervalMs = DEFAULT_RECONCILIATION_INTERVAL_MS,
