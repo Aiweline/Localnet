@@ -2623,10 +2623,10 @@ impl Storage {
     fn list_friends(&self) -> Result<Vec<Friend>, AppError> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT f.peer_id, f.nickname, f.platform, COALESCE(p.online, 0),
+            "SELECT f.peer_id, COALESCE(p.nickname, f.nickname), f.platform, COALESCE(p.online, 0),
                     f.added_at, COALESCE(p.last_seen, f.last_seen)
              FROM friends f LEFT JOIN peers p ON p.peer_id = f.peer_id
-             ORDER BY COALESCE(p.online, 0) DESC, f.nickname COLLATE NOCASE",
+             ORDER BY COALESCE(p.online, 0) DESC, COALESCE(p.nickname, f.nickname) COLLATE NOCASE",
         )?;
         let rows = statement.query_map([], |row| {
             Ok((
@@ -9644,6 +9644,60 @@ mod tests {
 
         drop(storage);
         fs::remove_dir_all(fixture).expect("remove remembered friend fixture");
+    }
+
+    #[test]
+    fn known_friend_uses_latest_peer_nickname_after_hello() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-friend-nickname-sync-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&fixture).expect("create friend nickname fixture");
+        let database = fixture.join("localnet.sqlite3");
+        let storage = Storage::open(&database).expect("open friend nickname storage");
+        let peer_id = "renamed-friend-peer";
+        let now = "2026-08-25T00:00:00.000Z";
+
+        storage
+            .upsert_peer(&PeerSummary {
+                peer_id: peer_id.to_string(),
+                nickname: "Old Name".to_string(),
+                platform: Platform::Macos,
+                online: true,
+                protocol_version: 2,
+                capabilities: Vec::new(),
+                last_seen: now.to_string(),
+            })
+            .expect("persist initial hello");
+        storage
+            .connection()
+            .expect("open friend nickname fixture connection")
+            .execute(
+                "INSERT INTO friends (peer_id, nickname, platform, added_at, last_seen)
+                 VALUES (?1, ?2, ?3, ?4, ?4)",
+                rusqlite::params![peer_id, "Old Name", Platform::Macos.as_str(), now],
+            )
+            .expect("insert accepted friend");
+
+        storage
+            .upsert_peer(&PeerSummary {
+                peer_id: peer_id.to_string(),
+                nickname: "New Name".to_string(),
+                platform: Platform::Macos,
+                online: true,
+                protocol_version: 2,
+                capabilities: Vec::new(),
+                last_seen: "2026-08-25T00:01:00.000Z".to_string(),
+            })
+            .expect("persist renamed hello");
+
+        let friends = storage.list_friends().expect("load friends after rename");
+        assert_eq!(friends.len(), 1);
+        assert_eq!(friends[0].peer_id, peer_id);
+        assert_eq!(friends[0].nickname, "New Name");
+
+        drop(storage);
+        fs::remove_dir_all(fixture).expect("remove friend nickname fixture");
     }
 
     #[test]
