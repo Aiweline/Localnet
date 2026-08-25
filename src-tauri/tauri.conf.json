@@ -44,6 +44,7 @@
         "installMode": "currentUser",
         "installerIcon": "icons/icon.ico",
         "installerHooks": "windows/installer-hooks.nsh",
+        "displayLanguageSelector": true,
         "languages": [
           "English",
           "SimpChinese",

@@ -2,6 +2,7 @@ import { StrictMode, useCallback, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getVersion } from "@tauri-apps/api/app";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
@@ -65,6 +66,7 @@ function App() {
   const [discoverySlow, setDiscoverySlow] = useState(false);
   const [discoveryRefreshing, setDiscoveryRefreshing] = useState(false);
   const [announcement, setAnnouncement] = useState("");
+  const [appVersion, setAppVersion] = useState("");
   const [notificationPermission, setNotificationPermission] = useState<NotificationPermissionState>("default");
   const refreshTimer = useRef<number | null>(null);
   const hasOnlinePeer = snapshot.peers.some((peer) => peer.online);
@@ -138,6 +140,14 @@ function App() {
   }, [handleNetworkEvent, refresh]);
 
   useEffect(() => startSnapshotReconciliation(reconcilePresence), [reconcilePresence]);
+
+  useEffect(() => {
+    let active = true;
+    void getVersion()
+      .then((version) => { if (active) setAppVersion(version); })
+      .catch(() => { if (active) setAppVersion(""); });
+    return () => { active = false; };
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -277,7 +287,7 @@ function App() {
       <aside className="sidebar">
         <header className="brand-row">
           <span className="brand-mark"><MessageCircleMore size={22} /></span>
-          <span><strong>Weline Localnet</strong><small>局域网私密传输</small></span>
+          <span><strong>Weline Localnet {appVersion && <span className="version-badge">v{appVersion}</span>}</strong><small>局域网私密传输</small></span>
           <button className="icon-button" title="设置" onClick={() => setEditingProfile(true)}><Settings2 size={18} /></button>
         </header>
         <button className="profile-card" onClick={() => setEditingProfile(true)}>

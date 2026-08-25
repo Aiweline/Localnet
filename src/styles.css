@@ -36,7 +36,8 @@ button:disabled { cursor: not-allowed; opacity: 0.5; }
 .brand-mark, .boot-mark, .welcome-logo { width: 42px; height: 42px; flex: 0 0 auto; display: grid; place-items: center; color: #fff; border-radius: 14px; background: linear-gradient(145deg, #7769fa, #4a39cf); box-shadow: 0 10px 22px rgba(79, 61, 211, 0.25); }
 .brand-mark.large { width: 58px; height: 58px; border-radius: 19px; }
 .brand-row > span:nth-child(2) { min-width: 0; flex: 1; display: grid; }
-.brand-row strong { font-size: 17px; letter-spacing: -0.02em; }
+.brand-row strong { min-width: 0; display: flex; align-items: center; gap: 6px; font-size: 17px; letter-spacing: -0.02em; white-space: nowrap; }
+.version-badge { flex: 0 0 auto; padding: 2px 5px; border: 1px solid var(--border); border-radius: 99px; color: var(--subtle); background: var(--surface-soft); font-size: 9px; font-variant-numeric: tabular-nums; font-weight: 700; letter-spacing: 0; }
 .brand-row small, .profile-card small, .person-row small, .friend-row small, .request-card small { color: var(--muted); font-size: 11px; }
 .icon-button { width: 34px; height: 34px; display: grid; place-items: center; border: 0; border-radius: 10px; color: var(--muted); background: transparent; cursor: pointer; }
 .icon-button:hover { color: var(--primary); background: var(--primary-soft); }
