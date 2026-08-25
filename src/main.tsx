@@ -12,7 +12,7 @@ import {
   Monitor, Paperclip, RefreshCw, Search, Send, Settings2, ShieldCheck, UserPlus,
   UsersRound, Wifi, WifiOff, X,
 } from "lucide-react";
-import { mergePresenceSnapshot, startSnapshotReconciliation } from "./presence";
+import { mergePresenceSnapshot, nearbyPeerEntries, startSnapshotReconciliation } from "./presence";
 import { transferStatusPresentation, type TransferStatusInput } from "./transfer-status";
 import "./styles.css";
 
@@ -197,14 +197,12 @@ function App() {
 
   const profile = snapshot.localProfile;
   const selectedFriend = snapshot.friends.find((friend) => friend.peerId === selectedPeerId) ?? null;
-  const friendIds = new Set(snapshot.friends.map((friend) => friend.peerId));
-  const pendingOutgoingPeerIds = new Set(snapshot.friendRequests.filter((request) => request.direction === "outgoing" && request.status === "pending").map((request) => request.peerId));
-  const nearbyPeers = snapshot.peers.filter((peer) => peer.online && !friendIds.has(peer.peerId) && peer.peerId !== profile.peerId);
+  const nearbyPeers = nearbyPeerEntries(snapshot.peers, snapshot.friends, snapshot.friendRequests, profile.peerId);
   const incomingRequests = snapshot.friendRequests.filter((request) => request.direction === "incoming" && request.status === "pending");
   const primaryIncomingRequest = incomingRequests[0] ?? null;
   const normalizedSearch = searchText.trim().toLocaleLowerCase();
   const visibleFriends = snapshot.friends.filter((friend) => friend.nickname.toLocaleLowerCase().includes(normalizedSearch));
-  const visibleNearby = nearbyPeers.filter((peer) => peer.nickname.toLocaleLowerCase().includes(normalizedSearch));
+  const visibleNearby = nearbyPeers.filter(({ peer }) => peer.nickname.toLocaleLowerCase().includes(normalizedSearch));
 
   const resolveFriend = async (requestId: string, accepted: boolean) => {
     const result = await act(`request:${requestId}`, () => invoke("resolve_friend_request", { requestId, accepted }), accepted ? "已添加好友，可以开始聊天了" : "已拒绝好友申请");
@@ -278,12 +276,12 @@ function App() {
             </SidebarSection>
           )}
           <SidebarSection title="附近用户" count={visibleNearby.length} icon={<Wifi size={14} />}>
-            {visibleNearby.map((peer) => (
+            {visibleNearby.map(({ peer, relationship }) => (
               <div className="person-row" key={peer.peerId}>
                 <Avatar name={peer.nickname} online />
                 <span><strong>{peer.nickname}</strong><small>{platformLabel(peer.platform)} · 在线</small></span>
-                <button className="add-button" disabled={busyKey === `add:${peer.peerId}` || peer.protocolVersion !== 1 || pendingOutgoingPeerIds.has(peer.peerId)} title={pendingOutgoingPeerIds.has(peer.peerId) ? "好友申请正在等待对方处理" : peer.protocolVersion === 1 ? "添加好友" : "版本不兼容"} onClick={() => void act(`add:${peer.peerId}`, () => invoke("send_friend_request", { peerId: peer.peerId }))}>
-                  {busyKey === `add:${peer.peerId}` ? <LoaderCircle size={15} className="spin" /> : pendingOutgoingPeerIds.has(peer.peerId) ? <Check size={15} /> : <UserPlus size={15} />}
+                <button className="add-button" disabled={busyKey === `add:${peer.peerId}` || relationship === "pending"} title={relationship === "pending" ? "好友申请正在等待处理" : "添加好友"} onClick={() => void act(`add:${peer.peerId}`, () => invoke("send_friend_request", { peerId: peer.peerId }))}>
+                  {busyKey === `add:${peer.peerId}` ? <LoaderCircle size={15} className="spin" /> : relationship === "pending" ? <Check size={15} /> : <UserPlus size={15} />}
                 </button>
               </div>
             ))}

@@ -19,6 +19,8 @@ const repository = fileURLToPath(new URL("..", import.meta.url));
 const workflowPath = ".github/workflows/release.yml";
 const decisionScript = "scripts/release-decision.sh";
 const policyScript = "scripts/release-policy.mjs";
+// This is a stable fake-release fixture. Current package-version synchronization is
+// verified separately by scripts/release-version.mjs --check.
 const releaseVersion = "0.2.0";
 const releaseTag = `v${releaseVersion}`;
 const auditedRuleset = {

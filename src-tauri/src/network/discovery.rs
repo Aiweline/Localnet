@@ -25,6 +25,7 @@ const DISCOVERY_PORT: u16 = 43_821;
 const MAX_BEACON_BYTES: usize = 512;
 const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(3);
 const PROBE_INTERVAL: Duration = Duration::from_secs(12);
+const REMEMBERED_PROBE_INTERVAL: Duration = Duration::from_secs(2);
 const PROBE_RESPONSE_WINDOW: Duration = Duration::from_millis(900);
 const PROBE_RESPONSE_RATE_LIMIT: Duration = Duration::from_millis(500);
 pub(super) const BEACON_LEASE: Duration = Duration::from_secs(12);
@@ -39,7 +40,7 @@ pub(super) enum DiscoveryEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct LanInterface {
+pub(super) struct LanInterface {
     name: String,
     ip: Ipv4Addr,
     broadcast: Ipv4Addr,
@@ -58,6 +59,7 @@ impl DiscoveryService {
     pub(super) fn spawn(
         peer_id: PeerId,
         listen_port: watch::Receiver<Option<u16>>,
+        remembered_targets: watch::Receiver<Vec<Ipv4Addr>>,
     ) -> mpsc::Receiver<DiscoveryEvent> {
         let (event_sender, event_receiver) = mpsc::channel(128);
 
@@ -67,7 +69,17 @@ impl DiscoveryService {
             event_sender.clone(),
         ));
         tauri::async_runtime::spawn(announce_beacons(peer_id, listen_port.clone()));
-        tauri::async_runtime::spawn(probe_peers(peer_id, listen_port, event_sender.clone()));
+        tauri::async_runtime::spawn(probe_peers(
+            peer_id,
+            listen_port.clone(),
+            event_sender.clone(),
+        ));
+        tauri::async_runtime::spawn(probe_remembered_peers(
+            peer_id,
+            listen_port,
+            remembered_targets,
+            event_sender.clone(),
+        ));
 
         #[cfg(target_os = "windows")]
         mdns_compat::spawn(peer_id, event_sender.clone());
@@ -221,6 +233,50 @@ async fn probe_peers(
     }
 }
 
+async fn probe_remembered_peers(
+    peer_id: PeerId,
+    listen_port: watch::Receiver<Option<u16>>,
+    remembered_targets: watch::Receiver<Vec<Ipv4Addr>>,
+    sender: mpsc::Sender<DiscoveryEvent>,
+) {
+    let mut interval = time::interval(REMEMBERED_PROBE_INTERVAL);
+    interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+
+    loop {
+        interval.tick().await;
+        let Some(port) = *listen_port.borrow() else {
+            continue;
+        };
+        let remembered_targets = remembered_targets
+            .borrow()
+            .iter()
+            .copied()
+            .filter(|ip| is_private_lan_ip(*ip))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .take(256)
+            .collect::<Vec<_>>();
+        if remembered_targets.is_empty() {
+            continue;
+        }
+        let interfaces = match eligible_interfaces() {
+            Ok(interfaces) => interfaces,
+            Err(error) => {
+                tracing::debug!(%error, "unable to enumerate LAN interfaces for remembered peers");
+                continue;
+            }
+        };
+        let payload = encode_probe(peer_id, port);
+        let probes = interfaces.iter().filter_map(|interface| {
+            let targets = remembered_probe_targets(interface, &remembered_targets);
+            (!targets.is_empty()).then(|| {
+                probe_targets_on_interface(interface, &payload, peer_id, sender.clone(), targets)
+            })
+        });
+        futures::future::join_all(probes).await;
+    }
+}
+
 fn bind_receiver() -> io::Result<UdpSocket> {
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(SocketProtocol::UDP))?;
     socket.set_reuse_address(true)?;
@@ -263,6 +319,23 @@ async fn probe_on_interface(
     local_peer: PeerId,
     sender: mpsc::Sender<DiscoveryEvent>,
 ) {
+    probe_targets_on_interface(
+        interface,
+        payload,
+        local_peer,
+        sender,
+        unicast_probe_targets(interface),
+    )
+    .await;
+}
+
+async fn probe_targets_on_interface(
+    interface: &LanInterface,
+    payload: &[u8],
+    local_peer: PeerId,
+    sender: mpsc::Sender<DiscoveryEvent>,
+    targets: Vec<Ipv4Addr>,
+) {
     let socket = match UdpSocket::bind(SocketAddrV4::new(interface.ip, 0)).await {
         Ok(socket) => socket,
         Err(error) => {
@@ -275,7 +348,6 @@ async fn probe_on_interface(
             return;
         }
     };
-    let targets = unicast_probe_targets(interface);
     tracing::trace!(
         interface = %interface.name,
         address = %interface.ip,
@@ -324,7 +396,23 @@ async fn probe_on_interface(
     }
 }
 
-fn eligible_interfaces() -> io::Result<Vec<LanInterface>> {
+fn remembered_probe_targets(interface: &LanInterface, targets: &[Ipv4Addr]) -> Vec<Ipv4Addr> {
+    let mut targets = targets
+        .iter()
+        .copied()
+        .filter(|target| {
+            *target != interface.ip
+                && is_private_lan_ip(*target)
+                && interface_contains(interface, *target)
+        })
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    targets.sort_unstable();
+    targets
+}
+
+pub(super) fn eligible_interfaces() -> io::Result<Vec<LanInterface>> {
     let mut interfaces = HashSet::new();
     for interface in get_if_addrs()? {
         if !interface.is_oper_up()
@@ -354,8 +442,84 @@ fn eligible_interfaces() -> io::Result<Vec<LanInterface>> {
         });
     }
     let mut interfaces: Vec<_> = interfaces.into_iter().collect();
-    interfaces.sort_by_key(|interface| (interface.ip, interface.name.clone()));
+    interfaces.sort_by_key(|interface| {
+        (
+            interface_priority(&interface.name),
+            interface.ip,
+            interface.name.clone(),
+        )
+    });
     Ok(interfaces)
+}
+
+pub(super) fn ranked_dial_addresses(
+    addresses: impl IntoIterator<Item = Multiaddr>,
+    preferred_ip: Option<Ipv4Addr>,
+    interfaces: &[LanInterface],
+) -> Vec<Multiaddr> {
+    let mut addresses = addresses
+        .into_iter()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    addresses.sort_by_key(|address| {
+        let ip = address.iter().find_map(|protocol| match protocol {
+            Protocol::Ip4(ip) => Some(ip),
+            _ => None,
+        });
+        let remembered = match (ip, preferred_ip) {
+            (Some(ip), Some(preferred)) if ip == preferred => 0,
+            (Some(_), _) => 1,
+            (None, _) => 2,
+        };
+        let interface = ip
+            .and_then(|ip| {
+                interfaces
+                    .iter()
+                    .filter(|interface| interface_contains(interface, ip))
+                    .map(|interface| interface_priority(&interface.name))
+                    .min()
+            })
+            .unwrap_or(u8::MAX);
+        (remembered, interface, ip, address.to_string())
+    });
+    addresses
+}
+
+fn interface_contains(interface: &LanInterface, target: Ipv4Addr) -> bool {
+    if !(1..=32).contains(&interface.prefixlen) {
+        return false;
+    }
+    let mask = u32::MAX << (32 - u32::from(interface.prefixlen));
+    u32::from(interface.ip) & mask == u32::from(target) & mask
+}
+
+fn interface_priority(name: &str) -> u8 {
+    let normalized = name.to_ascii_lowercase();
+    const VIRTUAL_MARKERS: [&str; 14] = [
+        "utun",
+        "tun",
+        "tap",
+        "vmnet",
+        "vmware",
+        "vethernet",
+        "hyper-v",
+        "wsl",
+        "docker",
+        "tailscale",
+        "zerotier",
+        "vpn",
+        "bridge",
+        "virtual",
+    ];
+    if VIRTUAL_MARKERS
+        .iter()
+        .any(|marker| normalized.contains(marker))
+    {
+        1
+    } else {
+        0
+    }
 }
 
 fn unicast_probe_targets(interface: &LanInterface) -> Vec<Ipv4Addr> {
@@ -444,4 +608,123 @@ fn startup_jitter(peer_id: PeerId) -> Duration {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| u64::from(duration.subsec_millis()));
     Duration::from_millis(100 + (peer_entropy ^ clock_entropy) % 700)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dial_address(ip: Ipv4Addr, port: u16, peer_id: PeerId) -> Multiaddr {
+        Multiaddr::empty()
+            .with(Protocol::Ip4(ip))
+            .with(Protocol::Tcp(port))
+            .with(Protocol::P2p(peer_id))
+    }
+
+    #[test]
+    fn discovery_candidate_prefers_remembered_physical_path_and_deduplicates() {
+        let peer_id = PeerId::random();
+        let physical_ip = Ipv4Addr::new(192, 168, 31, 22);
+        let virtual_ip = Ipv4Addr::new(172, 29, 96, 2);
+        let physical = dial_address(physical_ip, 45_001, peer_id);
+        let virtual_path = dial_address(virtual_ip, 45_002, peer_id);
+        let interfaces = vec![
+            LanInterface {
+                name: "vEthernet (WSL)".to_string(),
+                ip: Ipv4Addr::new(172, 29, 96, 1),
+                broadcast: Ipv4Addr::new(172, 29, 111, 255),
+                prefixlen: 20,
+            },
+            LanInterface {
+                name: "Ethernet".to_string(),
+                ip: Ipv4Addr::new(192, 168, 31, 213),
+                broadcast: Ipv4Addr::new(192, 168, 31, 255),
+                prefixlen: 24,
+            },
+        ];
+
+        let ranked = ranked_dial_addresses(
+            vec![virtual_path.clone(), physical.clone(), physical.clone()],
+            Some(physical_ip),
+            &interfaces,
+        );
+
+        assert_eq!(ranked, vec![physical, virtual_path]);
+    }
+
+    #[test]
+    fn discovery_candidate_prefers_physical_interface_without_history() {
+        let peer_id = PeerId::random();
+        let physical = dial_address(Ipv4Addr::new(192, 168, 31, 22), 45_001, peer_id);
+        let virtual_path = dial_address(Ipv4Addr::new(172, 29, 96, 2), 45_002, peer_id);
+        let interfaces = vec![
+            LanInterface {
+                name: "vEthernet (Hyper-V)".to_string(),
+                ip: Ipv4Addr::new(172, 29, 96, 1),
+                broadcast: Ipv4Addr::new(172, 29, 111, 255),
+                prefixlen: 20,
+            },
+            LanInterface {
+                name: "Wi-Fi".to_string(),
+                ip: Ipv4Addr::new(192, 168, 31, 213),
+                broadcast: Ipv4Addr::new(192, 168, 31, 255),
+                prefixlen: 24,
+            },
+        ];
+
+        assert_eq!(
+            ranked_dial_addresses(
+                vec![virtual_path.clone(), physical.clone()],
+                None,
+                &interfaces,
+            ),
+            vec![physical, virtual_path],
+        );
+    }
+
+    #[test]
+    fn discovery_candidate_places_non_ipv4_after_physical_ipv4_without_history() {
+        let peer_id = PeerId::random();
+        let physical = dial_address(Ipv4Addr::new(192, 168, 31, 22), 45_001, peer_id);
+        let ipv6 = Multiaddr::empty()
+            .with(Protocol::Ip6(std::net::Ipv6Addr::LOCALHOST))
+            .with(Protocol::Tcp(45_002))
+            .with(Protocol::P2p(peer_id));
+        let interfaces = vec![LanInterface {
+            name: "Wi-Fi".to_string(),
+            ip: Ipv4Addr::new(192, 168, 31, 213),
+            broadcast: Ipv4Addr::new(192, 168, 31, 255),
+            prefixlen: 24,
+        }];
+
+        assert_eq!(
+            ranked_dial_addresses(vec![ipv6.clone(), physical.clone()], None, &interfaces),
+            vec![physical, ipv6],
+        );
+    }
+
+    #[test]
+    fn remembered_friend_probe_reaches_the_real_subnet_without_expanding_the_generic_scan() {
+        let interface = LanInterface {
+            name: "Ethernet".to_string(),
+            ip: Ipv4Addr::new(10, 20, 30, 40),
+            broadcast: Ipv4Addr::new(10, 20, 255, 255),
+            prefixlen: 16,
+        };
+        let remembered_outside_local_24 = Ipv4Addr::new(10, 20, 99, 8);
+
+        assert_eq!(
+            remembered_probe_targets(
+                &interface,
+                &[
+                    remembered_outside_local_24,
+                    remembered_outside_local_24,
+                    Ipv4Addr::new(10, 21, 1, 9),
+                    interface.ip,
+                ],
+            ),
+            vec![remembered_outside_local_24]
+        );
+        assert!(!unicast_probe_targets(&interface).contains(&remembered_outside_local_24));
+    }
 }

@@ -1,5 +1,45 @@
 const DEFAULT_RECONCILIATION_INTERVAL_MS = 3_000;
 
+export type NearbyRelationship = "available" | "pending";
+
+export function nearbyPeerEntries<
+  TPeer extends { peerId: string; online: boolean },
+  TFriend extends { peerId: string },
+  TRequest extends { peerId: string; status: string },
+>(
+  peers: TPeer[],
+  friends: TFriend[],
+  requests: TRequest[],
+  localPeerId: string,
+): Array<{ peer: TPeer; relationship: NearbyRelationship }> {
+  const friendIds = new Set(friends.map((friend) => friend.peerId));
+  const acceptedPeerIds = new Set(
+    requests
+      .filter((request) => request.status === "accepted")
+      .map((request) => request.peerId),
+  );
+  const pendingPeerIds = new Set(
+    requests
+      .filter((request) => request.status === "pending")
+      .map((request) => request.peerId),
+  );
+
+  return peers.flatMap((peer) => {
+    if (
+      !peer.online
+      || peer.peerId === localPeerId
+      || friendIds.has(peer.peerId)
+      || acceptedPeerIds.has(peer.peerId)
+    ) {
+      return [];
+    }
+    return [{
+      peer,
+      relationship: pendingPeerIds.has(peer.peerId) ? "pending" : "available",
+    }];
+  });
+}
+
 export function mergePresenceSnapshot<
   TSnapshot extends { peers: unknown[]; friends: unknown[] },
 >(

@@ -188,7 +188,7 @@ pub fn resolve_friend_request(
             "这条好友申请已经处理，请刷新后查看".to_string(),
         ));
     }
-    let peer = require_online_peer(&request.peer_id, &state)?;
+    let peer = state.storage.get_peer(&request.peer_id)?;
     let status = if accepted {
         FriendRequestStatus::Accepted
     } else {
@@ -198,7 +198,9 @@ pub fn resolve_friend_request(
     let friend = accepted.then(|| Friend {
         peer_id: request.peer_id.clone(),
         nickname: request.nickname.clone(),
-        platform: peer.platform,
+        platform: peer
+            .as_ref()
+            .map_or(Platform::Unknown, |peer| peer.platform),
         online: true,
         added_at: now.clone(),
         last_seen: now.clone(),
@@ -206,13 +208,19 @@ pub fn resolve_friend_request(
     state
         .storage
         .resolve_friend_request(&request_id, status, friend.as_ref(), &now)?;
-    state
-        .network()?
-        .try_send(NetworkCommand::ResolveFriendRequest {
-            peer_id: request.peer_id.clone(),
-            request_id,
-            accepted,
-        })?;
+    let network_command = NetworkCommand::ResolveFriendRequest {
+        peer_id: request.peer_id.clone(),
+    };
+    match state.network() {
+        Ok(network) => {
+            if let Err(error) = network.try_send(network_command) {
+                tracing::warn!(%error, "durable friend decision will retry after reconnect");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "network runtime unavailable; durable friend decision retained");
+        }
+    }
     Ok(FriendRequest {
         status,
         updated_at: now,

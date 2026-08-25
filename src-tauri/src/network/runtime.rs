@@ -22,7 +22,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use super::{
     behaviour::{LocalnetBehaviour, LocalnetBehaviourEvent},
-    discovery::{DiscoveryEvent, DiscoveryService},
+    discovery::{DiscoveryEvent, DiscoveryService, eligible_interfaces, ranked_dial_addresses},
     transfer,
 };
 use crate::{
@@ -52,6 +52,44 @@ const FRIEND_REQUEST_WINDOW: Duration = Duration::from_secs(60);
 const INCOMING_START_TIMEOUT: Duration = Duration::from_secs(35);
 const TERMINAL_NOTIFICATIONS_PER_PEER: usize = 8;
 const TERMINAL_NOTIFICATIONS_GLOBAL: usize = 32;
+const DIAL_BATCH_DELAY: Duration = Duration::from_millis(75);
+const DIAL_RETRY_DELAY: Duration = Duration::from_millis(500);
+
+#[derive(Default)]
+struct DiscoveryDialSchedule {
+    deadlines: HashMap<PeerId, Instant>,
+}
+
+impl DiscoveryDialSchedule {
+    fn queue(&mut self, peer_id: PeerId, now: Instant) {
+        self.deadlines
+            .entry(peer_id)
+            .or_insert(now + DIAL_BATCH_DELAY);
+    }
+
+    fn retry(&mut self, peer_id: PeerId, now: Instant) {
+        self.deadlines
+            .entry(peer_id)
+            .or_insert(now + DIAL_RETRY_DELAY);
+    }
+
+    fn remove(&mut self, peer_id: &PeerId) {
+        self.deadlines.remove(peer_id);
+    }
+
+    fn take_due(&mut self, now: Instant) -> Vec<PeerId> {
+        let mut due = self
+            .deadlines
+            .iter()
+            .filter_map(|(peer_id, deadline)| (*deadline <= now).then_some(*peer_id))
+            .collect::<Vec<_>>();
+        due.sort_by_key(ToString::to_string);
+        for peer_id in &due {
+            self.deadlines.remove(peer_id);
+        }
+        due
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum NetworkCommand {
@@ -59,8 +97,6 @@ pub enum NetworkCommand {
     SendFriendRequest(FriendRequest),
     ResolveFriendRequest {
         peer_id: String,
-        request_id: String,
-        accepted: bool,
     },
     SendText(ChatMessage),
     OfferTransfer(TransferRecord),
@@ -222,7 +258,10 @@ enum PendingAction {
     FriendRequest {
         request_id: String,
     },
-    FriendDecision,
+    FriendDecision {
+        request_id: String,
+        peer_id: String,
+    },
     Text {
         message_id: String,
     },
@@ -288,6 +327,10 @@ struct NetworkRuntime {
     mdns_addresses: HashMap<PeerId, HashSet<Multiaddr>>,
     beacon_addresses: HashMap<PeerId, HashMap<Multiaddr, Instant>>,
     active_connections: HashMap<PeerId, usize>,
+    dial_schedule: DiscoveryDialSchedule,
+    remembered_peer_ips: HashMap<PeerId, std::net::Ipv4Addr>,
+    remembered_targets_sender: watch::Sender<Vec<std::net::Ipv4Addr>>,
+    authenticated_connection_ips: HashMap<PeerId, std::net::Ipv4Addr>,
     terminal_retry_cursor: usize,
     friend_request_times: HashMap<PeerId, VecDeque<Instant>>,
     mdns_enabled: bool,
@@ -342,7 +385,15 @@ impl NetworkRuntime {
             .listen_on("/ip4/0.0.0.0/tcp/0".parse().expect("static listen address"))
             .map_err(|error| AppError::Network(format!("无法监听局域网端口：{error}")))?;
         let (listen_port_sender, listen_port_receiver) = watch::channel(None);
-        let discovery_receiver = DiscoveryService::spawn(peer_id, listen_port_receiver);
+        let remembered_peer_ips = storage
+            .list_friend_lan_targets()?
+            .into_iter()
+            .filter_map(|(peer_id, ip)| peer_id.parse::<PeerId>().ok().map(|peer_id| (peer_id, ip)))
+            .collect::<HashMap<_, _>>();
+        let (remembered_targets_sender, remembered_targets_receiver) =
+            watch::channel(sorted_remembered_targets(&remembered_peer_ips));
+        let discovery_receiver =
+            DiscoveryService::spawn(peer_id, listen_port_receiver, remembered_targets_receiver);
         let mdns_enabled =
             !(cfg!(debug_assertions) && std::env::var_os("LOCALNET_DISABLE_MDNS").is_some());
 
@@ -362,6 +413,10 @@ impl NetworkRuntime {
             mdns_addresses: HashMap::new(),
             beacon_addresses: HashMap::new(),
             active_connections: HashMap::new(),
+            dial_schedule: DiscoveryDialSchedule::default(),
+            remembered_peer_ips,
+            remembered_targets_sender,
+            authenticated_connection_ips: HashMap::new(),
             terminal_retry_cursor: 0,
             friend_request_times: HashMap::new(),
             mdns_enabled,
@@ -381,6 +436,8 @@ impl NetworkRuntime {
     async fn event_loop(&mut self) -> Result<(), AppError> {
         let mut discovery_cleanup = tokio::time::interval(Duration::from_secs(1));
         discovery_cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut dial_flush = tokio::time::interval(Duration::from_millis(25));
+        dial_flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 command = self.receiver.recv() => {
@@ -407,6 +464,7 @@ impl NetworkRuntime {
                     self.expire_beacon_addresses()?;
                     self.retry_terminal_notifications_for_connected_peers()?;
                 },
+                _ = dial_flush.tick() => self.flush_due_discovery_dials()?,
             }
         }
     }
@@ -430,23 +488,10 @@ impl NetworkRuntime {
                 self.pending
                     .insert(outbound_id, PendingAction::FriendRequest { request_id });
             }
-            NetworkCommand::ResolveFriendRequest {
-                peer_id,
-                request_id,
-                accepted,
-            } => {
+            NetworkCommand::ResolveFriendRequest { peer_id } => {
                 let peer_id = parse_peer_id(&peer_id)?;
-                self.ensure_connected(&peer_id)?;
-                let outbound_id = self.send_control_request(
-                    peer_id,
-                    ControlRequest::FriendDecision {
-                        request_id,
-                        accepted,
-                        nickname: self.local_profile.nickname.clone(),
-                    },
-                )?;
-                self.pending
-                    .insert(outbound_id, PendingAction::FriendDecision);
+                self.activate_remembered_friend_target(peer_id)?;
+                self.flush_pending_friend_decisions(peer_id)?;
             }
             NetworkCommand::SendText(message) => {
                 let peer_id = parse_peer_id(&message.peer_id)?;
@@ -652,7 +697,8 @@ impl NetworkRuntime {
                         .entry(peer_id)
                         .or_default()
                         .insert(address.clone());
-                    self.dial_discovered_peer(peer_id, address, "mdns");
+                    self.swarm.add_peer_address(peer_id, address);
+                    self.dial_schedule.queue(peer_id, Instant::now());
                 }
             }
             SwarmEvent::Behaviour(LocalnetBehaviourEvent::Mdns(mdns::Event::Expired(peers))) => {
@@ -676,7 +722,13 @@ impl NetworkRuntime {
                 tracing::trace!(?event, "identify event");
             }
             SwarmEvent::Behaviour(LocalnetBehaviourEvent::Stream(())) => {}
-            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+            SwarmEvent::ConnectionEstablished {
+                peer_id, endpoint, ..
+            } => {
+                self.dial_schedule.remove(&peer_id);
+                if let Some(ip) = private_ipv4_from_multiaddr(endpoint.get_remote_address()) {
+                    self.authenticated_connection_ips.insert(peer_id, ip);
+                }
                 *self.active_connections.entry(peer_id).or_default() += 1;
                 let outbound_id = self.swarm.behaviour_mut().control.send_request(
                     &peer_id,
@@ -710,6 +762,11 @@ impl NetworkRuntime {
             }
             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                 tracing::debug!(?peer_id, %error, "outgoing connection error");
+                if let Some(peer_id) = peer_id
+                    && self.has_fresh_discovery_address(&peer_id)
+                {
+                    self.dial_schedule.retry(peer_id, Instant::now());
+                }
             }
             SwarmEvent::IncomingConnectionError { error, .. } => {
                 tracing::debug!(%error, "incoming connection error");
@@ -739,23 +796,69 @@ impl NetworkRuntime {
                 if is_new {
                     tracing::debug!(peer_id = %peer_id, %address, "LAN beacon peer hint received");
                 }
-                self.dial_discovered_peer(peer_id, address, "lan-beacon");
+                self.swarm.add_peer_address(peer_id, address);
+                self.dial_schedule.queue(peer_id, Instant::now());
             }
         }
         Ok(())
     }
 
     #[cfg(not(test))]
-    fn dial_discovered_peer(&mut self, peer_id: PeerId, address: Multiaddr, source: &'static str) {
-        let swarm = &mut self.swarm;
-        swarm.add_peer_address(peer_id, address.clone());
-        let options = DialOpts::peer_id(peer_id)
-            .condition(PeerCondition::DisconnectedAndNotDialing)
-            .addresses(vec![address])
-            .build();
-        if let Err(error) = swarm.dial(options) {
-            tracing::trace!(peer_id = %peer_id, source, error = %error, "peer dial deferred");
+    fn flush_due_discovery_dials(&mut self) -> Result<(), AppError> {
+        let due = self.dial_schedule.take_due(Instant::now());
+        if due.is_empty() {
+            return Ok(());
         }
+        let interfaces = eligible_interfaces().unwrap_or_default();
+        for peer_id in due {
+            if self.swarm.is_connected(&peer_id) {
+                continue;
+            }
+            let addresses = ranked_dial_addresses(
+                self.discovery_addresses(&peer_id),
+                self.remembered_peer_ips.get(&peer_id).copied(),
+                &interfaces,
+            );
+            if addresses.is_empty() {
+                continue;
+            }
+            let address_count = addresses.len();
+            let options = DialOpts::peer_id(peer_id)
+                .condition(PeerCondition::DisconnectedAndNotDialing)
+                .addresses(addresses)
+                .extend_addresses_through_behaviour()
+                .build();
+            if let Err(error) = self.swarm.dial(options) {
+                tracing::trace!(%peer_id, address_count, %error, "peer dial deferred");
+            } else {
+                tracing::debug!(%peer_id, address_count, "dialing aggregated LAN candidates");
+            }
+        }
+        Ok(())
+    }
+
+    fn discovery_addresses(&self, peer_id: &PeerId) -> Vec<Multiaddr> {
+        self.mdns_addresses
+            .get(peer_id)
+            .into_iter()
+            .flat_map(|addresses| addresses.iter().cloned())
+            .chain(
+                self.beacon_addresses
+                    .get(peer_id)
+                    .into_iter()
+                    .flat_map(|addresses| addresses.keys().cloned()),
+            )
+            .collect()
+    }
+
+    fn has_fresh_discovery_address(&self, peer_id: &PeerId) -> bool {
+        self.mdns_addresses
+            .get(peer_id)
+            .is_some_and(|addresses| !addresses.is_empty())
+            || self
+                .beacon_addresses
+                .get(peer_id)
+                .is_some_and(|addresses| !addresses.is_empty())
     }
 
     #[cfg(not(test))]
@@ -855,9 +958,19 @@ impl NetworkRuntime {
                 })?;
                 let nickname = validate_nickname(&nickname)?;
                 if self.storage.is_friend(&peer_id.to_string())? {
-                    return Err(AppError::InvalidInput(
-                        "双方已经是好友，无需重复申请".to_string(),
-                    ));
+                    let now = now_rfc3339();
+                    self.storage
+                        .reconcile_request_from_existing_friend(&FriendRequest {
+                            request_id,
+                            peer_id: peer_id.to_string(),
+                            nickname,
+                            direction: Direction::Incoming,
+                            status: FriendRequestStatus::Accepted,
+                            created_at: now.clone(),
+                            updated_at: now,
+                        })?;
+                    self.flush_pending_friend_decisions(peer_id)?;
+                    return Ok(ControlResponse::Accepted);
                 }
                 if let Some(existing) = self.storage.get_friend_request(&request_id)? {
                     if existing.peer_id != peer_id.to_string() {
@@ -919,6 +1032,9 @@ impl NetworkRuntime {
                 });
                 self.storage
                     .resolve_friend_request(&request_id, status, friend.as_ref(), &now)?;
+                if accepted {
+                    self.activate_remembered_friend_target(peer_id)?;
+                }
                 let mut resolved = request;
                 resolved.nickname = nickname;
                 resolved.status = status;
@@ -1293,6 +1409,38 @@ impl NetworkRuntime {
             (PendingAction::FriendRequest { request_id }, ControlResponse::Accepted) => {
                 self.emit(NetworkEvent::FriendRequestDelivered { request_id });
             }
+            (
+                PendingAction::FriendDecision {
+                    request_id,
+                    peer_id: expected_peer,
+                },
+                ControlResponse::Accepted,
+            ) => {
+                if peer_id.to_string() == expected_peer {
+                    self.storage
+                        .acknowledge_friend_decision(&request_id, &expected_peer)?;
+                    self.flush_pending_friend_decisions(peer_id)?;
+                }
+            }
+            (
+                PendingAction::FriendDecision {
+                    request_id,
+                    peer_id: expected_peer,
+                },
+                ControlResponse::Rejected { message, .. },
+            ) => {
+                if peer_id.to_string() == expected_peer {
+                    self.storage
+                        .acknowledge_friend_decision(&request_id, &expected_peer)?;
+                    self.flush_pending_friend_decisions(peer_id)?;
+                    tracing::warn!(
+                        %request_id,
+                        peer_id = %expected_peer,
+                        %message,
+                        "peer rejected durable friend decision"
+                    );
+                }
+            }
             (PendingAction::Text { message_id }, ControlResponse::Rejected { message, .. }) => {
                 self.set_message_status(&message_id, MessageStatus::Failed, Some(message))?;
             }
@@ -1521,7 +1669,7 @@ impl NetworkRuntime {
                 );
             }
             PendingAction::Hello
-            | PendingAction::FriendDecision
+            | PendingAction::FriendDecision { .. }
             | PendingAction::TransferDecision {
                 accepted: false, ..
             }
@@ -1555,14 +1703,82 @@ impl NetworkRuntime {
             last_seen: now_rfc3339(),
         };
         self.storage.upsert_peer(&peer)?;
+        if let Some(ip) = self.authenticated_connection_ips.get(&peer_id).copied() {
+            self.storage
+                .remember_authenticated_lan_ip(&peer.peer_id, ip)?;
+            self.activate_remembered_friend_target(peer_id)?;
+        }
         let supports_resume = peer
             .capabilities
             .iter()
             .any(|capability| capability == FILE_RESUME_V2_CAPABILITY);
         self.emit(NetworkEvent::PeerDiscovered { peer });
+        self.flush_pending_friend_decisions(peer_id)?;
         if supports_resume && self.storage.is_friend(&peer_id.to_string())? {
             self.retry_terminal_notifications_for_connected_peers()?;
             self.resume_outgoing_for_peer(peer_id)?;
+        }
+        Ok(())
+    }
+
+    fn activate_remembered_friend_target(&mut self, peer_id: PeerId) -> Result<(), AppError> {
+        let Some(ip) = self.authenticated_connection_ips.get(&peer_id).copied() else {
+            return Ok(());
+        };
+        if !self.storage.is_friend(&peer_id.to_string())? {
+            return Ok(());
+        }
+        self.remembered_peer_ips.insert(peer_id, ip);
+        self.remembered_targets_sender
+            .send_replace(sorted_remembered_targets(&self.remembered_peer_ips));
+        Ok(())
+    }
+
+    fn flush_pending_friend_decisions(&mut self, peer_id: PeerId) -> Result<(), AppError> {
+        if self.active_connections.get(&peer_id).copied().unwrap_or(0) == 0 {
+            return Ok(());
+        }
+        let peer_id_text = peer_id.to_string();
+        let decisions = self.storage.list_pending_friend_decisions(&peer_id_text)?;
+        for decision in decisions {
+            let already_in_flight = self.pending.values().any(|action| {
+                matches!(
+                    action,
+                    PendingAction::FriendDecision { request_id, peer_id }
+                        if request_id == &decision.request_id && peer_id == &decision.peer_id
+                )
+            });
+            if already_in_flight {
+                continue;
+            }
+            let request_id = decision.request_id.clone();
+            match self.send_control_request(
+                peer_id,
+                ControlRequest::FriendDecision {
+                    request_id: request_id.clone(),
+                    accepted: decision.accepted,
+                    nickname: self.local_profile.nickname.clone(),
+                },
+            ) {
+                Ok(outbound_id) => {
+                    self.pending.insert(
+                        outbound_id,
+                        PendingAction::FriendDecision {
+                            request_id,
+                            peer_id: peer_id_text.clone(),
+                        },
+                    );
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        %error,
+                        %request_id,
+                        peer_id = %peer_id_text,
+                        "durable friend decision will retry after reconnect"
+                    );
+                    break;
+                }
+            }
         }
         Ok(())
     }
@@ -2344,6 +2560,33 @@ impl NetworkRuntime {
     }
 }
 
+fn private_ipv4_from_multiaddr(address: &Multiaddr) -> Option<std::net::Ipv4Addr> {
+    address.iter().find_map(|protocol| match protocol {
+        Protocol::Ip4(ip)
+            if ip.is_private()
+                && !ip.is_loopback()
+                && !ip.is_link_local()
+                && !ip.is_unspecified() =>
+        {
+            Some(ip)
+        }
+        _ => None,
+    })
+}
+
+fn sorted_remembered_targets(
+    remembered_peer_ips: &HashMap<PeerId, std::net::Ipv4Addr>,
+) -> Vec<std::net::Ipv4Addr> {
+    let mut targets = remembered_peer_ips
+        .values()
+        .copied()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    targets.sort_unstable();
+    targets
+}
+
 fn parse_peer_id(value: &str) -> Result<PeerId, AppError> {
     value
         .parse()
@@ -2715,19 +2958,22 @@ mod tests {
         cell::Cell,
         collections::{HashMap, VecDeque},
         fs, io,
+        net::Ipv4Addr,
         path::PathBuf,
         pin::Pin,
         sync::{Arc, Mutex},
         task::{Context, Poll},
+        time::{Duration, Instant},
     };
 
     use futures::io::{AsyncRead, AsyncWrite};
+    use libp2p::PeerId;
     use tokio::sync::{mpsc, oneshot, watch};
 
     use super::{
-        AcceptedSubmissionOutcome, NetworkCommand, NetworkEvent, NetworkRuntime, PendingAction,
-        PendingRequestId, TestControlTransport, TestResumableTransport,
-        accept_file_protocol_streams, automatic_receive_path,
+        AcceptedSubmissionOutcome, DIAL_BATCH_DELAY, DiscoveryDialSchedule, NetworkCommand,
+        NetworkEvent, NetworkRuntime, PendingAction, PendingRequestId, TestControlTransport,
+        TestResumableTransport, accept_file_protocol_streams, automatic_receive_path,
         finalize_accepted_transfer_submission, persist_incoming_offer_with_preflight,
         persist_incoming_offer_with_preflight_and_accept, validate_transfer_offer,
     };
@@ -2963,6 +3209,7 @@ mod tests {
         let (command_sender, receiver) = mpsc::channel(1);
         let (_discovery_sender, discovery_receiver) = mpsc::channel(1);
         let (listen_port_sender, _listen_port_receiver) = watch::channel(None);
+        let (remembered_targets_sender, _remembered_targets_receiver) = watch::channel(Vec::new());
         let mut active_connections = HashMap::new();
         active_connections.insert(remote_peer, 1);
         NetworkRuntime {
@@ -2982,6 +3229,10 @@ mod tests {
             mdns_addresses: HashMap::new(),
             beacon_addresses: HashMap::new(),
             active_connections,
+            dial_schedule: DiscoveryDialSchedule::default(),
+            remembered_peer_ips: HashMap::new(),
+            remembered_targets_sender,
+            authenticated_connection_ips: HashMap::new(),
             terminal_retry_cursor: 0,
             friend_request_times: HashMap::new(),
             mdns_enabled: false,
@@ -3027,6 +3278,9 @@ mod tests {
                 &now,
             )
             .expect("accept runtime friend");
+        storage
+            .acknowledge_friend_decision(&request.request_id, peer_id)
+            .expect("retire runtime friend fixture decision");
     }
 
     fn persist_runtime_peer_capabilities(
@@ -6731,5 +6985,302 @@ mod tests {
         assert!(error.to_string().contains("不可用"));
         assert!(!fixture.exists());
         let _ = fs::remove_dir_all(fixture);
+    }
+
+    #[test]
+    fn discovery_candidate_batches_multiple_hints_without_extending_the_latency_bound() {
+        let peer_id = PeerId::random();
+        let started = Instant::now();
+        let mut schedule = DiscoveryDialSchedule::default();
+
+        schedule.queue(peer_id, started);
+        schedule.queue(peer_id, started + Duration::from_millis(20));
+
+        assert!(
+            schedule
+                .take_due(started + DIAL_BATCH_DELAY - Duration::from_millis(1))
+                .is_empty()
+        );
+        assert_eq!(schedule.take_due(started + DIAL_BATCH_DELAY), vec![peer_id]);
+        assert!(
+            schedule
+                .take_due(started + DIAL_BATCH_DELAY + Duration::from_millis(1))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn friend_decision_retries_after_hello_and_only_exact_response_retires_it() {
+        let (directory, storage, _) = automatic_fixture("friend-decision-retry");
+        let remote_peer = deterministic_peer_id(91);
+        let request_id = uuid::Uuid::now_v7().to_string();
+        let now = now_rfc3339();
+        storage
+            .put_friend_request(&FriendRequest {
+                request_id: request_id.clone(),
+                peer_id: remote_peer.to_string(),
+                nickname: "Remote Friend".to_string(),
+                direction: Direction::Incoming,
+                status: FriendRequestStatus::Pending,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            })
+            .expect("persist incoming friend request");
+        storage
+            .resolve_friend_request(
+                &request_id,
+                FriendRequestStatus::Accepted,
+                Some(&Friend {
+                    peer_id: remote_peer.to_string(),
+                    nickname: "Remote Friend".to_string(),
+                    platform: Platform::current(),
+                    online: true,
+                    added_at: now.clone(),
+                    last_seen: now,
+                }),
+                &now_rfc3339(),
+            )
+            .expect("accept friend request locally");
+
+        let mut runtime = production_test_runtime(storage.clone(), &directory, remote_peer);
+        runtime.test_control_transport.as_mut().unwrap().fail_next =
+            Some("injected disconnect".to_string());
+        runtime
+            .record_hello(
+                remote_peer,
+                PROTOCOL_VERSION,
+                "Remote Friend".to_string(),
+                Platform::current(),
+                Vec::new(),
+            )
+            .expect("Hello remains successful when the first retry disconnects");
+        assert_eq!(
+            storage
+                .list_pending_friend_decisions(&remote_peer.to_string())
+                .expect("failed retry remains durable")
+                .len(),
+            1
+        );
+
+        runtime
+            .record_hello(
+                remote_peer,
+                PROTOCOL_VERSION,
+                "Remote Friend".to_string(),
+                Platform::current(),
+                Vec::new(),
+            )
+            .expect("next Hello retries durable decision");
+        let pending_id = runtime
+            .pending
+            .iter()
+            .find_map(|(pending_id, action)| {
+                matches!(
+                    action,
+                    PendingAction::FriendDecision { request_id: pending, peer_id }
+                        if pending == &request_id && peer_id == &remote_peer.to_string()
+                )
+                .then_some(*pending_id)
+            })
+            .expect("friend decision is awaiting response");
+        runtime
+            .handle_outbound_response(
+                deterministic_peer_id(92),
+                pending_id,
+                ControlResponse::Accepted,
+            )
+            .expect("wrong peer response is ignored");
+        assert_eq!(
+            storage
+                .list_pending_friend_decisions(&remote_peer.to_string())
+                .expect("wrong peer retains outbox")
+                .len(),
+            1
+        );
+
+        runtime
+            .record_hello(
+                remote_peer,
+                PROTOCOL_VERSION,
+                "Remote Friend".to_string(),
+                Platform::current(),
+                Vec::new(),
+            )
+            .expect("Hello retries after wrong response");
+        let pending_id = runtime
+            .pending
+            .iter()
+            .find_map(|(pending_id, action)| {
+                matches!(
+                    action,
+                    PendingAction::FriendDecision { request_id: pending, peer_id }
+                        if pending == &request_id && peer_id == &remote_peer.to_string()
+                )
+                .then_some(*pending_id)
+            })
+            .expect("exact retry is awaiting response");
+        runtime
+            .handle_outbound_response(remote_peer, pending_id, ControlResponse::Accepted)
+            .expect("exact peer response retires decision");
+        assert!(
+            storage
+                .list_pending_friend_decisions(&remote_peer.to_string())
+                .expect("exact response retires outbox")
+                .is_empty()
+        );
+
+        drop(runtime);
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove friend decision retry fixture");
+    }
+
+    #[test]
+    fn existing_friend_request_is_auto_reconciled_without_a_duplicate_prompt() {
+        let (directory, storage, _) = automatic_fixture("friend-request-reconcile");
+        let remote_peer = deterministic_peer_id(93);
+        add_runtime_friend(&storage, &remote_peer.to_string());
+        let mut runtime = production_test_runtime(storage.clone(), &directory, remote_peer);
+        let request_id = uuid::Uuid::now_v7().to_string();
+
+        assert!(matches!(
+            runtime
+                .handle_inbound_request(
+                    remote_peer,
+                    ControlRequest::FriendRequest {
+                        request_id: request_id.clone(),
+                        nickname: "Existing Friend".to_string(),
+                    },
+                )
+                .expect("existing friend request is reconciled"),
+            ControlResponse::Accepted
+        ));
+        let request = storage
+            .get_friend_request(&request_id)
+            .expect("load reconciled request")
+            .expect("reconciled request exists");
+        assert_eq!(request.status, FriendRequestStatus::Accepted);
+        assert_eq!(request.direction, Direction::Incoming);
+        assert!(
+            runtime
+                .test_events
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|event| !matches!(event, NetworkEvent::FriendRequestReceived { .. }))
+        );
+        assert_eq!(
+            storage
+                .list_pending_friend_decisions(&remote_peer.to_string())
+                .expect("auto-heal decision is durable")
+                .len(),
+            1
+        );
+
+        drop(runtime);
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove friend reconcile fixture");
+    }
+
+    #[test]
+    fn authenticated_friend_endpoint_updates_fast_probe_targets_without_restart() {
+        let (directory, storage, _) = automatic_fixture("friend-fast-probe-update");
+        let remote_peer = deterministic_peer_id(94);
+        add_runtime_friend(&storage, &remote_peer.to_string());
+        let mut runtime = production_test_runtime(storage.clone(), &directory, remote_peer);
+        let remembered = Ipv4Addr::new(192, 168, 31, 94);
+        runtime
+            .authenticated_connection_ips
+            .insert(remote_peer, remembered);
+        let receiver = runtime.remembered_targets_sender.subscribe();
+
+        runtime
+            .record_hello(
+                remote_peer,
+                PROTOCOL_VERSION,
+                "Fast Probe Friend".to_string(),
+                Platform::current(),
+                Vec::new(),
+            )
+            .expect("authenticated Hello remembers friend endpoint");
+
+        assert_eq!(receiver.borrow().as_slice(), &[remembered]);
+        drop(runtime);
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove friend fast probe fixture");
+    }
+
+    #[test]
+    fn authenticated_nonfriend_is_persisted_but_only_fast_probed_after_acceptance() {
+        let (directory, storage, _) = automatic_fixture("nonfriend-fast-probe-gate");
+        let remote_peer = deterministic_peer_id(95);
+        let mut runtime = production_test_runtime(storage.clone(), &directory, remote_peer);
+        let remembered = Ipv4Addr::new(192, 168, 31, 95);
+        runtime
+            .authenticated_connection_ips
+            .insert(remote_peer, remembered);
+        let receiver = runtime.remembered_targets_sender.subscribe();
+
+        runtime
+            .record_hello(
+                remote_peer,
+                PROTOCOL_VERSION,
+                "Nearby Peer".to_string(),
+                Platform::current(),
+                Vec::new(),
+            )
+            .expect("authenticated nonfriend Hello persists endpoint");
+        assert!(receiver.borrow().is_empty());
+        assert!(
+            storage
+                .list_friend_lan_targets()
+                .expect("nonfriend target stays out of startup set")
+                .is_empty()
+        );
+
+        let request_id = uuid::Uuid::now_v7().to_string();
+        let now = now_rfc3339();
+        storage
+            .put_friend_request(&FriendRequest {
+                request_id: request_id.clone(),
+                peer_id: remote_peer.to_string(),
+                nickname: "Nearby Peer".to_string(),
+                direction: Direction::Incoming,
+                status: FriendRequestStatus::Pending,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            })
+            .expect("persist incoming friend request");
+        storage
+            .resolve_friend_request(
+                &request_id,
+                FriendRequestStatus::Accepted,
+                Some(&Friend {
+                    peer_id: remote_peer.to_string(),
+                    nickname: "Nearby Peer".to_string(),
+                    platform: Platform::current(),
+                    online: true,
+                    added_at: now.clone(),
+                    last_seen: now.clone(),
+                }),
+                &now,
+            )
+            .expect("accept nearby peer");
+        runtime
+            .handle_command(NetworkCommand::ResolveFriendRequest {
+                peer_id: remote_peer.to_string(),
+            })
+            .expect("friend acceptance activates fast probe target");
+
+        assert_eq!(receiver.borrow().as_slice(), &[remembered]);
+        assert_eq!(
+            storage
+                .list_friend_lan_targets()
+                .expect("accepted friend loads remembered endpoint"),
+            vec![(remote_peer.to_string(), remembered)]
+        );
+
+        drop(runtime);
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove nonfriend fast probe fixture");
     }
 }
