@@ -49,6 +49,11 @@ jobs:
       - name: Run transfer status regression test
         run: node --test --experimental-strip-types tests/transfer-status.test.ts
 
+      - name: Set up Ruby for release workflow validation
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+
       - name: Run release workflow regression test
         run: node --test tests/release-workflow.test.mjs
 

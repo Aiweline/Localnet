@@ -28,7 +28,7 @@ github_api_json() {
 
 verify_audited_release_tag_policy() {
   local repository="${1:?GitHub repository is required}"
-  validate_github_repository_name "$repository"
+  validate_github_repository_name "$repository" || return 1
   local ruleset_id
   ruleset_id="$(node scripts/release-policy.mjs audited-ruleset-id)"
 
@@ -58,7 +58,7 @@ verify_audited_release_tag_policy() {
 find_release_by_tag() {
   local repository="${1:?GitHub repository is required}"
   local tag="${2:?release tag is required}"
-  validate_github_repository_name "$repository"
+  validate_github_repository_name "$repository" || return 1
   local pages
   if ! pages="$(
     github_api_json --paginate --slurp "repos/$repository/releases?per_page=100"
@@ -72,7 +72,7 @@ find_release_by_tag() {
 read_release_by_id() {
   local repository="${1:?GitHub repository is required}"
   local release_id="${2:?release id is required}"
-  validate_github_repository_name "$repository"
+  validate_github_repository_name "$repository" || return 1
   if [[ ! "$release_id" =~ ^[0-9]+$ ]]; then
     echo "::error::Invalid GitHub release id." >&2
     return 1
@@ -181,7 +181,7 @@ verify_remote_release_tag() {
   local remote_name="${1:?remote name is required}"
   local tag="${2:?tag is required}"
   local expected_sha="${3:?expected SHA is required}"
-  validate_remote_release_tag_arguments "$remote_name" "$tag" "$expected_sha"
+  validate_remote_release_tag_arguments "$remote_name" "$tag" "$expected_sha" || return 1
 
   local remote_refs
   if ! remote_refs="$(
@@ -217,7 +217,7 @@ create_remote_release_tag() {
   local remote_name="${1:?remote name is required}"
   local tag="${2:?tag is required}"
   local expected_sha="${3:?expected SHA is required}"
-  validate_remote_release_tag_arguments "$remote_name" "$tag" "$expected_sha"
+  validate_remote_release_tag_arguments "$remote_name" "$tag" "$expected_sha" || return 1
 
   if ! git cat-file -e "$expected_sha^{commit}" 2>/dev/null; then
     echo "::error::Expected release commit $expected_sha is not available locally."
@@ -275,7 +275,7 @@ release_decision_main() {
   local tag_commit=""
   local release_complete=false
 
-  validate_release_ref "$GITHUB_EVENT_NAME" "$GITHUB_REF"
+  validate_release_ref "$GITHUB_EVENT_NAME" "$GITHUB_REF" || return 1
 
   if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
     local before="${RELEASE_EVENT_BEFORE:-}"

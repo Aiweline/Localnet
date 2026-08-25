@@ -647,6 +647,52 @@ test("the remote tag guard rejects shell metacharacters as invalid tag input", (
   }
 });
 
+test("a guard validation failure stops before external commands in an AND-list context", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "localnet-release-validation-"));
+  const commandLog = join(fixtureRoot, "external-commands.log");
+  try {
+    const result = spawnSync(
+      bash,
+      [
+        "-c",
+        `node() {
+  printf 'node %s\\n' "$*" >> "$COMMAND_LOG"
+  if [[ "$*" == *"audited-ruleset-id"* ]]; then
+    printf '21367373\\n'
+  fi
+}
+gh() {
+  printf 'gh %s\\n' "$*" >> "$COMMAND_LOG"
+  printf '[]\\n'
+}
+git() {
+  printf 'git %s\\n' "$*" >> "$COMMAND_LOG"
+  if [[ "$1" == "ls-remote" ]]; then
+    printf '%s\\trefs/tags/v0.2.0\\n' "$EXPECTED_SHA"
+  fi
+}
+source scripts/release-decision.sh
+guard_release_mutation 'invalid repository' origin v0.2.0 "$EXPECTED_SHA" && printf 'MUTATION_REACHED\\n'`,
+      ],
+      {
+        cwd: repository,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          COMMAND_LOG: commandLog,
+          EXPECTED_SHA: "0123456789abcdef0123456789abcdef01234567",
+        },
+      },
+    );
+
+    assert.notEqual(result.status, 0, result.stdout + result.stderr);
+    assert.equal(existsSync(commandLog), false, "validation must fail before node, gh, or git runs");
+    assert.doesNotMatch(result.stdout, /MUTATION_REACHED/);
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
 for (const tagKind of ["annotated", "lightweight"]) {
   test(`an unchanged ${tagKind} remote release tag peels to the expected commit`, () => {
     const fixture = remoteTagFixture(tagKind);
@@ -967,17 +1013,31 @@ test("release workflow is valid YAML and wires provenance checks before decision
   assert.match(workflow, /bash scripts\/release-decision\.sh/);
 
   const validators = [
-    ["python", ["-c", "import pathlib, yaml; yaml.safe_load(pathlib.Path('.github/workflows/release.yml').read_text(encoding='utf-8'))"]],
-    ["python3", ["-c", "import pathlib, yaml; yaml.safe_load(pathlib.Path('.github/workflows/release.yml').read_text(encoding='utf-8'))"]],
-    ["ruby", ["-e", "require 'yaml'; YAML.safe_load_file('.github/workflows/release.yml', aliases: true)"]],
+    ["ruby", ["-e", "require 'json'; require 'yaml'; puts JSON.generate(YAML.safe_load_file('.github/workflows/release.yml', aliases: true))"]],
+    ...(process.env.GITHUB_ACTIONS === "true" ? [] : [
+      ["python", ["-c", "import json, pathlib, yaml; print(json.dumps(yaml.safe_load(pathlib.Path('.github/workflows/release.yml').read_text(encoding='utf-8'))))"]],
+      ["python3", ["-c", "import json, pathlib, yaml; print(json.dumps(yaml.safe_load(pathlib.Path('.github/workflows/release.yml').read_text(encoding='utf-8'))))"]],
+    ]),
   ];
   const attempts = validators.map(([command, args]) =>
     spawnSync(command, args, { cwd: repository, encoding: "utf8" }),
   );
+  const successfulValidation = attempts.find((attempt) => attempt.status === 0);
   assert.ok(
-    attempts.some((attempt) => attempt.status === 0),
+    successfulValidation,
     attempts.map((attempt) => attempt.stderr).filter(Boolean).join("\n"),
   );
+  const parsedWorkflow = JSON.parse(successfulValidation.stdout);
+  const prepareSteps = parsedWorkflow.jobs.prepare.steps;
+  const rubySetupIndex = prepareSteps.findIndex((step) => step.name === "Set up Ruby for release workflow validation");
+  const releaseRegressionIndex = prepareSteps.findIndex((step) => step.name === "Run release workflow regression test");
+  assert.ok(rubySetupIndex >= 0, "prepare must install the YAML validator's pinned Ruby runtime");
+  assert.ok(
+    releaseRegressionIndex > rubySetupIndex,
+    "Ruby setup must complete before the release workflow regression test",
+  );
+  assert.equal(prepareSteps[rubySetupIndex].uses, "ruby/setup-ruby@v1");
+  assert.equal(prepareSteps[rubySetupIndex].with["ruby-version"], "3.3");
 });
 
 test("release decision script and every inline Bash block pass Bash syntax validation", () => {

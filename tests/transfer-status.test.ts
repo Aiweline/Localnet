@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-const statusModule = await import("../src/transfer-status.ts").catch(() => ({}));
+const statusModule = await import("../src/transfer-status.ts");
 
 const DEFAULT_PAUSED_LABEL = "网络中断，等待自动恢复";
 const DESTINATION_PREFLIGHT_MARKER = "[weline-localnet:destination-preflight:v1]";

@@ -56,7 +56,7 @@ export function transferStatusPresentation(
       };
     case "transferring":
       return { label: labels.transferring(percent), tone: "active", percent, showProgress: true, showCancel: false };
-    case "paused":
+    case "paused": {
       const destinationError = destinationPreflightPauseMessage(transfer);
       return {
         label: destinationError || labels.paused,
@@ -65,6 +65,7 @@ export function transferStatusPresentation(
         showProgress: true,
         showCancel: true,
       };
+    }
     case "completed":
       return { label: labels.completed, tone: "success", percent: 100, showProgress: false, showCancel: false };
     case "cancelled":
