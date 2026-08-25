@@ -8,6 +8,10 @@ use crate::error::AppError;
 pub const MAX_NICKNAME_CHARS: usize = 32;
 pub const MAX_TEXT_BYTES: usize = 16 * 1024;
 pub const PROTOCOL_VERSION: u16 = 1;
+pub const SUPPORTED_LANGUAGE_PREFERENCES: [&str; 11] = [
+    "auto", "zh-CN", "en-US", "es-ES", "fr-FR", "de-DE", "pt-BR", "ru-RU", "ja-JP", "ko-KR",
+    "ar-SA",
+];
 
 pub const fn default_transfer_protocol() -> u8 {
     1
@@ -219,12 +223,22 @@ pub struct PresenceSnapshot {
 #[serde(rename_all = "camelCase")]
 pub struct BootstrapSnapshot {
     pub local_profile: Option<LocalProfile>,
+    pub language_preference: String,
     pub transfer_preferences: TransferPreferences,
     pub peers: Vec<PeerSummary>,
     pub friend_requests: Vec<FriendRequest>,
     pub friends: Vec<Friend>,
     pub messages: Vec<ChatMessage>,
     pub transfers: Vec<TransferRecord>,
+}
+
+pub fn validate_language_preference(value: &str) -> Result<String, AppError> {
+    if SUPPORTED_LANGUAGE_PREFERENCES.contains(&value) {
+        return Ok(value.to_string());
+    }
+    Err(AppError::InvalidInput(
+        "不支持的界面语言，请重新选择".to_string(),
+    ))
 }
 
 pub fn now_rfc3339() -> String {
@@ -259,4 +273,29 @@ pub fn validate_text(value: &str) -> Result<String, AppError> {
         )));
     }
     Ok(normalized)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_language_preference;
+
+    #[test]
+    fn language_preference_accepts_only_the_supported_canonical_values() {
+        for value in [
+            "auto", "zh-CN", "en-US", "es-ES", "fr-FR", "de-DE", "pt-BR", "ru-RU", "ja-JP",
+            "ko-KR", "ar-SA",
+        ] {
+            assert_eq!(
+                validate_language_preference(value).expect("supported preference"),
+                value
+            );
+        }
+
+        for value in ["", "en", "en-us", "zh-TW", "pt-PT", " ar-SA ", "de-DE\n"] {
+            assert!(
+                validate_language_preference(value).is_err(),
+                "unsupported preference must be rejected: {value:?}"
+            );
+        }
+    }
 }

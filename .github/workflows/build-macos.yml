@@ -61,6 +61,12 @@ jobs:
           test "$bundle_version" = "$version"
           test -n "$local_network_description"
           test "$bonjour_service" = "_p2p._udp"
+          for locale in en.lproj zh-Hans.lproj es.lproj fr.lproj de.lproj pt-BR.lproj ru.lproj ja.lproj ko.lproj ar.lproj; do
+            localized="$app_path/Contents/Resources/$locale/InfoPlist.strings"
+            test -s "$localized"
+            plutil -lint "$localized" >/dev/null
+            grep -Eq '^"NSLocalNetworkUsageDescription" = ".+";$' "$localized"
+          done
           [[ "$archs" == *arm64* ]]
           [[ "$archs" == *x86_64* ]]
 

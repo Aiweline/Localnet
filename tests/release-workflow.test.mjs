@@ -1084,6 +1084,35 @@ test("release workflow is valid YAML and wires provenance checks before decision
   assert.equal(prepareSteps[rubySetupIndex].with["ruby-version"], "3.3");
 });
 
+test("release builds gate all ten localizations and the attachment file actions", () => {
+  const releaseWorkflow = readFileSync(new URL(`../${workflowPath}`, import.meta.url), "utf8");
+  const macosWorkflow = readFileSync(
+    new URL("../.github/workflows/build-macos.yml", import.meta.url),
+    "utf8",
+  );
+
+  assert.match(releaseWorkflow, /tests\/i18n\.test\.ts/);
+  assert.match(releaseWorkflow, /tests\/file-actions\.test\.ts/);
+  assert.match(releaseWorkflow, /tests\/macos-localizations\.test\.mjs/);
+  assert.match(releaseWorkflow, /MUI_LANGDLL_ALWAYSSHOW/);
+  assert.match(releaseWorkflow, /installer\.nsi/);
+  for (const locale of [
+    "en.lproj",
+    "zh-Hans.lproj",
+    "es.lproj",
+    "fr.lproj",
+    "de.lproj",
+    "pt-BR.lproj",
+    "ru.lproj",
+    "ja.lproj",
+    "ko.lproj",
+    "ar.lproj",
+  ]) {
+    assert.match(releaseWorkflow, new RegExp(locale.replace(".", "\\.")));
+    assert.match(macosWorkflow, new RegExp(locale.replace(".", "\\.")));
+  }
+});
+
 test("release decision script and every inline Bash block pass Bash syntax validation", () => {
   const scriptResult = spawnSync(bash, ["-n", decisionScript], {
     cwd: repository,

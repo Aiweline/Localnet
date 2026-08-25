@@ -15,6 +15,7 @@ use crate::{
         BootstrapSnapshot, ChatMessage, Direction, Friend, FriendRequest, FriendRequestStatus,
         LocalProfile, MessageKind, MessageStatus, PeerSummary, Platform, PresenceSnapshot,
         TransferKind, TransferPreferences, TransferRecord, TransferStatus,
+        validate_language_preference,
     },
     error::{AppError, DestinationPreflightFailure},
     receive_paths::{
@@ -123,6 +124,125 @@ impl Storage {
             [&profile.nickname],
         )?;
         Ok(())
+    }
+
+    pub fn load_language_preference(&self) -> Result<String, AppError> {
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('language_preference', 'auto')",
+            [],
+        )?;
+        let preference: String = connection.query_row(
+            "SELECT value FROM settings WHERE key = 'language_preference'",
+            [],
+            |row| row.get(0),
+        )?;
+        if validate_language_preference(&preference).is_ok() {
+            return Ok(preference);
+        }
+        tracing::warn!(%preference, "repairing invalid stored interface language preference");
+        connection.execute(
+            "UPDATE settings SET value = 'auto' WHERE key = 'language_preference'",
+            [],
+        )?;
+        Ok("auto".to_string())
+    }
+
+    pub fn save_language_preference(&self, preference: &str) -> Result<(), AppError> {
+        let preference = validate_language_preference(preference)?;
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO settings (key, value) VALUES ('language_preference', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [&preference],
+        )?;
+        Ok(())
+    }
+
+    pub fn import_installer_locale_marker(
+        &self,
+        marker: &Path,
+    ) -> Result<Option<String>, AppError> {
+        self.import_installer_locale_marker_with_remover(marker, |path| std::fs::remove_file(path))
+    }
+
+    fn import_installer_locale_marker_with_remover<F>(
+        &self,
+        marker: &Path,
+        remove_marker: F,
+    ) -> Result<Option<String>, AppError>
+    where
+        F: Fn(&Path) -> std::io::Result<()>,
+    {
+        let bytes = match std::fs::read(marker) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                tracing::warn!(path = %marker.display(), %error, "ignoring unreadable installer locale marker");
+                return Ok(None);
+            }
+        };
+        let parsed = {
+            let mut lines = bytes.split(|byte| *byte == b'\n');
+            let preference = lines
+                .next()
+                .and_then(|value| std::str::from_utf8(value).ok());
+            let generation = lines.next();
+            if lines.next().is_some()
+                || generation.is_none_or(|value| value.is_empty() || value.len() > 4096)
+            {
+                None
+            } else {
+                preference.and_then(|preference| {
+                    validate_language_preference(preference)
+                        .ok()
+                        .map(|preference| {
+                            let generation = hex::encode(sha2::Sha256::digest(
+                                generation.expect("validated installer generation"),
+                            ));
+                            (preference, generation)
+                        })
+                })
+            }
+        };
+        let Some((preference, generation)) = parsed else {
+            tracing::warn!(path = %marker.display(), "ignoring invalid installer locale marker");
+            if let Err(error) = remove_marker(marker) {
+                tracing::warn!(path = %marker.display(), %error, "failed to remove invalid installer locale marker");
+            }
+            return Ok(None);
+        };
+        let last_generation = self
+            .connection()?
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'installer_locale_marker_generation'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if last_generation.as_deref() == Some(generation.as_str()) {
+            if let Err(error) = remove_marker(marker) {
+                tracing::warn!(path = %marker.display(), %error, "failed to remove previously consumed installer locale marker");
+            }
+            return Ok(None);
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO settings (key, value) VALUES ('language_preference', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [&preference],
+        )?;
+        transaction.execute(
+            "INSERT INTO settings (key, value) VALUES ('installer_locale_marker_generation', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [&generation],
+        )?;
+        transaction.commit()?;
+        if let Err(error) = remove_marker(marker) {
+            tracing::warn!(path = %marker.display(), %error, "failed to remove consumed installer locale marker");
+        }
+        Ok(Some(preference))
     }
 
     pub fn load_transfer_preferences(
@@ -2408,6 +2528,7 @@ impl Storage {
     ) -> Result<BootstrapSnapshot, AppError> {
         Ok(BootstrapSnapshot {
             local_profile,
+            language_preference: self.load_language_preference()?,
             transfer_preferences: self.load_transfer_preferences(default_receive_directory)?,
             peers: self.list_peers()?,
             friend_requests: self.list_friend_requests()?,
@@ -4289,6 +4410,214 @@ mod tests {
 
     fn initialize_database(database: &std::path::Path) {
         drop(Storage::open(database).expect("initialize current storage schema"));
+    }
+
+    #[test]
+    fn language_preference_defaults_to_auto_and_survives_restart() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-language-preference-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&fixture).expect("create language fixture");
+        let database = fixture.join("localnet.sqlite3");
+
+        {
+            let storage = Storage::open(&database).expect("open language storage");
+            assert_eq!(
+                storage
+                    .load_language_preference()
+                    .expect("load default language"),
+                "auto"
+            );
+            storage
+                .save_language_preference("pt-BR")
+                .expect("save language preference");
+        }
+
+        let storage = Storage::open(&database).expect("reopen language storage");
+        assert_eq!(
+            storage
+                .load_language_preference()
+                .expect("reload language preference"),
+            "pt-BR"
+        );
+        storage
+            .connection()
+            .expect("open language corruption fixture")
+            .execute(
+                "UPDATE settings SET value = 'xx-PRIVATE' WHERE key = 'language_preference'",
+                [],
+            )
+            .expect("corrupt saved language fixture");
+        assert_eq!(
+            storage
+                .load_language_preference()
+                .expect("invalid stored language falls back safely"),
+            "auto"
+        );
+        assert_eq!(
+            storage
+                .load_language_preference()
+                .expect("safe fallback is repaired durably"),
+            "auto"
+        );
+        drop(storage);
+        fs::remove_dir_all(&fixture).expect("remove language fixture");
+    }
+
+    #[test]
+    fn language_preference_imports_one_shot_installer_marker_and_rejects_invalid_content() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-installer-language-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&fixture).expect("create installer-language fixture");
+        let storage = Storage::open(&fixture.join("localnet.sqlite3"))
+            .expect("open installer-language storage");
+        let marker = fixture.join("installer-locale");
+
+        fs::write(&marker, b"de-DE\ngeneration-one").expect("write valid installer locale");
+        assert_eq!(
+            storage
+                .import_installer_locale_marker(&marker)
+                .expect("import installer locale"),
+            Some("de-DE".to_string())
+        );
+        assert!(!marker.exists(), "valid marker must be consumed once");
+        assert_eq!(
+            storage
+                .load_language_preference()
+                .expect("load imported language"),
+            "de-DE"
+        );
+
+        fs::write(&marker, b"de-DE\ngeneration-two\nprivate-data")
+            .expect("write invalid installer locale");
+        assert_eq!(
+            storage
+                .import_installer_locale_marker(&marker)
+                .expect("ignore invalid installer locale"),
+            None
+        );
+        assert!(!marker.exists(), "invalid marker must not retry forever");
+        assert_eq!(
+            storage
+                .load_language_preference()
+                .expect("preserve prior language"),
+            "de-DE"
+        );
+
+        fs::create_dir(&marker).expect("create unreadable marker fixture");
+        assert_eq!(
+            storage
+                .import_installer_locale_marker(&marker)
+                .expect("an unreadable marker must not block startup"),
+            None
+        );
+        assert!(marker.is_dir(), "unreadable marker must be left untouched");
+
+        drop(storage);
+        fs::remove_dir_all(&fixture).expect("remove installer-language fixture");
+    }
+
+    #[test]
+    fn consumed_installer_locale_marker_cannot_override_a_later_user_choice() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-installer-language-undeletable-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&fixture).expect("create undeletable marker fixture");
+        let storage = Storage::open(&fixture.join("localnet.sqlite3"))
+            .expect("open undeletable marker storage");
+        let marker = fixture.join("installer-locale");
+        fs::write(&marker, b"de-DE\ngeneration-stale")
+            .expect("write readable installer locale marker");
+
+        assert_eq!(
+            storage
+                .import_installer_locale_marker_with_remover(&marker, |_| {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "simulated marker deletion failure",
+                    ))
+                })
+                .expect("persist consumption before deletion"),
+            Some("de-DE".to_string())
+        );
+        assert!(
+            marker.exists(),
+            "the simulated deletion failure keeps the marker"
+        );
+        storage
+            .save_language_preference("en-US")
+            .expect("save later user language choice");
+
+        assert_eq!(
+            storage
+                .import_installer_locale_marker(&marker)
+                .expect("ignore an already-consumed marker after restart"),
+            None
+        );
+        assert_eq!(
+            storage
+                .load_language_preference()
+                .expect("load preserved user language choice"),
+            "en-US"
+        );
+        assert!(
+            !marker.exists(),
+            "a later cleanup may remove the stale marker"
+        );
+
+        fs::write(&marker, b"ja-JP\ngeneration-new").expect("simulate a new installer generation");
+        assert_eq!(
+            storage
+                .import_installer_locale_marker(&marker)
+                .expect("import a new installer generation"),
+            Some("ja-JP".to_string())
+        );
+        assert_eq!(
+            storage
+                .load_language_preference()
+                .expect("load the new installer language"),
+            "ja-JP"
+        );
+
+        drop(storage);
+        fs::remove_dir_all(&fixture).expect("remove undeletable marker fixture");
+    }
+
+    #[test]
+    fn installer_locale_generation_accepts_non_utf8_windows_temp_path_bytes() {
+        let fixture = std::env::temp_dir().join(format!(
+            "weline-localnet-installer-language-ansi-path-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&fixture).expect("create ANSI marker fixture");
+        let storage =
+            Storage::open(&fixture.join("localnet.sqlite3")).expect("open ANSI marker storage");
+        let marker = fixture.join("installer-locale");
+        fs::write(
+            &marker,
+            b"ar-SA\nC:\\Users\\\xd6\xd0\xce\xc4\\AppData\\Temp\\nsa42.tmp",
+        )
+        .expect("write marker with non-UTF-8 generation bytes");
+
+        assert_eq!(
+            storage
+                .import_installer_locale_marker(&marker)
+                .expect("import marker independently of the Windows code page"),
+            Some("ar-SA".to_string())
+        );
+        assert_eq!(
+            storage
+                .load_language_preference()
+                .expect("load language imported from ANSI marker"),
+            "ar-SA"
+        );
+
+        drop(storage);
+        fs::remove_dir_all(&fixture).expect("remove ANSI marker fixture");
     }
 
     fn insert_paused_outgoing_resume_fixture(storage: &Storage, transfer_id: &str) {
