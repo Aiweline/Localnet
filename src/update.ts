@@ -30,6 +30,14 @@ export interface UpdateInfo {
   };
 }
 
+export interface UpdateDownloadRequest {
+  version: string;
+  assetName: string;
+  downloadUrl: string;
+  sha256: string;
+  size: number;
+}
+
 interface GithubFetchResponse {
   ok: boolean;
   json(): Promise<unknown>;
@@ -122,6 +130,19 @@ export async function checkForUpdate(
   const payload = await response.json();
   if (!isGithubRelease(payload)) throw new Error("GitHub release response is invalid");
   return selectAvailableUpdate(payload, currentVersion, platform);
+}
+
+export function createUpdateDownloadRequest(update: UpdateInfo): UpdateDownloadRequest {
+  if (!SHA256_DIGEST.test(update.asset.digest)) {
+    throw new Error("invalid verified update digest");
+  }
+  return {
+    version: update.version,
+    assetName: update.asset.name,
+    downloadUrl: update.asset.url,
+    sha256: update.asset.digest.slice("sha256:".length),
+    size: update.asset.size,
+  };
 }
 
 function platformAssetName(platform: ClientPlatform, version: string): string | null {

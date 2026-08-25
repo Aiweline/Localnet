@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   checkForUpdate,
   compareStableVersions,
+  createUpdateDownloadRequest,
   parseStableVersion,
   selectAvailableUpdate,
   type GithubRelease,
@@ -132,4 +133,17 @@ test("fails closed when GitHub returns an unsuccessful response", async () => {
     checkForUpdate("0.2.2", "windows", async () => ({ ok: false, json: async () => release() })),
     /GitHub release check failed/,
   );
+});
+
+test("creates the exact verified-download command payload", () => {
+  const update = selectAvailableUpdate(release(), "0.2.2", "windows");
+  assert.ok(update);
+
+  assert.deepEqual(createUpdateDownloadRequest(update), {
+    version: VERSION,
+    assetName: WINDOWS_ASSET,
+    downloadUrl: `https://github.com/Aiweline/Localnet/releases/download/v${VERSION}/${WINDOWS_ASSET}`,
+    sha256: "a".repeat(64),
+    size: 8_000_000,
+  });
 });
