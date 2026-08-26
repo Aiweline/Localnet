@@ -487,6 +487,7 @@ impl NetworkRuntime {
         match command {
             NetworkCommand::SetProfile(profile) => {
                 self.local_profile = profile;
+                self.push_profile_to_connected_peers();
             }
             NetworkCommand::RefreshDiscovery => {
                 let generation = self.discovery_refresh.trigger();
@@ -755,17 +756,7 @@ impl NetworkRuntime {
                     peer_id,
                     active_connection_count_after_established(num_established.get()),
                 );
-                let outbound_id = self.swarm.behaviour_mut().control.send_request(
-                    &peer_id,
-                    ControlRequest::Hello {
-                        version: PROTOCOL_VERSION,
-                        nickname: self.local_profile.nickname.clone(),
-                        platform: self.local_profile.platform,
-                        capabilities: vec![FILE_RESUME_V2_CAPABILITY.to_string()],
-                    },
-                );
-                self.pending
-                    .insert(PendingRequestId::Network(outbound_id), PendingAction::Hello);
+                self.send_hello(peer_id)?;
             }
             SwarmEvent::ConnectionClosed {
                 peer_id,
@@ -786,7 +777,7 @@ impl NetworkRuntime {
                     Protocol::Tcp(port) => Some(port),
                     _ => None,
                 }) {
-                    self.listen_port_sender.send_replace(Some(port));
+                    self.publish_listen_port(port);
                 }
             }
             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
@@ -878,6 +869,46 @@ impl NetworkRuntime {
                     .flat_map(|addresses| addresses.keys().cloned()),
             )
             .collect()
+    }
+
+    fn publish_listen_port(&mut self, port: u16) {
+        let previous = self.listen_port_sender.send_replace(Some(port));
+        if previous != Some(port) {
+            let generation = self.discovery_refresh.trigger();
+            tracing::debug!(
+                port,
+                generation,
+                "LAN listener ready; discovery started immediately"
+            );
+        }
+    }
+
+    fn push_profile_to_connected_peers(&mut self) {
+        let mut peers = self
+            .active_connections
+            .iter()
+            .filter_map(|(peer_id, count)| (*count > 0).then_some(*peer_id))
+            .collect::<Vec<_>>();
+        peers.sort_by_key(ToString::to_string);
+        for peer_id in peers {
+            if let Err(error) = self.send_hello(peer_id) {
+                tracing::debug!(%peer_id, %error, "unable to push updated profile immediately");
+            }
+        }
+    }
+
+    fn send_hello(&mut self, peer_id: PeerId) -> Result<(), AppError> {
+        let request_id = self.send_control_request(
+            peer_id,
+            ControlRequest::Hello {
+                version: PROTOCOL_VERSION,
+                nickname: self.local_profile.nickname.clone(),
+                platform: self.local_profile.platform,
+                capabilities: vec![FILE_RESUME_V2_CAPABILITY.to_string()],
+            },
+        )?;
+        self.pending.insert(request_id, PendingAction::Hello);
+        Ok(())
     }
 
     fn has_fresh_discovery_address(&self, peer_id: &PeerId) -> bool {
@@ -3031,6 +3062,55 @@ mod tests {
         assert_eq!(active_connection_count_after_established(2), 2);
         assert_eq!(active_connection_count_after_close(2), 2);
         assert_eq!(active_connection_count_after_close(0), 0);
+    }
+
+    #[test]
+    fn profile_update_immediately_pushes_hello_to_connected_peer() {
+        let (directory, storage, _) = automatic_fixture("profile-push");
+        let remote_peer = deterministic_peer_id(91);
+        let mut runtime = production_test_runtime(storage.clone(), &directory, remote_peer);
+        let updated = LocalProfile {
+            peer_id: runtime.local_profile.peer_id.clone(),
+            nickname: "Renamed Immediately".to_string(),
+            platform: runtime.local_profile.platform,
+            protocol_version: PROTOCOL_VERSION,
+        };
+
+        runtime
+            .handle_command(NetworkCommand::SetProfile(updated))
+            .expect("profile update succeeds");
+
+        let requests = &runtime
+            .test_control_transport
+            .as_ref()
+            .expect("test control transport")
+            .requests;
+        assert!(matches!(
+            requests.as_slice(),
+            [(peer_id, ControlRequest::Hello { nickname, .. })]
+                if *peer_id == remote_peer && nickname == "Renamed Immediately"
+        ));
+
+        drop(runtime);
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove profile push fixture");
+    }
+
+    #[test]
+    fn first_listen_port_immediately_wakes_discovery() {
+        let (directory, storage, _) = automatic_fixture("listen-refresh");
+        let remote_peer = deterministic_peer_id(92);
+        let mut runtime = production_test_runtime(storage.clone(), &directory, remote_peer);
+        let before = runtime.discovery_refresh.trigger();
+
+        runtime.publish_listen_port(45_123);
+
+        assert_eq!(*runtime.listen_port_sender.borrow(), Some(45_123));
+        assert_eq!(runtime.discovery_refresh.trigger(), before + 2);
+
+        drop(runtime);
+        drop(storage);
+        fs::remove_dir_all(directory).expect("remove listen refresh fixture");
     }
 
     const MIB: u64 = 1024 * 1024;
