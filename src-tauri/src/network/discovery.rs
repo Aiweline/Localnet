@@ -113,6 +113,7 @@ impl DiscoveryService {
             listen_port,
             remembered_targets,
             event_sender.clone(),
+            refresh.subscribe(),
         ));
 
         #[cfg(target_os = "windows")]
@@ -291,12 +292,20 @@ async fn probe_remembered_peers(
     listen_port: watch::Receiver<Option<u16>>,
     remembered_targets: watch::Receiver<Vec<Ipv4Addr>>,
     sender: mpsc::Sender<DiscoveryEvent>,
+    mut refresh: watch::Receiver<u64>,
 ) {
     let mut interval = time::interval(REMEMBERED_PROBE_INTERVAL);
     interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
     loop {
-        interval.tick().await;
+        tokio::select! {
+            _ = interval.tick() => {}
+            changed = refresh.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+        }
         let Some(port) = *listen_port.borrow() else {
             continue;
         };
@@ -786,6 +795,7 @@ mod tests {
         let refresh = DiscoveryRefresh::new();
         let mut announce = refresh.subscribe();
         let mut generic_probe = refresh.subscribe();
+        let mut remembered_probe = refresh.subscribe();
 
         assert_eq!(refresh.trigger(), 1);
         assert!(
@@ -800,6 +810,7 @@ mod tests {
         );
         assert_eq!(*announce.borrow_and_update(), 1);
         assert_eq!(*generic_probe.borrow_and_update(), 1);
+        assert_eq!(*remembered_probe.borrow_and_update(), 1);
 
         assert_eq!(refresh.trigger(), 2);
         assert!(announce.has_changed().expect("announce can refresh again"));
@@ -807,6 +818,11 @@ mod tests {
             generic_probe
                 .has_changed()
                 .expect("probe can refresh again")
+        );
+        assert!(
+            remembered_probe
+                .has_changed()
+                .expect("remembered probe can refresh again")
         );
     }
 }
